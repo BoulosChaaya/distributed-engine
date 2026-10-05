@@ -5,6 +5,7 @@ import { generateId, log, AppError } from '@repo/shared';
 import { Task, TaskStatus, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
 import { MetricsCollector } from './metrics';
+import { CircuitBreaker } from './circuitbreaker';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,6 +38,13 @@ const taskStore = new Map<string, Task>();
 
 // Metrics collector for observability
 const metrics = new MetricsCollector(taskStore, taskQueue);
+
+// Circuit breaker for queue operations (graceful degradation if Redis is down)
+const queueCircuitBreaker = new CircuitBreaker(
+  5,      // Open after 5 consecutive failures
+  2,      // Close after 2 successes in HALF_OPEN state
+  30000   // Wait 30s before attempting recovery
+);
 
 // Middleware
 app.use(express.json({ limit: '10mb' }));
@@ -79,11 +87,18 @@ app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
-  res.json({
-    success: true,
-    data: { status: 'healthy', timestamp: new Date() },
+  const circuitState = queueCircuitBreaker.getState();
+  const isHealthy = circuitState !== 'OPEN';
+
+  res.status(isHealthy ? 200 : 503).json({
+    success: isHealthy,
+    data: {
+      status: isHealthy ? 'healthy' : 'degraded',
+      timestamp: new Date(),
+      circuitBreaker: circuitState,
+    },
     timestamp: new Date(),
-  } as ApiResponse<{ status: string; timestamp: Date }>);
+  });
 });
 
 // Metrics endpoint - System observability
@@ -149,13 +164,25 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
     // Store task metadata locally
     taskStore.set(taskId, task);
 
-    // Enqueue job to BullMQ (worker will process it)
-    const job = await taskQueue.add(validatedData.name, { taskId, task }, {
-      jobId: taskId,
-      priority: priorityToNumber(validatedData.priority),
-    });
+    // Enqueue job to BullMQ with circuit breaker protection
+    try {
+      const job = await queueCircuitBreaker.execute(async () => {
+        return await taskQueue.add(validatedData.name, { taskId, task }, {
+          jobId: taskId,
+          priority: priorityToNumber(validatedData.priority),
+        });
+      });
 
-    log('INFO', 'Task enqueued', { taskId, name: validatedData.name, jobId: job.id });
+      log('INFO', 'Task enqueued', { taskId, name: validatedData.name, jobId: job.id });
+    } catch (queueError) {
+      // Circuit breaker is open: graceful degradation
+      // Task is stored locally but not yet queued
+      task.status = 'PENDING' as TaskStatus;
+      task.updatedAt = new Date();
+      log('WARN', 'Task queued locally, awaiting queue recovery', { taskId });
+
+      // Still return success to client, but with degraded status
+    }
 
     res.status(201).json({
       success: true,
@@ -230,10 +257,17 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunct
       throw new AppError(400, `Cannot cancel task in ${task.status} state`);
     }
 
-    // Try to cancel the job in BullMQ
-    const job = await taskQueue.getJob(req.params.id);
-    if (job) {
-      await job.remove();
+    // Try to cancel the job in BullMQ (protected by circuit breaker)
+    try {
+      await queueCircuitBreaker.execute(async () => {
+        const job = await taskQueue.getJob(req.params.id);
+        if (job) {
+          await job.remove();
+        }
+      });
+    } catch (queueError) {
+      log('WARN', 'Failed to cancel job in queue, marking locally', { taskId: req.params.id });
+      // Still mark as cancelled locally even if queue operation fails
     }
 
     task.status = 'CANCELLED' as TaskStatus;
