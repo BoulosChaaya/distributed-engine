@@ -1,0 +1,64 @@
+# Multi-stage Docker build for production
+# Stage 1: Builder - compile TypeScript to JavaScript
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy workspace configuration
+COPY pnpm-workspace.yaml .
+COPY package.json pnpm-lock.yaml ./
+
+# Copy all packages
+COPY packages ./packages
+COPY apps/api ./apps/api
+
+# Install dependencies (using pnpm for monorepo)
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
+
+# Build the entire workspace
+RUN pnpm build
+
+# Stage 2: Production - minimal runtime image
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dumb-init for proper signal handling in containers
+RUN apk add --no-cache dumb-init
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+# Copy pnpm (lightweight dependency manager for production)
+RUN npm install -g pnpm
+
+# Copy package.json files from builder
+COPY --from=builder --chown=nodejs:nodejs /app/pnpm-lock.yaml ./
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
+COPY --from=builder --chown=nodejs:nodejs /app/pnpm-workspace.yaml ./
+
+# Copy compiled code from builder
+COPY --from=builder --chown=nodejs:nodejs /app/packages ./packages
+COPY --from=builder --chown=nodejs:nodejs /app/apps/api/dist ./apps/api/dist
+COPY --from=builder --chown=nodejs:nodejs /app/apps/api/package.json ./apps/api/
+
+# Install production dependencies only (skip devDependencies)
+RUN pnpm install --prod --frozen-lockfile && pnpm prune --prod
+
+# Switch to non-root user
+USER nodejs
+
+# Health check - verify API responds
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000/health', (r) => { if(r.statusCode!==200) throw new Error(r.statusCode) })"
+
+# Use dumb-init to handle signals properly (SIGTERM for graceful shutdown)
+ENTRYPOINT ["dumb-init", "--"]
+
+# Start the API server
+CMD ["node", "apps/api/dist/main.js"]
+
+# Metadata
+LABEL maintainer="Distributed Engine Team"
+LABEL version="0.1.0"
+LABEL description="REST API server for distributed task execution engine"

@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Redis - message queue and state store
+  redis:
+    image: redis:7-alpine
+    container_name: engine-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  # API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: engine-api
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOG_LEVEL: INFO
+      QUEUE_CONCURRENCY: 5
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # Worker - Job Processor (scale by running multiple instances)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: engine-worker-1
+    environment:
+      NODE_ENV: development
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOG_LEVEL: INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Optional: Additional worker for parallel processing
+  # worker-2:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.worker
+  #   environment:
+  #     NODE_ENV: development
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     LOG_LEVEL: INFO
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    name: engine-network

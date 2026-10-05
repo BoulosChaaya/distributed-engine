@@ -1,0 +1,59 @@
+# Multi-stage Docker build for worker
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy workspace configuration
+COPY pnpm-workspace.yaml .
+COPY package.json pnpm-lock.yaml ./
+
+# Copy all packages
+COPY packages ./packages
+COPY apps/worker ./apps/worker
+
+# Install dependencies
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
+
+# Build the workspace
+RUN pnpm build
+
+# Stage 2: Production runtime
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dumb-init for proper signal handling
+RUN apk add --no-cache dumb-init
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy package files
+COPY --from=builder --chown=nodejs:nodejs /app/pnpm-lock.yaml ./
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
+COPY --from=builder --chown=nodejs:nodejs /app/pnpm-workspace.yaml ./
+
+# Copy compiled code
+COPY --from=builder --chown=nodejs:nodejs /app/packages ./packages
+COPY --from=builder --chown=nodejs:nodejs /app/apps/worker/dist ./apps/worker/dist
+COPY --from=builder --chown=nodejs:nodejs /app/apps/worker/package.json ./apps/worker/
+
+# Install production dependencies only
+RUN pnpm install --prod --frozen-lockfile && pnpm prune --prod
+
+# Switch to non-root user
+USER nodejs
+
+# Use dumb-init for signal handling (SIGINT for graceful shutdown)
+ENTRYPOINT ["dumb-init", "--"]
+
+# Start the worker
+CMD ["node", "apps/worker/dist/index.js"]
+
+# Metadata
+LABEL maintainer="Distributed Engine Team"
+LABEL version="0.1.0"
+LABEL description="Background worker for processing distributed tasks"

@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Development
+node_modules
+dist
+*.log
+.env.local
+.env.*.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.github
+.gitlab-ci.yml
+
+# Documentation
+README.md
+CHANGELOG.md
+docs/
+
+# Testing
+.jest
+coverage/
+__tests__
+
+# Build artifacts
+build/
+.tsc
+*.tgz
+
+# Dependencies documentation
+pnpm-debug.log
+
+# Temporary files
+tmp/
+temp/
+.cache/
