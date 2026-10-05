@@ -3,6 +3,7 @@ import { Queue } from 'bullmq';
 import { createClient } from 'redis';
 import { generateId, log, AppError } from '@repo/shared';
 import { Task, TaskStatus, ApiResponse } from '@repo/shared';
+import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,29 +35,39 @@ const taskQueue = new Queue('tasks', {
 const taskStore = new Map<string, Task>();
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Request logging middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
-  log('INFO', `${req.method} ${req.path}`);
+  log('INFO', `${req.method} ${req.path}`, { ip: req.ip });
   next();
 });
 
-// Error handling middleware
+// Enhanced error handling middleware with validation support
 app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof ValidationError) {
+    return res.status(422).json({
+      success: false,
+      error: 'Validation error',
+      details: err.toJSON(),
+      timestamp: new Date(),
+    });
+  }
+
   if (err instanceof AppError) {
-    res.status(err.statusCode).json({
+    return res.status(err.statusCode).json({
       success: false,
       error: err.message,
       timestamp: new Date(),
     });
-  } else {
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      timestamp: new Date(),
-    });
   }
+
+  log('ERROR', 'Unhandled error', { error: err });
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error',
+    timestamp: new Date(),
+  });
 });
 
 // Health check endpoint
@@ -69,23 +80,20 @@ app.get('/health', (req: Request, res: Response) => {
 });
 
 // Submit a new task - ENQUEUE to BullMQ
-app.post('/tasks', async (req: Request, res: Response) => {
+app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { name, payload, priority = 'NORMAL', maxRetries = 3 } = req.body;
-
-    if (!name) {
-      throw new AppError(400, 'Task name is required');
-    }
+    // Validate input using Zod schema
+    const validatedData = SubmitTaskSchema.parse(req.body);
 
     const taskId = generateId();
     const task: Task = {
       id: taskId,
-      name,
+      name: validatedData.name,
       status: 'QUEUED' as TaskStatus,
-      priority: priority as any,
-      payload: payload || {},
+      priority: validatedData.priority,
+      payload: validatedData.payload,
       retries: 0,
-      maxRetries,
+      maxRetries: validatedData.maxRetries,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -94,14 +102,37 @@ app.post('/tasks', async (req: Request, res: Response) => {
     taskStore.set(taskId, task);
 
     // Enqueue job to BullMQ (worker will process it)
-    const job = await taskQueue.add(name, { taskId, task }, {
+    const job = await taskQueue.add(validatedData.name, { taskId, task }, {
       jobId: taskId,
-      priority: priorityToNumber(priority),
+      priority: priorityToNumber(validatedData.priority),
     });
 
-    log('INFO', 'Task enqueued', { taskId, name, jobId: job.id });
+    log('INFO', 'Task enqueued', { taskId, name: validatedData.name, jobId: job.id });
 
     res.status(201).json({
+      success: true,
+      data: task,
+      timestamp: new Date(),
+    } as ApiResponse<Task>);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else {
+      next(error);
+    }
+  }
+});
+
+// Get task by ID
+app.get('/tasks/:id', (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const task = taskStore.get(req.params.id);
+
+    if (!task) {
+      throw new AppError(404, `Task ${req.params.id} not found`);
+    }
+
+    res.json({
       success: true,
       data: task,
       timestamp: new Date(),
@@ -111,45 +142,35 @@ app.post('/tasks', async (req: Request, res: Response) => {
   }
 });
 
-// Get task by ID
-app.get('/tasks/:id', (req: Request, res: Response) => {
-  const task = taskStore.get(req.params.id);
-
-  if (!task) {
-    throw new AppError(404, `Task ${req.params.id} not found`);
-  }
-
-  res.json({
-    success: true,
-    data: task,
-    timestamp: new Date(),
-  } as ApiResponse<Task>);
-});
-
 // List all tasks with pagination
-app.get('/tasks', (req: Request, res: Response) => {
-  const page = parseInt(req.query.page as string) || 1;
-  const pageSize = parseInt(req.query.pageSize as string) || 10;
-  const allTasks = Array.from(taskStore.values());
-  const total = allTasks.length;
-  const start = (page - 1) * pageSize;
-  const items = allTasks.slice(start, start + pageSize);
+app.get('/tasks', (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Validate pagination params
+    const { page, pageSize } = PaginationSchema.parse(req.query);
 
-  res.json({
-    success: true,
-    data: {
-      items,
-      total,
-      page,
-      pageSize,
-      hasMore: start + pageSize < total,
-    },
-    timestamp: new Date(),
-  });
+    const allTasks = Array.from(taskStore.values());
+    const total = allTasks.length;
+    const start = (page - 1) * pageSize;
+    const items = allTasks.slice(start, start + pageSize);
+
+    res.json({
+      success: true,
+      data: {
+        items,
+        total,
+        page,
+        pageSize,
+        hasMore: start + pageSize < total,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Cancel a task
-app.put('/tasks/:id/cancel', async (req: Request, res: Response) => {
+app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const task = taskStore.get(req.params.id);
 
@@ -177,10 +198,7 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response) => {
       timestamp: new Date(),
     } as ApiResponse<Task>);
   } catch (error) {
-    if (!(error instanceof AppError)) {
-      throw new AppError(500, 'Failed to cancel task');
-    }
-    throw error;
+    next(error);
   }
 });
 
