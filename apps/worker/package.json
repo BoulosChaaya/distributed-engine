@@ -1,0 +1,23 @@
+{
+  "name": "@distributed-engine/worker",
+  "version": "0.1.0",
+  "description": "Background job worker using BullMQ and Redis",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@repo/shared": "workspace:*",
+    "bullmq": "^5.0.0",
+    "redis": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.2.0"
+  }
+}
