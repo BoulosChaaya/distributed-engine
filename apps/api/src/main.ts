@@ -4,6 +4,7 @@ import { createClient } from 'redis';
 import { generateId, log, AppError } from '@repo/shared';
 import { Task, TaskStatus, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
+import { MetricsCollector } from './metrics';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,17 +35,23 @@ const taskQueue = new Queue('tasks', {
 // Task state store (Redis-backed, but can be replaced with PostgreSQL)
 const taskStore = new Map<string, Task>();
 
+// Metrics collector for observability
+const metrics = new MetricsCollector(taskStore, taskQueue);
+
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 
-// Request logging middleware
+// Request logging and metrics middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
+  metrics.recordRequest();
   log('INFO', `${req.method} ${req.path}`, { ip: req.ip });
   next();
 });
 
 // Enhanced error handling middleware with validation support
 app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  metrics.recordError();
+
   if (err instanceof ValidationError) {
     return res.status(422).json({
       success: false,
@@ -77,6 +84,20 @@ app.get('/health', (req: Request, res: Response) => {
     data: { status: 'healthy', timestamp: new Date() },
     timestamp: new Date(),
   } as ApiResponse<{ status: string; timestamp: Date }>);
+});
+
+// Metrics endpoint - System observability
+app.get('/metrics', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const metricsData = await metrics.getMetrics();
+    res.json({
+      success: true,
+      data: metricsData,
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Submit a new task - ENQUEUE to BullMQ
