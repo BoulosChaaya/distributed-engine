@@ -6,6 +6,7 @@ import { Task, TaskStatus, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
 import { MetricsCollector } from './metrics';
 import { CircuitBreaker } from './circuitbreaker';
+import { ShutdownManager } from './shutdown';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -46,13 +47,38 @@ const queueCircuitBreaker = new CircuitBreaker(
   30000   // Wait 30s before attempting recovery
 );
 
+// Shutdown manager for graceful shutdown
+const shutdownManager = new ShutdownManager(
+  app,
+  redisClient,
+  taskQueue,
+  30000 // 30 second graceful shutdown timeout
+);
+
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 
-// Request logging and metrics middleware
+// Request logging, metrics, and shutdown tracking middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
+  try {
+    shutdownManager.incrementRequests();
+  } catch (error) {
+    // Server is shutting down, reject new requests
+    return res.status(503).json({
+      success: false,
+      error: 'Server is shutting down',
+      timestamp: new Date(),
+    });
+  }
+
   metrics.recordRequest();
   log('INFO', `${req.method} ${req.path}`, { ip: req.ip });
+
+  // Track when response is sent to decrement counter
+  res.on('finish', () => {
+    shutdownManager.decrementRequests();
+  });
+
   next();
 });
 
@@ -296,6 +322,7 @@ function priorityToNumber(priority: string): number {
 }
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   log('INFO', `API server running on port ${PORT}`);
+  shutdownManager.registerHandlers(server);
 });
