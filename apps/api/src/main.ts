@@ -7,15 +7,22 @@ import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validatio
 import { MetricsCollector } from './metrics';
 import { CircuitBreaker } from './circuitbreaker';
 import { ShutdownManager } from './shutdown';
+import { config } from './config';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = config.port;
 
 // Redis connection for both job queue and state storage
 const redisClient = createClient({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379'),
-  retryStrategy: (times) => Math.min(times * 50, 2000),
+  host: config.redis.host,
+  port: config.redis.port,
+  password: config.redis.password,
+  db: config.redis.db,
+  socket: {
+    keepAlive: config.redis.keepAlive,
+    connectTimeout: config.redis.connectTimeoutMs,
+  },
+  retry: (times) => Math.min(times * config.redis.retryDelayMs, 2000),
 });
 
 redisClient.on('error', (err) => log('ERROR', 'Redis error', err));
@@ -25,10 +32,10 @@ redisClient.on('connect', () => log('INFO', 'Redis connected'));
 const taskQueue = new Queue('tasks', {
   connection: redisClient,
   defaultJobOptions: {
-    attempts: 3,
+    attempts: config.queue.maxAttempts,
     backoff: {
       type: 'exponential',
-      delay: 2000,
+      delay: config.queue.backoffDelayMs,
     },
     removeOnComplete: true,
   },
@@ -42,9 +49,9 @@ const metrics = new MetricsCollector(taskStore, taskQueue);
 
 // Circuit breaker for queue operations (graceful degradation if Redis is down)
 const queueCircuitBreaker = new CircuitBreaker(
-  5,      // Open after 5 consecutive failures
-  2,      // Close after 2 successes in HALF_OPEN state
-  30000   // Wait 30s before attempting recovery
+  config.circuitBreaker.failureThreshold,
+  config.circuitBreaker.successThreshold,
+  config.circuitBreaker.resetTimeoutMs
 );
 
 // Shutdown manager for graceful shutdown
@@ -52,7 +59,7 @@ const shutdownManager = new ShutdownManager(
   app,
   redisClient,
   taskQueue,
-  30000 // 30 second graceful shutdown timeout
+  config.gracefulShutdown.timeoutMs
 );
 
 // Middleware
