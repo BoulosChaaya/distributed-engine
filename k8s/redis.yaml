@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: distributed-engine
+
+---
+# Redis StatefulSet for persistent task queue storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: distributed-engine
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        command:
+          - redis-server
+          - "--appendonly"
+          - "yes"
+          - "--appendfsync"
+          - "everysec"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# Redis Service for internal DNS resolution
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: distributed-engine
+spec:
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379

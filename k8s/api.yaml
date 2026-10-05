@@ -1,0 +1,174 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: distributed-engine
+  labels:
+    app: api
+spec:
+  replicas: 3  # Three API instances for high availability
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # One extra pod during update
+      maxUnavailable: 0  # Zero downtime updates
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Pod Disruption Budget - protect against node failures
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - api
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: api
+        image: distributed-engine-api:0.1.0  # Set to your registry image
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+          name: http
+
+        # Environment configuration
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: REDIS_HOST
+          value: "redis.distributed-engine.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: QUEUE_CONCURRENCY
+          value: "10"
+        - name: CIRCUIT_BREAKER_RESET_TIMEOUT_MS
+          value: "60000"
+        - name: GRACEFUL_SHUTDOWN_TIMEOUT_MS
+          value: "30000"
+
+        # Resource management - prevent resource starvation
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        # Health checks for Kubernetes orchestration
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+
+        # Graceful shutdown - 30s to drain requests
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]  # Wait for LB to stop routing
+
+      # Termination grace period matches GRACEFUL_SHUTDOWN_TIMEOUT_MS
+      terminationGracePeriodSeconds: 40  # 30s shutdown + 10s buffer
+
+---
+# Service for routing traffic to API pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: distributed-engine
+spec:
+  type: LoadBalancer  # Expose externally
+  selector:
+    app: api
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+    name: http
+
+---
+# Horizontal Pod Autoscaler - scale based on CPU usage
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: distributed-engine
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 15
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+
+---
+# PodDisruptionBudget - ensure minimum replicas during maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+  namespace: distributed-engine
+spec:
+  minAvailable: 2  # Keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: api

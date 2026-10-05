@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: distributed-engine
+  labels:
+    app: worker
+spec:
+  replicas: 5  # Five workers for parallel job processing
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      # Pod anti-affinity spreads workers across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - worker
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: worker
+        image: distributed-engine-worker:0.1.0  # Set to your registry image
+        imagePullPolicy: IfNotPresent
+
+        # Environment configuration
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: REDIS_HOST
+          value: "redis.distributed-engine.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: LOG_LEVEL
+          value: "INFO"
+
+        # Resource management - workers are CPU intensive
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+
+        # Graceful shutdown - wait for in-flight jobs
+        lifecycle:
+          preStop:
+            exec:
+              # Give worker 25s to finish current jobs
+              command: ["/bin/sh", "-c", "sleep 25"]
+
+      # Termination grace period for graceful job completion
+      terminationGracePeriodSeconds: 35  # 25s graceful shutdown + 10s buffer
+
+---
+# Horizontal Pod Autoscaler for workers - scale by queue depth
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: distributed-engine
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+
+---
+# PodDisruptionBudget - ensure worker availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-pdb
+  namespace: distributed-engine
+spec:
+  minAvailable: 3  # Keep at least 3 workers running
+  selector:
+    matchLabels:
+      app: worker
