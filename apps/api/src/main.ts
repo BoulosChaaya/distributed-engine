@@ -100,6 +100,33 @@ app.get('/metrics', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
+// Workers endpoint - Get all active workers and their status
+app.get('/workers', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Scan Redis for all worker status keys (pattern: worker:*)
+    const keys = await redisClient.keys('worker:*');
+    const workers = [];
+
+    for (const key of keys) {
+      const workerData = await redisClient.get(key);
+      if (workerData) {
+        workers.push(JSON.parse(workerData));
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        total: workers.length,
+        workers: workers.sort((a, b) => a.id.localeCompare(b.id)),
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Submit a new task - ENQUEUE to BullMQ
 app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {

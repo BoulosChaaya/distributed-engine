@@ -1,6 +1,7 @@
 import { Worker, Queue } from 'bullmq';
 import { log, retryWithBackoff, Task } from '@repo/shared';
 import { createClient } from 'redis';
+import { randomUUID } from 'crypto';
 
 // Redis connection
 const redisClient = createClient({
@@ -24,12 +25,48 @@ const taskQueue = new Queue('tasks', {
 // Local task state cache (mirrors API's task store)
 const taskStore = new Map<string, Task>();
 
+// Worker identity and metrics
+const WORKER_ID = randomUUID().substring(0, 8);
+const workerMetrics = {
+  id: WORKER_ID,
+  startTime: Date.now(),
+  jobsProcessed: 0,
+  jobsFailed: 0,
+  jobsCompleted: 0,
+};
+
+// Helper: Update worker status in Redis for API visibility
+async function updateWorkerStatus() {
+  try {
+    const uptime = Math.floor((Date.now() - workerMetrics.startTime) / 1000);
+    const status = {
+      id: workerMetrics.id,
+      uptime,
+      jobsProcessed: workerMetrics.jobsProcessed,
+      jobsCompleted: workerMetrics.jobsCompleted,
+      jobsFailed: workerMetrics.jobsFailed,
+      status: 'healthy',
+      lastHeartbeat: new Date().toISOString(),
+    };
+
+    // Store worker status in Redis with 30s TTL (heartbeat)
+    await redisClient.setEx(
+      `worker:${workerMetrics.id}`,
+      30,
+      JSON.stringify(status)
+    );
+  } catch (error) {
+    log('WARN', 'Failed to update worker status', { error: String(error) });
+  }
+}
+
 // Job processor - handles task execution and status updates
 const worker = new Worker(
   'tasks',
   async (job) => {
     const { taskId, task } = job.data;
     log('INFO', 'Processing task', { taskId, name: task.name });
+    workerMetrics.jobsProcessed++;
 
     // Update task status to PROCESSING
     task.status = 'PROCESSING';
@@ -55,6 +92,7 @@ const worker = new Worker(
       task.completedAt = new Date();
       task.updatedAt = new Date();
       taskStore.set(taskId, task);
+      workerMetrics.jobsCompleted++;
       log('INFO', 'Task completed', { taskId });
 
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
@@ -65,6 +103,7 @@ const worker = new Worker(
       task.retries++;
       task.updatedAt = new Date();
       taskStore.set(taskId, task);
+      workerMetrics.jobsFailed++;
 
       log('ERROR', 'Task failed', {
         taskId,
@@ -84,11 +123,11 @@ const worker = new Worker(
 
 // Event handlers for job lifecycle
 worker.on('active', (job) => {
-  log('INFO', 'Job active', { jobId: job.id });
+  log('INFO', 'Job active', { jobId: job.id, workerId: WORKER_ID });
 });
 
 worker.on('completed', (job) => {
-  log('INFO', 'Job completed event', { jobId: job.id });
+  log('INFO', 'Job completed event', { jobId: job.id, workerId: WORKER_ID });
 });
 
 worker.on('failed', (job, err) => {
@@ -96,20 +135,28 @@ worker.on('failed', (job, err) => {
     jobId: job?.id,
     error: err.message,
     attempt: job?.attemptsMade,
+    workerId: WORKER_ID,
   });
 });
 
 worker.on('stalled', (jobId) => {
-  log('WARN', 'Job stalled', { jobId });
+  log('WARN', 'Job stalled', { jobId, workerId: WORKER_ID });
 });
 
 worker.on('error', (err) => {
-  log('ERROR', 'Worker error', { error: err.message });
+  log('ERROR', 'Worker error', { error: err.message, workerId: WORKER_ID });
 });
+
+// Periodic heartbeat - update worker status in Redis every 10s
+const heartbeatInterval = setInterval(() => {
+  updateWorkerStatus();
+}, 10000);
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
-  log('INFO', 'Shutting down worker gracefully');
+  log('INFO', 'Shutting down worker gracefully', { workerId: WORKER_ID });
+  clearInterval(heartbeatInterval);
+  await redisClient.del(`worker:${WORKER_ID}`); // Remove worker status
   await worker.close();
   await redisClient.quit();
   process.exit(0);
@@ -127,7 +174,11 @@ process.on('SIGINT', async () => {
     }, 100);
   });
 
+  // Publish initial heartbeat
+  await updateWorkerStatus();
+
   log('INFO', 'Worker initialized and listening for tasks', {
+    workerId: WORKER_ID,
     concurrency: 5,
     host: process.env.REDIS_HOST || 'localhost',
     port: process.env.REDIS_PORT || '6379',
