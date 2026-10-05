@@ -21,12 +21,20 @@ const taskQueue = new Queue('tasks', {
   },
 });
 
-// Job processor - this handles actual task execution
+// Local task state cache (mirrors API's task store)
+const taskStore = new Map<string, Task>();
+
+// Job processor - handles task execution and status updates
 const worker = new Worker(
   'tasks',
   async (job) => {
     const { taskId, task } = job.data;
     log('INFO', 'Processing task', { taskId, name: task.name });
+
+    // Update task status to PROCESSING
+    task.status = 'PROCESSING';
+    task.updatedAt = new Date();
+    taskStore.set(taskId, task);
 
     try {
       // Simulate async work with retry logic
@@ -42,10 +50,27 @@ const worker = new Worker(
         return task;
       });
 
+      // Update task status to COMPLETED
+      task.status = 'COMPLETED';
+      task.completedAt = new Date();
+      task.updatedAt = new Date();
+      taskStore.set(taskId, task);
       log('INFO', 'Task completed', { taskId });
+
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
     } catch (error) {
-      log('ERROR', 'Task failed', { taskId, error: String(error) });
+      // Update task status to FAILED
+      task.status = 'FAILED';
+      task.error = error instanceof Error ? error.message : String(error);
+      task.retries++;
+      task.updatedAt = new Date();
+      taskStore.set(taskId, task);
+
+      log('ERROR', 'Task failed', {
+        taskId,
+        error: String(error),
+        attempt: job.attemptsMade,
+      });
       throw error;
     }
   },
@@ -58,8 +83,12 @@ const worker = new Worker(
 );
 
 // Event handlers for job lifecycle
+worker.on('active', (job) => {
+  log('INFO', 'Job active', { jobId: job.id });
+});
+
 worker.on('completed', (job) => {
-  log('INFO', 'Job completed event', { jobId: job.id, data: job.data });
+  log('INFO', 'Job completed event', { jobId: job.id });
 });
 
 worker.on('failed', (job, err) => {
@@ -68,6 +97,10 @@ worker.on('failed', (job, err) => {
     error: err.message,
     attempt: job?.attemptsMade,
   });
+});
+
+worker.on('stalled', (jobId) => {
+  log('WARN', 'Job stalled', { jobId });
 });
 
 worker.on('error', (err) => {
@@ -82,4 +115,21 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-log('INFO', 'Worker initialized and listening for tasks');
+// Startup message
+(async () => {
+  // Wait for Redis connection
+  await new Promise((resolve) => {
+    const checkConnection = setInterval(() => {
+      if (redisClient.isOpen) {
+        clearInterval(checkConnection);
+        resolve(undefined);
+      }
+    }, 100);
+  });
+
+  log('INFO', 'Worker initialized and listening for tasks', {
+    concurrency: 5,
+    host: process.env.REDIS_HOST || 'localhost',
+    port: process.env.REDIS_PORT || '6379',
+  });
+})();
