@@ -8,7 +8,7 @@
     "dev": "node --loader ts-node/esm src/main.ts",
     "build": "tsc",
     "start": "node dist/main.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest"
   },
   "dependencies": {
     "@repo/shared": "workspace:*",
