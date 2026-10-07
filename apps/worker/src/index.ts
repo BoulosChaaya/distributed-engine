@@ -1,4 +1,4 @@
-import { Worker } from 'bullmq';
+import { Worker, DelayedError } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
 import { log, TaskRepository, ClaimNotExpiredError, runMigrations } from '@repo/shared';
@@ -29,6 +29,7 @@ redisClient.on('connect', () => log('INFO', 'Redis connected', { workerId: WORKE
 
 const taskRepo = new TaskRepository(pgPool);
 const RENEWAL_INTERVAL = Math.floor(taskRepo.claimTtl / 3);
+const LEASE_DEFERRAL_MARGIN_MS = 2000;
 
 const workerMetrics = {
   id: WORKER_ID,
@@ -93,6 +94,7 @@ const worker = new Worker(
     let claimToken: string | undefined;
     let currentRetries = currentTask.retries;
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
+    let ownershipLost = false;
 
     if (currentTask.status === 'QUEUED') {
       try {
@@ -118,10 +120,14 @@ const worker = new Worker(
         log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
       } catch (error) {
         if (error instanceof ClaimNotExpiredError) {
-          log('INFO', 'Claim not expired, deferring for BullMQ retry', {
-            taskId, expiresAt: error.expiresAt.toISOString(), workerId: WORKER_ID,
+          const deferUntil = error.expiresAt.getTime() + LEASE_DEFERRAL_MARGIN_MS;
+          log('INFO', 'Lease not expired, deferring job via moveToDelayed', {
+            taskId, expiresAt: error.expiresAt.toISOString(),
+            deferUntil: new Date(deferUntil).toISOString(),
+            workerId: WORKER_ID,
           });
-          throw error;
+          await job.moveToDelayed(deferUntil, job.token);
+          throw new DelayedError();
         }
         log('WARN', 'Failed to reclaim stalled task', {
           taskId, error: String(error), workerId: WORKER_ID,
@@ -137,7 +143,8 @@ const worker = new Worker(
           await taskRepo.renewClaim(taskId, claimToken);
           log('INFO', 'Lease renewed', { taskId, workerId: WORKER_ID });
         } catch (renewError) {
-          log('WARN', 'Lease renewal failed', { taskId, error: String(renewError), workerId: WORKER_ID });
+          log('WARN', 'Lease renewal failed, ownership lost', { taskId, error: String(renewError), workerId: WORKER_ID });
+          ownershipLost = true;
           if (renewalTimer) {
             clearInterval(renewalTimer);
             renewalTimer = undefined;
@@ -147,12 +154,22 @@ const worker = new Worker(
 
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
+      if (ownershipLost) {
+        log('INFO', 'Ownership lost during execution, aborting', { taskId, workerId: WORKER_ID });
+        return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
+      }
+
       const updatedTask = await taskRepo.getTask(taskId);
       if (!updatedTask || updatedTask.status === 'CANCELLED' || updatedTask.status === 'FAILED') {
         log('INFO', 'Task no longer processable, skipping completion', {
           taskId, status: updatedTask?.status, workerId: WORKER_ID,
         });
         return { status: 'SKIPPED', taskId, reason: updatedTask?.status?.toLowerCase() || 'not_found' };
+      }
+
+      if (ownershipLost) {
+        log('INFO', 'Ownership lost before completion, aborting', { taskId, workerId: WORKER_ID });
+        return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
 
       await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
