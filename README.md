@@ -12,6 +12,7 @@ An asynchronous task processing system demonstrating:
 - **State machine enforcement** on all task transitions
 - **At-least-once delivery** with idempotent job publication
 - **Circuit breaker** protecting the outbox publisher from Redis failures
+- **Stalled job recovery** for worker crash scenarios
 - **Graceful shutdown** for both API and worker processes
 
 This is **not** a production SaaS platform. It does not include service mesh, distributed tracing, log aggregation, advanced scheduling, or multi-tenancy. Those would be the next phase.
@@ -44,7 +45,7 @@ This is **not** a production SaaS platform. It does not include service mesh, di
 **Task submission flow:**
 
 1. API inserts task (status=QUEUED) + outbox event atomically in one PG transaction
-2. Outbox publisher polls PG for pending events, publishes to BullMQ using taskId as jobId (idempotent)
+2. Outbox publisher polls PG for pending events, publishes to BullMQ using taskId as jobId (idempotent while the job exists in BullMQ)
 3. Worker picks up job, transitions task QUEUED → PROCESSING → COMPLETED/FAILED in PG
 4. On intermediate failure with remaining BullMQ retries: PROCESSING → QUEUED
 5. On final failure (retries exhausted): PROCESSING → FAILED
@@ -88,8 +89,8 @@ curl -X POST http://localhost:3000/tasks \
 | GET | /tasks | List tasks (paginated) |
 | GET | /tasks/:id | Get task by ID |
 | PUT | /tasks/:id/cancel | Cancel a task |
-| GET | /health | Health check (PG required, Redis informational) |
-| GET | /ready | Readiness probe (PG connectivity) |
+| GET | /health | Health check (PG + Redis + circuit breaker) |
+| GET | /ready | Readiness probe (PG connectivity only) |
 | GET | /live | Liveness probe (always 200) |
 | GET | /metrics | JSON metrics (task counts, queue depth, outbox stats) |
 | GET | /workers | Live worker list from Redis heartbeats |
@@ -123,15 +124,25 @@ All task state lives in PostgreSQL. Redis/BullMQ is a job queue only — if Redi
 
 ### Transactional Outbox
 
-Task creation and the outbox event are inserted in a single PG transaction. The outbox publisher polls for pending events and publishes to BullMQ. This guarantees at-least-once delivery: if the publisher crashes after BullMQ.add() but before marking the event DELIVERED, it will re-publish on the next poll. Duplicate publication is safe because BullMQ uses the taskId as jobId (idempotent).
+Task creation and the outbox event are inserted in a single PG transaction. The outbox publisher polls for pending events and publishes to BullMQ. This guarantees at-least-once delivery: if the publisher crashes after BullMQ.add() but before marking the event DELIVERED, it will re-publish on the next poll.
+
+**Idempotency boundary:** The outbox publisher uses taskId as the BullMQ jobId. BullMQ rejects duplicate jobIds while the job exists, making re-publication a no-op. However, completed jobs are removed after a retention window (`removeOnComplete: 100`), after which the jobId becomes reusable. The outbox marks events as DELIVERED after successful publication, so this window only matters if the outbox itself is manually reset.
+
+### Cancellation Safety
+
+The outbox publisher checks task status under `SELECT FOR UPDATE` inside the same transaction as BullMQ publication. A task that is cancelled between outbox creation and publication will not be published to BullMQ — the cancellation check and the publish are atomic with respect to the task row.
 
 ### Optimistic Concurrency
 
 Every task has a `version` column. State transitions use `SELECT FOR UPDATE` + version check. If two workers race to process the same task, only one wins — the other gets a `StaleVersionError`.
 
+### Stalled Job Recovery
+
+If a worker crashes while processing a task, BullMQ detects the stalled job and redelivers it. The new worker finds the task in PROCESSING state and reclaims it by verifying the version and bumping it under a row lock. This prevents the task from getting stuck in PROCESSING after a worker crash. BullMQ's `maxStalledCount` limits how many times a single job can be reclaimed before being marked as failed.
+
 ### Circuit Breaker (Outbox Publisher)
 
-The outbox publisher has a built-in circuit breaker for BullMQ operations. After 5 consecutive failures, it stops attempting to publish (OPEN state). After 30 seconds, it tries one operation (HALF_OPEN). After 2 successes, it resumes normal operation (CLOSED). The `/health` endpoint reports this state.
+The outbox publisher has a built-in circuit breaker for BullMQ operations. After 5 consecutive failures, it stops attempting to publish (OPEN state). After 30 seconds, it tries a single operation as a probe (HALF_OPEN) — not the full batch. After 2 consecutive successes, it resumes normal operation (CLOSED). The `/health` endpoint reports this state.
 
 ### At-Least-Once, Not Exactly-Once
 
@@ -144,10 +155,7 @@ Task handlers should be **idempotent** — processing the same task twice should
 ## Testing
 
 ```bash
-# Run all tests (unit tests run without infrastructure)
-pnpm test
-
-# Run with infrastructure (PostgreSQL + Redis required for integration tests)
+# Run all tests (requires PostgreSQL + Redis)
 docker-compose up -d postgres redis
 pnpm test
 
@@ -155,7 +163,7 @@ pnpm test
 pnpm verify
 ```
 
-Integration tests for TaskRepository and OutboxPublisher require PostgreSQL and Redis. When infrastructure is unavailable, these tests report the skip reason rather than silently passing.
+Integration tests for TaskRepository and OutboxPublisher require PostgreSQL and Redis. Tests fail with a clear error when infrastructure is unavailable rather than silently passing.
 
 ## Project Structure
 
@@ -178,6 +186,8 @@ distributed-engine/
 
 All configuration is via environment variables with sensible defaults for local development.
 
+### API Server
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | PORT | 3000 | API server port |
@@ -189,13 +199,24 @@ All configuration is via environment variables with sensible defaults for local 
 | POSTGRES_USER | postgres | Database user |
 | POSTGRES_PASSWORD | (none) | Database password |
 | POSTGRES_MAX_CONNECTIONS | 20 | PG pool size |
-| QUEUE_CONCURRENCY | 5 | Worker concurrent jobs |
-| QUEUE_MAX_ATTEMPTS | 3 | Default BullMQ retry attempts |
 | OUTBOX_POLL_INTERVAL_MS | 1000 | Outbox polling frequency |
 | OUTBOX_BATCH_SIZE | 10 | Events per outbox poll |
 | OUTBOX_MAX_ATTEMPTS | 5 | Max outbox publish attempts |
 | GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Shutdown drain timeout |
 | LOG_LEVEL | INFO | Logging level |
+
+### Worker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| REDIS_HOST | localhost | Redis hostname |
+| REDIS_PORT | 6379 | Redis port |
+| POSTGRES_HOST | localhost | PostgreSQL hostname |
+| POSTGRES_PORT | 5432 | PostgreSQL port |
+| POSTGRES_DB | distributed_engine | Database name |
+| POSTGRES_USER | postgres | Database user |
+| POSTGRES_PASSWORD | (none) | Database password |
+| QUEUE_CONCURRENCY | 5 | Concurrent jobs per worker |
 
 ## Kubernetes Deployment
 

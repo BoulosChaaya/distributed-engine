@@ -66,12 +66,14 @@ export class ShutdownManager {
     await deps.outboxPublisher.stop();
 
     const drainStart = Date.now();
+    let timedOut = false;
     await new Promise<void>((resolve) => {
       const check = setInterval(() => {
         if (this.activeRequests === 0 || Date.now() - drainStart > this.shutdownTimeout) {
           clearInterval(check);
           if (this.activeRequests > 0) {
             log('WARN', 'Shutdown timeout, forcing close', { activeRequests: this.activeRequests });
+            timedOut = true;
           }
           resolve();
         }
@@ -79,7 +81,7 @@ export class ShutdownManager {
     });
 
     await this.closeConnections(deps);
-    process.exit(0);
+    process.exit(timedOut ? 1 : 0);
   }
 
   private async closeConnections(deps: {

@@ -15,6 +15,7 @@ export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 export class OutboxPublisher {
   private running = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private activePoll: Promise<number> | null = null;
   private readonly publisherId: string;
 
   private circuitState: CircuitState = 'CLOSED';
@@ -47,6 +48,14 @@ export class OutboxPublisher {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.activePoll) {
+      try {
+        await this.activePoll;
+      } catch {
+        // drain errors are already logged in processOutbox
+      }
+      this.activePoll = null;
     }
     log('INFO', 'Outbox publisher stopped', { publisherId: this.publisherId });
   }
@@ -93,11 +102,14 @@ export class OutboxPublisher {
   private schedulePoll(): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
+      const poll = this.processOutbox();
+      this.activePoll = poll;
       try {
-        await this.processOutbox();
+        await poll;
       } catch (error) {
         log('ERROR', 'Outbox poll error', { error: String(error), publisherId: this.publisherId });
       }
+      this.activePoll = null;
       this.schedulePoll();
     }, this.pollIntervalMs);
   }
@@ -108,6 +120,8 @@ export class OutboxPublisher {
       return 0;
     }
 
+    const isHalfOpen = currentCircuitState === 'HALF_OPEN';
+
     const client = await this.pool.connect();
     let processed = 0;
 
@@ -117,6 +131,8 @@ export class OutboxPublisher {
          WHERE status = 'PENDING' AND attempts >= $1`,
         [this.maxAttempts],
       );
+
+      const effectiveBatchSize = isHalfOpen ? 1 : this.batchSize;
 
       const claimResult = await client.query(
         `UPDATE outbox_events
@@ -131,7 +147,7 @@ export class OutboxPublisher {
            FOR UPDATE SKIP LOCKED
          )
          RETURNING *`,
-        [this.publisherId, this.maxAttempts, this.batchSize],
+        [this.publisherId, this.maxAttempts, effectiveBatchSize],
       );
 
       for (const row of claimResult.rows) {
@@ -147,30 +163,18 @@ export class OutboxPublisher {
           claimedAt: row.claimed_at ? new Date(row.claimed_at) : undefined,
         };
 
-        const taskCheck = await client.query(
-          `SELECT status FROM tasks WHERE id = $1`,
-          [event.taskId],
-        );
-        if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
-          await client.query(
-            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
-            [event.id],
-          );
-          log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
-          continue;
-        }
-
         try {
-          await this.publishEvent(event);
-          this.onBullMQSuccess();
+          const published = await this.publishEvent(event, client);
 
           await client.query(
             `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
             [event.id],
           );
 
-          processed++;
-          log('INFO', 'Outbox event published', { eventId: event.id, taskId: event.taskId });
+          if (published) {
+            processed++;
+            log('INFO', 'Outbox event published', { eventId: event.id, taskId: event.taskId });
+          }
         } catch (error) {
           this.onBullMQFailure();
 
@@ -206,10 +210,20 @@ export class OutboxPublisher {
     return processed;
   }
 
-  private async publishEvent(event: OutboxEvent): Promise<void> {
+  private async publishEvent(event: OutboxEvent, client: import('pg').PoolClient): Promise<boolean> {
     const payload = event.payload as Record<string, unknown>;
     const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
     const maxRetries = (payload.maxRetries as number) ?? 3;
+
+    const taskCheck = await client.query(
+      `SELECT status FROM tasks WHERE id = $1 FOR UPDATE`,
+      [event.taskId],
+    );
+
+    if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
+      log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
+      return false;
+    }
 
     await this.taskQueue.add(
       payload.taskName as string,
@@ -229,6 +243,9 @@ export class OutboxPublisher {
         },
       },
     );
+
+    this.onBullMQSuccess();
+    return true;
   }
 
   async getPendingCount(): Promise<number> {

@@ -45,7 +45,7 @@ Client                API                 PostgreSQL
   │◀── 201 Created ───│                      │
 ```
 
-The task is created as QUEUED (not PENDING). This eliminates a race condition where a worker could pick up a job from BullMQ before the outbox publisher has transitioned the task from PENDING to QUEUED.
+The task is created as QUEUED (not PENDING — there is no PENDING task state). This eliminates a race condition where a worker could pick up a job from BullMQ before the outbox publisher has enqueued it.
 
 ### 2. Outbox Publication
 
@@ -56,8 +56,8 @@ Outbox Publisher            PostgreSQL              BullMQ/Redis
       │   UPDATE SKIP LOCKED)   │                       │
       │◀── claimed events ─────│                       │
       │                         │                       │
-      │── check task status ───▶│                       │
-      │   (skip if CANCELLED)   │                       │
+      │── SELECT task FOR ─────▶│                       │
+      │   UPDATE (check cancel) │                       │
       │                         │                       │
       │── BullMQ.add(jobId = ──────────────────────────▶│
       │   taskId, attempts =    │                       │
@@ -68,10 +68,10 @@ Outbox Publisher            PostgreSQL              BullMQ/Redis
 ```
 
 Key properties:
-- **Idempotent publication**: Uses taskId as BullMQ jobId. Re-publishing the same event is a no-op in BullMQ.
+- **Idempotent publication**: Uses taskId as BullMQ jobId. Re-publishing the same event is a no-op while the job exists in BullMQ. After BullMQ removes completed jobs (retention of 100 jobs), the jobId becomes reusable — but this only matters if outbox events are manually reset, since the outbox marks events DELIVERED on successful publication.
 - **Per-job retry config**: Each BullMQ job gets `attempts = maxRetries + 1` from the task's configuration.
-- **Cancellation check**: Skips publishing for tasks that were cancelled between creation and publication.
-- **Circuit breaker**: After 5 consecutive BullMQ failures, the publisher enters OPEN state and stops attempting for 30 seconds.
+- **Cancellation safety**: The publisher checks task status under `SELECT FOR UPDATE` before calling `BullMQ.add()`. This makes the cancellation check and publish atomic with respect to the task row — a concurrent cancellation will either complete before the lock (publisher sees CANCELLED and skips) or wait until after publication.
+- **Circuit breaker**: After 5 consecutive BullMQ failures, the publisher enters OPEN state and stops attempting for 30 seconds. In HALF_OPEN state, only a single event is processed as a probe (not the full batch).
 
 ### 3. Task Processing
 
@@ -103,6 +103,18 @@ On task failure, the worker checks whether BullMQ has remaining retry attempts:
 
 This keeps PG and BullMQ states synchronized. The PG state always reflects the actual task lifecycle.
 
+### 5. Stalled Job Recovery
+
+If a worker crashes while processing a task:
+
+1. BullMQ detects the stalled job (via `stalledInterval`, default 5 seconds)
+2. BullMQ redelivers the job to another worker
+3. The new worker finds the task in PROCESSING state
+4. The worker reclaims the task by verifying the version and bumping it under a row lock (`reclaimStalledTask`)
+5. Processing continues from the start
+
+BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be reclaimed. After that limit, BullMQ marks the job as failed and the worker transitions the task to FAILED.
+
 ## Component Details
 
 ### API Server (`apps/api/`)
@@ -112,21 +124,22 @@ This keeps PG and BullMQ states synchronized. The PG state always reflects the a
 - Runs the outbox publisher as a background process
 - Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
 - `/metrics` returns JSON with task status counts, queue depth, and outbox stats
-- Graceful shutdown: stops accepting connections, drains in-flight requests, stops outbox publisher, closes connections
+- Graceful shutdown: stops accepting connections, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
 
 ### Worker (`apps/worker/`)
 
 - BullMQ Worker consuming from the "tasks" queue
 - Publishes heartbeat to Redis every 10 seconds (`worker:{id}` key with 30s TTL)
-- Validates task state in PG before processing (skips cancelled/completed/missing tasks)
+- Validates task state in PG before processing (skips cancelled/completed/failed/missing tasks)
+- Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash
 - Uses optimistic concurrency (version check) on all state transitions
 - Graceful shutdown: stops consuming new jobs, waits for in-flight jobs to complete (30s timeout), removes heartbeat key, closes connections
 
 ### Shared Package (`packages/shared/`)
 
-- **State machine**: Defines valid task transitions and enforces them at the repository layer
-- **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check for all transitions
-- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection
+- **State machine**: Defines valid task transitions (QUEUED, PROCESSING, COMPLETED, FAILED, CANCELLED) and enforces them at the repository layer
+- **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check for all transitions; includes `reclaimStalledTask` for crash recovery
+- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection. Cancellation check uses `SELECT FOR UPDATE` for atomicity. Stops cleanly by draining in-progress polls.
 - **Migrations**: Schema versioning with advisory lock for concurrent startup safety
 - **Types**: Task, OutboxEvent, WorkerStatus interfaces
 

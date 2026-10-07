@@ -6,36 +6,43 @@ import { runMigrations } from '../db/migrations';
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 
+function requirePg(): void {
+  if (!pool || !repo) {
+    throw new Error('PostgreSQL is required for this test. Set TEST_POSTGRES_URL or start a local PostgreSQL instance.');
+  }
+}
+
+let pool: Pool;
+let repo: TaskRepository;
+
+beforeAll(async () => {
+  pool = new Pool({ connectionString: TEST_PG_URL });
+  try {
+    await pool.query('SELECT 1');
+  } catch (err) {
+    throw new Error(
+      `PostgreSQL not available at ${TEST_PG_URL}. Integration tests require PostgreSQL. Error: ${err}`
+    );
+  }
+  await runMigrations(pool);
+  repo = new TaskRepository(pool);
+});
+
+afterAll(async () => {
+  if (pool) {
+    await pool.query('TRUNCATE outbox_events, tasks CASCADE').catch(() => {});
+    await pool.end();
+  }
+});
+
+beforeEach(async () => {
+  requirePg();
+  await pool.query('TRUNCATE outbox_events, tasks CASCADE');
+});
+
 describe('TaskRepository (requires PostgreSQL)', () => {
-  let pool: Pool;
-  let repo: TaskRepository;
-
-  beforeAll(async () => {
-    pool = new Pool({ connectionString: TEST_PG_URL });
-    try {
-      await pool.query('SELECT 1');
-    } catch {
-      console.warn('PostgreSQL not available, skipping TaskRepository tests');
-      return;
-    }
-    await runMigrations(pool);
-    repo = new TaskRepository(pool);
-  });
-
-  afterAll(async () => {
-    if (pool) {
-      await pool.query('TRUNCATE outbox_events, tasks CASCADE').catch(() => {});
-      await pool.end();
-    }
-  });
-
-  beforeEach(async () => {
-    if (!repo) return;
-    await pool.query('TRUNCATE outbox_events, tasks CASCADE');
-  });
-
   it('should create a task with outbox event atomically', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task, outboxEvent } = await repo.createTaskWithOutbox({
       name: 'test-task',
@@ -57,7 +64,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should retrieve a task by ID', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'get-task',
@@ -73,13 +80,13 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should return null for non-existent task', async () => {
-    if (!repo) return;
+    requirePg();
     const result = await repo.getTask('nonexistent-id');
     expect(result).toBeNull();
   });
 
   it('should list tasks with pagination', async () => {
-    if (!repo) return;
+    requirePg();
 
     for (let i = 0; i < 5; i++) {
       await repo.createTaskWithOutbox({
@@ -100,7 +107,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should transition status with version check', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'transition-task',
@@ -127,7 +134,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should reject invalid state transitions', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'invalid-transition',
@@ -142,7 +149,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should reject stale version updates', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'stale-version',
@@ -159,7 +166,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should handle concurrent transitions safely', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'concurrent-task',
@@ -181,7 +188,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should cancel a task atomically', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'cancel-task',
@@ -195,7 +202,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should reject cancellation of completed tasks', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'no-cancel-completed',
@@ -211,7 +218,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should get task status counts', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task: t1 } = await repo.createTaskWithOutbox({
       name: 'count-1', priority: 'NORMAL', payload: {}, maxRetries: 3,
@@ -232,7 +239,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should handle FAILED -> QUEUED retry transition', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'retry-task',
@@ -250,7 +257,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should handle PROCESSING -> QUEUED retry transition', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
       name: 'processing-retry-task',
@@ -271,7 +278,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   });
 
   it('should handle atomicity: task and outbox event created together', async () => {
-    if (!repo) return;
+    requirePg();
 
     const { task, outboxEvent } = await repo.createTaskWithOutbox({
       name: 'atomic-test',
@@ -286,5 +293,77 @@ describe('TaskRepository (requires PostgreSQL)', () => {
     expect(dbTask.rows.length).toBe(1);
     expect(dbOutbox.rows.length).toBe(1);
     expect(dbOutbox.rows[0].task_id).toBe(task.id);
+  });
+
+  it('should reclaim a stalled PROCESSING task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'stalled-task',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+    });
+
+    const reclaimed = await repo.reclaimStalledTask(task.id, processing.version);
+    expect(reclaimed.status).toBe('PROCESSING');
+    expect(reclaimed.version).toBe(processing.version + 1);
+  });
+
+  it('should reject reclaim on non-PROCESSING task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'no-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await expect(
+      repo.reclaimStalledTask(task.id, task.version),
+    ).rejects.toThrow('Cannot reclaim');
+  });
+
+  it('should reject reclaim with stale version', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'stale-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    await expect(
+      repo.reclaimStalledTask(task.id, 1),
+    ).rejects.toThrow(StaleVersionError);
+  });
+});
+
+describe('Migration concurrency (requires PostgreSQL)', () => {
+  it('should handle concurrent migration calls safely', async () => {
+    requirePg();
+
+    const pool1 = new Pool({ connectionString: TEST_PG_URL });
+    const pool2 = new Pool({ connectionString: TEST_PG_URL });
+
+    try {
+      const results = await Promise.allSettled([
+        runMigrations(pool1),
+        runMigrations(pool2),
+      ]);
+
+      const fulfilled = results.filter(r => r.status === 'fulfilled');
+      expect(fulfilled.length).toBe(2);
+    } finally {
+      await pool1.end();
+      await pool2.end();
+    }
   });
 });

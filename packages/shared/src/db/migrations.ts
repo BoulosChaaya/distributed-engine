@@ -21,7 +21,7 @@ const MIGRATIONS = [
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         started_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
-        CONSTRAINT valid_status CHECK (status IN ('PENDING','QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED')),
+        CONSTRAINT valid_status CHECK (status IN ('QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED')),
         CONSTRAINT valid_priority CHECK (priority IN ('LOW','NORMAL','HIGH','CRITICAL'))
       );
 
@@ -60,6 +60,14 @@ const MIGRATIONS = [
         name TEXT NOT NULL,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `,
+  },
+  {
+    version: 4,
+    name: 'remove_pending_status',
+    sql: `
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS valid_status;
+      ALTER TABLE tasks ADD CONSTRAINT valid_status CHECK (status IN ('QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED'));
     `,
   },
 ];

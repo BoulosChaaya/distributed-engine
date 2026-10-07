@@ -17,12 +17,6 @@ export interface AppConfig {
     maxConnections: number;
   };
 
-  queue: {
-    concurrency: number;
-    maxAttempts: number;
-    backoffDelayMs: number;
-  };
-
   gracefulShutdown: {
     timeoutMs: number;
   };
@@ -66,12 +60,6 @@ export function loadConfig(): AppConfig {
       maxConnections: parseNumber(process.env.POSTGRES_MAX_CONNECTIONS, 20),
     },
 
-    queue: {
-      concurrency: parseNumber(process.env.QUEUE_CONCURRENCY, 5),
-      maxAttempts: parseNumber(process.env.QUEUE_MAX_ATTEMPTS, 3),
-      backoffDelayMs: parseNumber(process.env.QUEUE_BACKOFF_DELAY_MS, 2000),
-    },
-
     gracefulShutdown: {
       timeoutMs: parseNumber(process.env.GRACEFUL_SHUTDOWN_TIMEOUT_MS, 30000),
     },
@@ -102,15 +90,6 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.postgres.maxConnections < 1) {
     errors.push('POSTGRES_MAX_CONNECTIONS must be at least 1');
-  }
-  if (config.queue.concurrency < 1) {
-    errors.push('QUEUE_CONCURRENCY must be at least 1');
-  }
-  if (config.queue.maxAttempts < 1) {
-    errors.push('QUEUE_MAX_ATTEMPTS must be at least 1');
-  }
-  if (config.queue.backoffDelayMs < 0) {
-    errors.push('QUEUE_BACKOFF_DELAY_MS must be non-negative');
   }
   if (config.outbox.pollIntervalMs < 100) {
     errors.push('OUTBOX_POLL_INTERVAL_MS must be at least 100');

@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "bullmq": "^5.81.5",
-    "ioredis": "^6.0.0",
+    "ioredis": "^5.11.1",
     "pg": "^8.23.1"
   }
 }
