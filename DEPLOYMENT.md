@@ -101,9 +101,9 @@ curl -X POST http://localhost:3000/tasks \
 |----------|---------------|---------------------|
 | `/ready` | PostgreSQL connectivity | PG unreachable |
 | `/live` | Nothing (always 200) | Never |
-| `/health` | PG + Redis + outbox circuit breaker | PG unreachable |
+| `/health` | PG + Redis + outbox circuit breaker state | PG unreachable |
 
-`/ready` only requires PostgreSQL because task submission (the core API function) writes to PG only. Redis unavailability degrades the outbox publisher but does not prevent task creation.
+`/ready` only requires PostgreSQL because task submission (the core API function) writes to PG only. Redis unavailability degrades the outbox publisher but does not prevent task creation. `/health` returns 200 with `status: "degraded"` when Redis is down or the circuit breaker is not CLOSED, and 503 only when PostgreSQL is unreachable.
 
 ## Graceful Shutdown
 
@@ -112,10 +112,10 @@ curl -X POST http://localhost:3000/tasks \
 1. K8s sends SIGTERM
 2. `preStop` hook sleeps 5 seconds (lets load balancer stop routing)
 3. Server stops accepting new connections
-4. Outbox publisher stops
+4. Outbox publisher stops (waits for any in-progress poll to complete)
 5. In-flight requests drain (up to GRACEFUL_SHUTDOWN_TIMEOUT_MS)
 6. Connections close (BullMQ queue, Redis, PG pool)
-7. Process exits
+7. Process exits with code 0 (clean drain) or code 1 (timeout with active requests still pending)
 
 `terminationGracePeriodSeconds: 40` = 5s preStop + 30s drain + 5s buffer.
 

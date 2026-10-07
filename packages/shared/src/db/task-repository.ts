@@ -186,6 +186,49 @@ export class TaskRepository {
     }
   }
 
+  async reclaimStalledTask(taskId: string, expectedVersion: number): Promise<Task> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const lockResult = await client.query(
+        'SELECT * FROM tasks WHERE id = $1 FOR UPDATE',
+        [taskId],
+      );
+
+      if (lockResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Task ${taskId} not found`);
+      }
+
+      const current = rowToTask(lockResult.rows[0]);
+
+      if (current.status !== 'PROCESSING') {
+        await client.query('ROLLBACK');
+        throw new Error(`Cannot reclaim task ${taskId}: status is ${current.status}, expected PROCESSING`);
+      }
+
+      if (current.version !== expectedVersion) {
+        await client.query('ROLLBACK');
+        throw new StaleVersionError(taskId, expectedVersion, current.version);
+      }
+
+      const updateResult = await client.query(
+        `UPDATE tasks SET version = version + 1, updated_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [taskId],
+      );
+
+      await client.query('COMMIT');
+      return rowToTask(updateResult.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async cancelTask(taskId: string): Promise<Task> {
     const client = await this.pool.connect();
     try {
@@ -225,7 +268,7 @@ export class TaskRepository {
       `SELECT status, COUNT(*)::int as count FROM tasks GROUP BY status`,
     );
     const counts: Record<string, number> = {
-      PENDING: 0, QUEUED: 0, PROCESSING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0,
+      QUEUED: 0, PROCESSING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0,
     };
     for (const row of result.rows) {
       counts[row.status] = row.count;

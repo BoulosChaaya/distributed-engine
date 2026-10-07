@@ -83,15 +83,38 @@ const worker = new Worker(
       return { status: 'SKIPPED', taskId, reason: 'already_completed' };
     }
 
-    try {
-      await taskRepo.transitionStatus(taskId, currentTask.version, 'PROCESSING', {
-        startedAt: new Date(),
-      });
-    } catch (error) {
-      log('WARN', 'Failed to transition task to PROCESSING', {
-        taskId, error: String(error), workerId: WORKER_ID,
-      });
-      return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
+    if (currentTask.status === 'FAILED') {
+      log('INFO', 'Task already failed, skipping', { taskId, workerId: WORKER_ID });
+      return { status: 'SKIPPED', taskId, reason: 'already_failed' };
+    }
+
+    let taskVersion = currentTask.version;
+
+    if (currentTask.status === 'QUEUED') {
+      try {
+        const updated = await taskRepo.transitionStatus(taskId, taskVersion, 'PROCESSING', {
+          startedAt: new Date(),
+        });
+        taskVersion = updated.version;
+      } catch (error) {
+        log('WARN', 'Failed to transition task to PROCESSING', {
+          taskId, error: String(error), workerId: WORKER_ID,
+        });
+        return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
+      }
+    } else if (currentTask.status === 'PROCESSING') {
+      // BullMQ redelivered a stalled job — the previous worker died.
+      // The task is already PROCESSING so we reclaim it by re-reading with a lock.
+      try {
+        const reclaimed = await taskRepo.reclaimStalledTask(taskId, taskVersion);
+        taskVersion = reclaimed.version;
+        log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
+      } catch (error) {
+        log('WARN', 'Failed to reclaim stalled task', {
+          taskId, error: String(error), workerId: WORKER_ID,
+        });
+        return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
+      }
     }
 
     try {
@@ -103,7 +126,7 @@ const worker = new Worker(
         return { status: 'CANCELLED', taskId };
       }
 
-      await taskRepo.transitionStatus(taskId, currentTask.version + 1, 'COMPLETED', {
+      await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
         completedAt: new Date(),
         result: { processedBy: WORKER_ID },
       });

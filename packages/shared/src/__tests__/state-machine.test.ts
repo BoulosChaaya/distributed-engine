@@ -4,14 +4,6 @@ import { TaskStatus } from '../types';
 
 describe('Task State Machine', () => {
   describe('isValidTransition', () => {
-    it('should allow PENDING -> QUEUED', () => {
-      expect(isValidTransition('PENDING', 'QUEUED')).toBe(true);
-    });
-
-    it('should allow PENDING -> CANCELLED', () => {
-      expect(isValidTransition('PENDING', 'CANCELLED')).toBe(true);
-    });
-
     it('should allow QUEUED -> PROCESSING', () => {
       expect(isValidTransition('QUEUED', 'PROCESSING')).toBe(true);
     });
@@ -41,25 +33,17 @@ describe('Task State Machine', () => {
     });
 
     it('should reject COMPLETED -> any', () => {
-      const statuses: TaskStatus[] = ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
+      const statuses: TaskStatus[] = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
       for (const status of statuses) {
         expect(isValidTransition('COMPLETED', status)).toBe(false);
       }
     });
 
     it('should reject CANCELLED -> any', () => {
-      const statuses: TaskStatus[] = ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
+      const statuses: TaskStatus[] = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
       for (const status of statuses) {
         expect(isValidTransition('CANCELLED', status)).toBe(false);
       }
-    });
-
-    it('should reject PENDING -> COMPLETED (skipping states)', () => {
-      expect(isValidTransition('PENDING', 'COMPLETED')).toBe(false);
-    });
-
-    it('should reject PENDING -> PROCESSING (skipping QUEUED)', () => {
-      expect(isValidTransition('PENDING', 'PROCESSING')).toBe(false);
     });
 
     it('should reject QUEUED -> COMPLETED (skipping PROCESSING)', () => {
@@ -69,7 +53,6 @@ describe('Task State Machine', () => {
 
   describe('assertValidTransition', () => {
     it('should not throw for valid transitions', () => {
-      expect(() => assertValidTransition('PENDING', 'QUEUED')).not.toThrow();
       expect(() => assertValidTransition('QUEUED', 'PROCESSING')).not.toThrow();
       expect(() => assertValidTransition('PROCESSING', 'COMPLETED')).not.toThrow();
     });
@@ -93,7 +76,7 @@ describe('Task State Machine', () => {
 
   describe('VALID_TRANSITIONS exhaustiveness', () => {
     it('should define transitions for all statuses', () => {
-      const allStatuses: TaskStatus[] = ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
+      const allStatuses: TaskStatus[] = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
       for (const status of allStatuses) {
         expect(VALID_TRANSITIONS).toHaveProperty(status);
         expect(Array.isArray(VALID_TRANSITIONS[status])).toBe(true);
