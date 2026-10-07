@@ -104,7 +104,7 @@ QUEUED ──▶ PROCESSING ──▶ COMPLETED
   │  └────────┘  │  └── (BullMQ retry: intermediate failure)
   │              │
   │              ▼
-  │           FAILED ──▶ QUEUED (manual retry)
+  │           FAILED
   │              
   ▼
 CANCELLED ◀── QUEUED | PROCESSING
@@ -113,7 +113,7 @@ CANCELLED ◀── QUEUED | PROCESSING
 - **QUEUED**: Task created and waiting for a worker
 - **PROCESSING**: Worker has picked up the task
 - **COMPLETED**: Task finished successfully (terminal)
-- **FAILED**: Task failed after all retries exhausted (terminal, can be manually re-queued)
+- **FAILED**: Task failed after all retries exhausted (terminal). The state machine permits FAILED → QUEUED but no user-facing retry endpoint is exposed.
 - **CANCELLED**: Task cancelled by user (terminal)
 
 ## Reliability Patterns
@@ -130,7 +130,7 @@ Task creation and the outbox event are inserted in a single PG transaction. The 
 
 ### Cancellation Safety
 
-The outbox publisher checks task status under `SELECT FOR UPDATE` inside the same transaction as BullMQ publication. A task that is cancelled between outbox creation and publication will not be published to BullMQ — the cancellation check and the publish are atomic with respect to the task row.
+The outbox publisher performs a best-effort cancellation check before publishing to BullMQ. Because PostgreSQL and Redis are separate systems, the check and the publish are **not** atomic — a task can be cancelled between the check and the BullMQ.add() call. If this race occurs, BullMQ will hold a job for a cancelled task. The worker guards (status check before processing, version-checked state transitions) ensure such a job is skipped harmlessly. PostgreSQL is the authoritative source of task state; workers always verify task status before processing.
 
 ### Optimistic Concurrency
 

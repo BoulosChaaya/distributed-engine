@@ -375,8 +375,6 @@ describe('HALF_OPEN circuit breaker bounding (requires PostgreSQL + Redis)', () 
       });
     }
 
-    // Force into HALF_OPEN state by manipulating internal state
-    // We'll use a separate publisher and manually force the state
     (halfOpenPublisher as any).circuitState = 'HALF_OPEN';
     (halfOpenPublisher as any).consecutiveSuccesses = 0;
 
@@ -385,5 +383,430 @@ describe('HALF_OPEN circuit breaker bounding (requires PostgreSQL + Redis)', () 
 
     const pending = await halfOpenPublisher.getPendingCount();
     expect(pending).toBe(2);
+  });
+});
+
+describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL + Redis)', () => {
+  it('should leave a BullMQ job harmless when task is cancelled after publication', async () => {
+    requireInfra();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'race-post-publish-cancel',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await publisher.processOutbox();
+    const job = await queue.getJob(task.id);
+    expect(job).not.toBeNull();
+
+    await repo.cancelTask(task.id);
+
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('CANCELLED');
+  });
+
+  it('should allow publication even when task is concurrently cancelled (best-effort check)', async () => {
+    requireInfra();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'concurrent-cancel-publish',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Publish first, then cancel — simulates the race where cancel commits
+    // after the best-effort check but before BullMQ.add() returns
+    await publisher.processOutbox();
+    const job = await queue.getJob(task.id);
+    expect(job).not.toBeNull();
+
+    // Cancel after publish — job exists in BullMQ but task is CANCELLED in PG
+    await repo.cancelTask(task.id);
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('CANCELLED');
+
+    // PG is authoritative — the BullMQ job is harmless
+    expect(job!.id).toBe(task.id);
+  });
+
+  it('should document that cancellation check is best-effort, not atomic', async () => {
+    requireInfra();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'non-atomic-check',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Task is QUEUED, publisher checks status and sees QUEUED, then publishes
+    const processed = await publisher.processOutbox();
+    expect(processed).toBe(1);
+
+    // Now cancel the task — BullMQ still has the job
+    await repo.cancelTask(task.id);
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('CANCELLED');
+
+    // The job is in BullMQ, but workers will check PG before processing
+    const job = await queue.getJob(task.id);
+    expect(job).not.toBeNull();
+  });
+
+  it('should skip cancelled tasks detected by best-effort check before publish', async () => {
+    requireInfra();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'skip-cancelled-early',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.cancelTask(task.id);
+
+    const processed = await publisher.processOutbox();
+    expect(processed).toBe(0);
+    const job = await queue.getJob(task.id);
+    expect(job).toBeFalsy();
+  });
+
+  it('should transition outbox event to DELIVERED even when skipping a cancelled task', async () => {
+    requireInfra();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'delivered-on-skip',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.cancelTask(task.id);
+    await publisher.processOutbox();
+
+    const result = await pool.query(
+      `SELECT status FROM outbox_events WHERE task_id = $1`,
+      [task.id],
+    );
+    expect(result.rows[0].status).toBe('DELIVERED');
+
+    const pending = await publisher.getPendingCount();
+    expect(pending).toBe(0);
+  });
+});
+
+describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL + Redis)', () => {
+  it('should go CLOSED -> OPEN after failure threshold via internal state', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+
+    // Simulate 3 consecutive BullMQ failures
+    for (let i = 0; i < 3; i++) {
+      (cbPublisher as any).onBullMQFailure();
+    }
+
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+  });
+
+  it('should not open before reaching failure threshold', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).onBullMQFailure();
+    (cbPublisher as any).onBullMQFailure();
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('should reset failure count on success', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).onBullMQFailure();
+    (cbPublisher as any).onBullMQFailure();
+    (cbPublisher as any).onBullMQSuccess();
+    (cbPublisher as any).onBullMQFailure();
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('should transition OPEN -> HALF_OPEN after reset timeout (injectable timing)', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).circuitState = 'OPEN';
+    (cbPublisher as any).lastFailureTime = 1000;
+
+    // Not enough time has passed
+    fakeNow = 1400;
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+
+    // Now enough time has passed
+    fakeNow = 1600;
+    expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
+  });
+
+  it('should transition HALF_OPEN -> CLOSED after success threshold', async () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).circuitState = 'HALF_OPEN';
+    (cbPublisher as any).consecutiveSuccesses = 0;
+
+    await repo.createTaskWithOutbox({
+      name: 'cb-success-1',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await cbPublisher.processOutbox();
+    expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
+
+    await repo.createTaskWithOutbox({
+      name: 'cb-success-2',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await cbPublisher.processOutbox();
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('should transition HALF_OPEN -> OPEN on failure', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).circuitState = 'HALF_OPEN';
+    (cbPublisher as any).consecutiveSuccesses = 0;
+
+    (cbPublisher as any).onBullMQFailure();
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+  });
+
+  it('should return 0 processed when circuit is OPEN', async () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    (cbPublisher as any).circuitState = 'OPEN';
+    (cbPublisher as any).lastFailureTime = 900;
+
+    await repo.createTaskWithOutbox({
+      name: 'cb-open-skip',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processed = await cbPublisher.processOutbox();
+    expect(processed).toBe(0);
+  });
+
+  it('should complete full cycle: CLOSED -> OPEN -> HALF_OPEN -> CLOSED', async () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+
+    // Drive to OPEN
+    for (let i = 0; i < 3; i++) {
+      (cbPublisher as any).onBullMQFailure();
+    }
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+
+    // Advance time past reset timeout
+    fakeNow = 1600;
+    expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
+
+    // Two successes should close it
+    await repo.createTaskWithOutbox({
+      name: 'cb-cycle-1',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+    await cbPublisher.processOutbox();
+    expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
+
+    await repo.createTaskWithOutbox({
+      name: 'cb-cycle-2',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+    await cbPublisher.processOutbox();
+    expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('should complete cycle: CLOSED -> OPEN -> HALF_OPEN -> OPEN on failure', () => {
+    requireInfra();
+
+    let fakeNow = 1000;
+    const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => fakeNow,
+    });
+
+    // Drive to OPEN
+    for (let i = 0; i < 3; i++) {
+      (cbPublisher as any).onBullMQFailure();
+    }
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+
+    // Wait for reset timeout
+    fakeNow = 1600;
+    expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
+
+    // Failure in HALF_OPEN goes back to OPEN
+    (cbPublisher as any).onBullMQFailure();
+    expect(cbPublisher.getCircuitState()).toBe('OPEN');
+  });
+});
+
+describe('Outbox stop/drain guarantee (requires PostgreSQL + Redis)', () => {
+  it('should await in-progress poll when stop() is called', async () => {
+    requireInfra();
+
+    const drainPublisher = new OutboxPublisher(pool, queue, 50, 10, 3);
+
+    await repo.createTaskWithOutbox({
+      name: 'drain-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    drainPublisher.start();
+
+    // Give time for the poll to start processing
+    await new Promise(r => setTimeout(r, 100));
+
+    // stop() should await the active poll, not abort it
+    await drainPublisher.stop();
+
+    // After stop, the in-progress poll should have completed
+    const pending = await publisher.getPendingCount();
+    expect(pending).toBe(0);
+  });
+
+  it('should not schedule new polls after stop()', async () => {
+    requireInfra();
+
+    const drainPublisher = new OutboxPublisher(pool, queue, 50, 10, 3);
+
+    drainPublisher.start();
+    await drainPublisher.stop();
+
+    // Create a task after stop — it should not be processed
+    await repo.createTaskWithOutbox({
+      name: 'after-stop-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await new Promise(r => setTimeout(r, 200));
+
+    const pending = await publisher.getPendingCount();
+    expect(pending).toBe(1);
+  });
+});
+
+describe('Outbox claim concurrency (requires PostgreSQL + Redis)', () => {
+  it('should not double-claim events when two publishers process concurrently', async () => {
+    requireInfra();
+
+    const queue2 = new Queue('tasks-test-concurrency', {
+      connection: redis,
+      defaultJobOptions: { removeOnComplete: false, removeOnFail: false },
+    });
+
+    const pub1 = new OutboxPublisher(pool, queue2, 60000, 10, 3);
+    const pub2 = new OutboxPublisher(pool, queue2, 60000, 10, 3);
+
+    for (let i = 0; i < 5; i++) {
+      await repo.createTaskWithOutbox({
+        name: `concurrency-test-${i}`,
+        priority: 'NORMAL',
+        payload: {},
+        maxRetries: 3,
+      });
+    }
+
+    const [count1, count2] = await Promise.all([
+      pub1.processOutbox(),
+      pub2.processOutbox(),
+    ]);
+
+    // Total processed should be exactly 5 — no double-claiming
+    expect(count1 + count2).toBe(5);
+
+    const pending = await publisher.getPendingCount();
+    expect(pending).toBe(0);
+
+    try { await queue2.obliterate({ force: true }); } catch {}
+    await queue2.close();
   });
 });

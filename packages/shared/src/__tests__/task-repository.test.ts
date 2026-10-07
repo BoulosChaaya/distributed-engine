@@ -367,3 +367,278 @@ describe('Migration concurrency (requires PostgreSQL)', () => {
     }
   });
 });
+
+describe('Clean-database migration (requires PostgreSQL)', () => {
+  it('should produce correct schema on a fresh database (DEFAULT is QUEUED, not PENDING)', async () => {
+    requirePg();
+
+    // Drop all tables to simulate a clean database
+    await pool.query('DROP TABLE IF EXISTS outbox_events, tasks, schema_migrations CASCADE');
+
+    // Run migrations from scratch
+    await runMigrations(pool);
+
+    // Verify the DEFAULT for status column is 'QUEUED'
+    const colDefault = await pool.query(`
+      SELECT column_default FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'status'
+    `);
+    expect(colDefault.rows[0].column_default).toBe("'QUEUED'::text");
+
+    // Verify the CHECK constraint allows only valid statuses (no PENDING)
+    const checkConstraint = await pool.query(`
+      SELECT pg_get_constraintdef(c.oid) as def
+      FROM pg_constraint c
+      JOIN pg_class t ON c.conrelid = t.oid
+      WHERE t.relname = 'tasks' AND c.conname = 'valid_status'
+    `);
+    expect(checkConstraint.rows.length).toBe(1);
+    const constraintDef = checkConstraint.rows[0].def;
+    expect(constraintDef).not.toContain('PENDING');
+    expect(constraintDef).toContain('QUEUED');
+
+    // Verify claimed_by column exists (migration 5)
+    const claimedByCol = await pool.query(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'claimed_by'
+    `);
+    expect(claimedByCol.rows.length).toBe(1);
+
+    // Verify a task can be inserted with the default status
+    const insertResult = await pool.query(
+      `INSERT INTO tasks (id, name, priority, payload, max_retries, retries, version, created_at, updated_at)
+       VALUES ('clean-db-test', 'test', 'NORMAL', '{}', 3, 0, 1, NOW(), NOW())
+       RETURNING status`
+    );
+    expect(insertResult.rows[0].status).toBe('QUEUED');
+
+    // Clean up
+    await pool.query('TRUNCATE outbox_events, tasks CASCADE');
+  });
+});
+
+describe('Task ownership semantics (requires PostgreSQL)', () => {
+  it('should set claimed_by when transitioning to PROCESSING', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-processing',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    expect(processing.claimedBy).toBe('worker-A');
+  });
+
+  it('should clear claimed_by when transitioning to COMPLETED', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-completed',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const completed = await repo.transitionStatus(task.id, 2, 'COMPLETED', {
+      completedAt: new Date(),
+    });
+
+    expect(completed.claimedBy).toBeUndefined();
+  });
+
+  it('should clear claimed_by when transitioning to FAILED', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-failed',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const failed = await repo.transitionStatus(task.id, 2, 'FAILED', {
+      error: 'test error',
+    });
+
+    expect(failed.claimedBy).toBeUndefined();
+  });
+
+  it('should clear claimed_by when transitioning to CANCELLED', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-cancelled',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const cancelled = await repo.cancelTask(task.id);
+    expect(cancelled.claimedBy).toBeUndefined();
+  });
+
+  it('should update claimed_by on reclaim with new worker ID', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const reclaimed = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B');
+    expect(reclaimed.claimedBy).toBe('worker-B');
+    expect(reclaimed.version).toBe(processing.version + 1);
+  });
+
+  it('should reject self-reclaim (same worker ID)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-self-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    await expect(
+      repo.reclaimStalledTask(task.id, processing.version, 'worker-A'),
+    ).rejects.toThrow('already claimed by this worker');
+  });
+
+  it('should allow reclaim without worker ID (backward compatibility)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-no-id-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+    });
+
+    const reclaimed = await repo.reclaimStalledTask(task.id, processing.version);
+    expect(reclaimed.version).toBe(processing.version + 1);
+  });
+});
+
+describe('Worker completion race (requires PostgreSQL)', () => {
+  it('should prevent COMPLETED transition on a CANCELLED task via version check', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'completion-race',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker transitions to PROCESSING (version 1 -> 2)
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Cancel the task (version 2 -> 3)
+    await repo.cancelTask(task.id);
+
+    // Worker tries to complete with stale version 2 — should be rejected
+    await expect(
+      repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() }),
+    ).rejects.toThrow(StaleVersionError);
+
+    // Task should remain CANCELLED
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('CANCELLED');
+  });
+
+  it('should prevent COMPLETED transition when another worker reclaimed the task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'double-reclaim-race',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker A transitions to PROCESSING (version 1 -> 2)
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Worker B reclaims (version 2 -> 3)
+    await repo.reclaimStalledTask(task.id, 2, 'worker-B');
+
+    // Worker A tries to complete with stale version 2
+    await expect(
+      repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() }),
+    ).rejects.toThrow(StaleVersionError);
+
+    // Task is still PROCESSING, now owned by worker-B
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimedBy).toBe('worker-B');
+  });
+
+  it('should clear claimed_by when transitioning PROCESSING -> QUEUED on retry', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'retry-clear-owner',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const requeued = await repo.transitionStatus(task.id, 2, 'QUEUED', {
+      error: 'intermediate failure',
+      retries: 1,
+    });
+
+    expect(requeued.claimedBy).toBeUndefined();
+    expect(requeued.status).toBe('QUEUED');
+  });
+});

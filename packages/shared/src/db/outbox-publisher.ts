@@ -22,9 +22,10 @@ export class OutboxPublisher {
   private consecutiveFailures = 0;
   private consecutiveSuccesses = 0;
   private lastFailureTime = 0;
-  private readonly circuitFailureThreshold = 5;
-  private readonly circuitSuccessThreshold = 2;
-  private readonly circuitResetTimeoutMs = 30000;
+  private readonly circuitFailureThreshold: number;
+  private readonly circuitSuccessThreshold: number;
+  private readonly circuitResetTimeoutMs: number;
+  private readonly nowFn: () => number;
 
   constructor(
     private pool: Pool,
@@ -32,8 +33,18 @@ export class OutboxPublisher {
     private pollIntervalMs: number = 1000,
     private batchSize: number = 10,
     private maxAttempts: number = 5,
+    circuitOptions?: {
+      failureThreshold?: number;
+      successThreshold?: number;
+      resetTimeoutMs?: number;
+      nowFn?: () => number;
+    },
   ) {
     this.publisherId = generateId().substring(0, 12);
+    this.circuitFailureThreshold = circuitOptions?.failureThreshold ?? 5;
+    this.circuitSuccessThreshold = circuitOptions?.successThreshold ?? 2;
+    this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
+    this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
   }
 
   start(): void {
@@ -63,7 +74,7 @@ export class OutboxPublisher {
   getCircuitState(): CircuitState {
     if (
       this.circuitState === 'OPEN' &&
-      Date.now() - this.lastFailureTime > this.circuitResetTimeoutMs
+      this.nowFn() - this.lastFailureTime > this.circuitResetTimeoutMs
     ) {
       this.circuitState = 'HALF_OPEN';
       this.consecutiveSuccesses = 0;
@@ -84,7 +95,7 @@ export class OutboxPublisher {
   }
 
   private onBullMQFailure(): void {
-    this.lastFailureTime = Date.now();
+    this.lastFailureTime = this.nowFn();
     if (this.circuitState === 'HALF_OPEN') {
       this.circuitState = 'OPEN';
       this.consecutiveFailures = 0;
@@ -215,8 +226,13 @@ export class OutboxPublisher {
     const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
     const maxRetries = (payload.maxRetries as number) ?? 3;
 
+    // Best-effort cancellation check. This is NOT atomic with the BullMQ.add()
+    // below — a cancellation can commit between this read and the add. If that
+    // happens, BullMQ will hold a job for a cancelled task. The worker guards
+    // (status check before processing) ensure such a job is skipped harmlessly.
+    // PostgreSQL is the authoritative source of task state.
     const taskCheck = await client.query(
-      `SELECT status FROM tasks WHERE id = $1 FOR UPDATE`,
+      `SELECT status FROM tasks WHERE id = $1`,
       [event.taskId],
     );
 

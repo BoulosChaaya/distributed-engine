@@ -70,7 +70,7 @@ Outbox Publisher            PostgreSQL              BullMQ/Redis
 Key properties:
 - **Idempotent publication**: Uses taskId as BullMQ jobId. Re-publishing the same event is a no-op while the job exists in BullMQ. After BullMQ removes completed jobs (retention of 100 jobs), the jobId becomes reusable — but this only matters if outbox events are manually reset, since the outbox marks events DELIVERED on successful publication.
 - **Per-job retry config**: Each BullMQ job gets `attempts = maxRetries + 1` from the task's configuration.
-- **Cancellation safety**: The publisher checks task status under `SELECT FOR UPDATE` before calling `BullMQ.add()`. This makes the cancellation check and publish atomic with respect to the task row — a concurrent cancellation will either complete before the lock (publisher sees CANCELLED and skips) or wait until after publication.
+- **Cancellation best-effort check**: The publisher checks task status before calling `BullMQ.add()`. Because PostgreSQL and Redis are separate systems, this check is **not** atomic with the publish — a concurrent cancellation can commit between the check and the add. If this race occurs, BullMQ holds a job for a cancelled task, but the worker's status check before processing ensures it is skipped harmlessly. PostgreSQL is the authoritative source of task state.
 - **Circuit breaker**: After 5 consecutive BullMQ failures, the publisher enters OPEN state and stops attempting for 30 seconds. In HALF_OPEN state, only a single event is processed as a probe (not the full batch).
 
 ### 3. Task Processing
@@ -109,8 +109,8 @@ If a worker crashes while processing a task:
 
 1. BullMQ detects the stalled job (via `stalledInterval`, default 5 seconds)
 2. BullMQ redelivers the job to another worker
-3. The new worker finds the task in PROCESSING state
-4. The worker reclaims the task by verifying the version and bumping it under a row lock (`reclaimStalledTask`)
+3. The new worker finds the task in PROCESSING state with the crashed worker's ID in `claimed_by`
+4. The new worker reclaims the task by verifying the version, setting its own worker ID as the new `claimed_by`, and bumping the version under a row lock (`reclaimStalledTask`)
 5. Processing continues from the start
 
 BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be reclaimed. After that limit, BullMQ marks the job as failed and the worker transitions the task to FAILED.
@@ -131,7 +131,7 @@ BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be
 - BullMQ Worker consuming from the "tasks" queue
 - Publishes heartbeat to Redis every 10 seconds (`worker:{id}` key with 30s TTL)
 - Validates task state in PG before processing (skips cancelled/completed/failed/missing tasks)
-- Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash
+- Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash, recording worker ownership (`claimed_by`) to distinguish the current executor from the crashed one
 - Uses optimistic concurrency (version check) on all state transitions
 - Graceful shutdown: stops consuming new jobs, waits for in-flight jobs to complete (30s timeout), removes heartbeat key, closes connections
 
