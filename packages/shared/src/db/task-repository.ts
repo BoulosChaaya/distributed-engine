@@ -32,11 +32,13 @@ function rowToTask(row: Record<string, unknown>): Task {
     startedAt: row.started_at ? new Date(row.started_at as string) : undefined,
     completedAt: row.completed_at ? new Date(row.completed_at as string) : undefined,
     claimedBy: (row.claimed_by as string) || undefined,
+    claimToken: (row.claim_token as string) || undefined,
+    claimExpiresAt: row.claim_expires_at ? new Date(row.claim_expires_at as string) : undefined,
   };
 }
 
 export class TaskRepository {
-  constructor(private pool: Pool) {}
+  constructor(private pool: Pool, private claimTtlMs: number = 30000) {}
 
   async createTaskWithOutbox(input: CreateTaskInput): Promise<TaskWithOutbox> {
     const taskId = generateId();
@@ -113,7 +115,7 @@ export class TaskRepository {
     taskId: string,
     expectedVersion: number,
     toStatus: TaskStatus,
-    extra?: Partial<Pick<Task, 'error' | 'result' | 'retries' | 'startedAt' | 'completedAt' | 'claimedBy'>>,
+    extra?: Partial<Pick<Task, 'error' | 'result' | 'retries' | 'startedAt' | 'completedAt' | 'claimedBy' | 'claimToken'>>,
   ): Promise<Task> {
     const client = await this.pool.connect();
     try {
@@ -137,6 +139,13 @@ export class TaskRepository {
       }
 
       assertValidTransition(current.status, toStatus);
+
+      if (current.status === 'PROCESSING' && current.claimToken) {
+        if (!extra?.claimToken || extra.claimToken !== current.claimToken) {
+          await client.query('ROLLBACK');
+          throw new ClaimTokenMismatchError(taskId, extra?.claimToken, current.claimToken);
+        }
+      }
 
       const setClauses = [
         'status = $2',
@@ -172,6 +181,20 @@ export class TaskRepository {
         paramIndex++;
       }
 
+      if (toStatus === 'PROCESSING') {
+        const claimToken = generateId();
+        const claimExpiresAt = new Date(Date.now() + this.claimTtlMs);
+        setClauses.push(`claim_token = $${paramIndex}`);
+        values.push(claimToken);
+        paramIndex++;
+        setClauses.push(`claim_expires_at = $${paramIndex}`);
+        values.push(claimExpiresAt);
+        paramIndex++;
+      } else if (current.status === 'PROCESSING') {
+        setClauses.push('claim_token = NULL');
+        setClauses.push('claim_expires_at = NULL');
+      }
+
       if (extra?.claimedBy !== undefined) {
         setClauses.push(`claimed_by = $${paramIndex}`);
         values.push(extra.claimedBy);
@@ -201,7 +224,7 @@ export class TaskRepository {
       await client.query('BEGIN');
 
       const lockResult = await client.query(
-        'SELECT * FROM tasks WHERE id = $1 FOR UPDATE',
+        'SELECT *, NOW() as db_now FROM tasks WHERE id = $1 FOR UPDATE',
         [taskId],
       );
 
@@ -227,10 +250,19 @@ export class TaskRepository {
         throw new Error(`Cannot reclaim task ${taskId}: already claimed by this worker (${workerId})`);
       }
 
+      const dbNow = new Date(lockResult.rows[0].db_now as string);
+      if (current.claimExpiresAt && current.claimExpiresAt > dbNow) {
+        await client.query('ROLLBACK');
+        throw new ClaimNotExpiredError(taskId, current.claimExpiresAt);
+      }
+
+      const claimToken = generateId();
+      const claimExpiresAt = new Date(Date.now() + this.claimTtlMs);
+
       const updateResult = await client.query(
-        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2
+        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2, claim_token = $3, claim_expires_at = $4
          WHERE id = $1 RETURNING *`,
-        [taskId, workerId || null],
+        [taskId, workerId || null, claimToken, claimExpiresAt],
       );
 
       await client.query('COMMIT');
@@ -262,7 +294,7 @@ export class TaskRepository {
       assertValidTransition(current.status, 'CANCELLED');
 
       const updateResult = await client.query(
-        `UPDATE tasks SET status = 'CANCELLED', version = version + 1, updated_at = NOW(), claimed_by = NULL
+        `UPDATE tasks SET status = 'CANCELLED', version = version + 1, updated_at = NOW(), claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
          WHERE id = $1 RETURNING *`,
         [taskId],
       );
@@ -304,5 +336,26 @@ export class StaleVersionError extends Error {
   ) {
     super(`Stale version for task ${taskId}: expected ${expected}, got ${actual}`);
     this.name = 'StaleVersionError';
+  }
+}
+
+export class ClaimTokenMismatchError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly provided: string | undefined,
+    public readonly expected: string,
+  ) {
+    super(`Claim token mismatch for task ${taskId}: provided ${provided || 'none'}, expected ${expected}`);
+    this.name = 'ClaimTokenMismatchError';
+  }
+}
+
+export class ClaimNotExpiredError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly expiresAt: Date,
+  ) {
+    super(`Cannot reclaim task ${taskId}: claim has not expired (expires at ${expiresAt.toISOString()})`);
+    this.name = 'ClaimNotExpiredError';
   }
 }

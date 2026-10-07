@@ -17,6 +17,8 @@ export interface Task {
   completedAt?: Date;
   version: number;
   claimedBy?: string;
+  claimToken?: string;
+  claimExpiresAt?: Date;
 }
 
 export type WorkerStatus = 'ONLINE' | 'OFFLINE' | 'BUSY';

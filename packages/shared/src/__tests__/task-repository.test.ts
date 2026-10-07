@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
 import { Pool } from 'pg';
-import { TaskRepository, StaleVersionError } from '../db/task-repository';
+import { TaskRepository, StaleVersionError, ClaimTokenMismatchError, ClaimNotExpiredError } from '../db/task-repository';
 import { InvalidTransitionError } from '../state-machine';
 import { runMigrations } from '../db/migrations';
 
@@ -124,10 +124,12 @@ describe('TaskRepository (requires PostgreSQL)', () => {
     expect(processing.status).toBe('PROCESSING');
     expect(processing.version).toBe(2);
     expect(processing.startedAt).toBeDefined();
+    expect(processing.claimToken).toBeDefined();
 
     const completed = await repo.transitionStatus(task.id, 2, 'COMPLETED', {
       completedAt: new Date(),
       result: { output: 'done' },
+      claimToken: processing.claimToken,
     });
     expect(completed.status).toBe('COMPLETED');
     expect(completed.version).toBe(3);
@@ -211,8 +213,11 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING');
-    await repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() });
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    await repo.transitionStatus(task.id, 2, 'COMPLETED', {
+      completedAt: new Date(),
+      claimToken: processing.claimToken,
+    });
 
     await expect(repo.cancelTask(task.id)).rejects.toThrow(InvalidTransitionError);
   });
@@ -248,8 +253,12 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING');
-    await repo.transitionStatus(task.id, 2, 'FAILED', { error: 'temporary error', retries: 1 });
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    await repo.transitionStatus(task.id, 2, 'FAILED', {
+      error: 'temporary error',
+      retries: 1,
+      claimToken: processing.claimToken,
+    });
 
     const retried = await repo.transitionStatus(task.id, 3, 'QUEUED');
     expect(retried.status).toBe('QUEUED');
@@ -266,11 +275,12 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING');
 
     const requeued = await repo.transitionStatus(task.id, 2, 'QUEUED', {
       error: 'intermediate failure',
       retries: 1,
+      claimToken: processing.claimToken,
     });
     expect(requeued.status).toBe('QUEUED');
     expect(requeued.version).toBe(3);
@@ -295,7 +305,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
     expect(dbOutbox.rows[0].task_id).toBe(task.id);
   });
 
-  it('should reclaim a stalled PROCESSING task', async () => {
+  it('should reclaim a stalled PROCESSING task with expired claim', async () => {
     requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
@@ -309,9 +319,17 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       startedAt: new Date(),
     });
 
+    // Expire the claim so reclaim is allowed
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
     const reclaimed = await repo.reclaimStalledTask(task.id, processing.version);
     expect(reclaimed.status).toBe('PROCESSING');
     expect(reclaimed.version).toBe(processing.version + 1);
+    expect(reclaimed.claimToken).toBeDefined();
+    expect(reclaimed.claimToken).not.toBe(processing.claimToken);
   });
 
   it('should reject reclaim on non-PROCESSING task', async () => {
@@ -369,23 +387,18 @@ describe('Migration concurrency (requires PostgreSQL)', () => {
 });
 
 describe('Clean-database migration (requires PostgreSQL)', () => {
-  it('should produce correct schema on a fresh database (DEFAULT is QUEUED, not PENDING)', async () => {
+  it('should produce correct schema on a fresh database', async () => {
     requirePg();
 
-    // Drop all tables to simulate a clean database
     await pool.query('DROP TABLE IF EXISTS outbox_events, tasks, schema_migrations CASCADE');
-
-    // Run migrations from scratch
     await runMigrations(pool);
 
-    // Verify the DEFAULT for status column is 'QUEUED'
     const colDefault = await pool.query(`
       SELECT column_default FROM information_schema.columns
       WHERE table_name = 'tasks' AND column_name = 'status'
     `);
     expect(colDefault.rows[0].column_default).toBe("'QUEUED'::text");
 
-    // Verify the CHECK constraint allows only valid statuses (no PENDING)
     const checkConstraint = await pool.query(`
       SELECT pg_get_constraintdef(c.oid) as def
       FROM pg_constraint c
@@ -397,14 +410,25 @@ describe('Clean-database migration (requires PostgreSQL)', () => {
     expect(constraintDef).not.toContain('PENDING');
     expect(constraintDef).toContain('QUEUED');
 
-    // Verify claimed_by column exists (migration 5)
     const claimedByCol = await pool.query(`
       SELECT column_name FROM information_schema.columns
       WHERE table_name = 'tasks' AND column_name = 'claimed_by'
     `);
     expect(claimedByCol.rows.length).toBe(1);
 
-    // Verify a task can be inserted with the default status
+    // Verify claim_token and claim_expires_at columns exist (migration 6)
+    const claimTokenCol = await pool.query(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'claim_token'
+    `);
+    expect(claimTokenCol.rows.length).toBe(1);
+
+    const claimExpiresCol = await pool.query(`
+      SELECT column_name, data_type FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'claim_expires_at'
+    `);
+    expect(claimExpiresCol.rows.length).toBe(1);
+
     const insertResult = await pool.query(
       `INSERT INTO tasks (id, name, priority, payload, max_retries, retries, version, created_at, updated_at)
        VALUES ('clean-db-test', 'test', 'NORMAL', '{}', 3, 0, 1, NOW(), NOW())
@@ -412,7 +436,6 @@ describe('Clean-database migration (requires PostgreSQL)', () => {
     );
     expect(insertResult.rows[0].status).toBe('QUEUED');
 
-    // Clean up
     await pool.query('TRUNCATE outbox_events, tasks CASCADE');
   });
 });
@@ -436,6 +459,29 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
     expect(processing.claimedBy).toBe('worker-A');
   });
 
+  it('should generate claim token on QUEUED -> PROCESSING', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'ownership-claim-token',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    expect(task.claimToken).toBeUndefined();
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    expect(processing.claimToken).toBeDefined();
+    expect(processing.claimToken!.length).toBeGreaterThan(0);
+    expect(processing.claimExpiresAt).toBeDefined();
+    expect(processing.claimExpiresAt!.getTime()).toBeGreaterThan(Date.now() - 1000);
+  });
+
   it('should clear claimed_by when transitioning to COMPLETED', async () => {
     requirePg();
 
@@ -446,16 +492,19 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-A',
     });
 
     const completed = await repo.transitionStatus(task.id, 2, 'COMPLETED', {
       completedAt: new Date(),
+      claimToken: processing.claimToken,
     });
 
     expect(completed.claimedBy).toBeUndefined();
+    expect(completed.claimToken).toBeUndefined();
+    expect(completed.claimExpiresAt).toBeUndefined();
   });
 
   it('should clear claimed_by when transitioning to FAILED', async () => {
@@ -468,16 +517,18 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-A',
     });
 
     const failed = await repo.transitionStatus(task.id, 2, 'FAILED', {
       error: 'test error',
+      claimToken: processing.claimToken,
     });
 
     expect(failed.claimedBy).toBeUndefined();
+    expect(failed.claimToken).toBeUndefined();
   });
 
   it('should clear claimed_by when transitioning to CANCELLED', async () => {
@@ -497,6 +548,8 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
 
     const cancelled = await repo.cancelTask(task.id);
     expect(cancelled.claimedBy).toBeUndefined();
+    expect(cancelled.claimToken).toBeUndefined();
+    expect(cancelled.claimExpiresAt).toBeUndefined();
   });
 
   it('should update claimed_by on reclaim with new worker ID', async () => {
@@ -514,9 +567,17 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
       claimedBy: 'worker-A',
     });
 
+    // Expire the claim
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
     const reclaimed = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B');
     expect(reclaimed.claimedBy).toBe('worker-B');
     expect(reclaimed.version).toBe(processing.version + 1);
+    expect(reclaimed.claimToken).toBeDefined();
+    expect(reclaimed.claimToken).not.toBe(processing.claimToken);
   });
 
   it('should reject self-reclaim (same worker ID)', async () => {
@@ -539,7 +600,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
     ).rejects.toThrow('already claimed by this worker');
   });
 
-  it('should allow reclaim without worker ID (backward compatibility)', async () => {
+  it('should allow reclaim without worker ID when claim expired', async () => {
     requirePg();
 
     const { task } = await repo.createTaskWithOutbox({
@@ -552,6 +613,12 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
     const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
     });
+
+    // Expire the claim
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
 
     const reclaimed = await repo.reclaimStalledTask(task.id, processing.version);
     expect(reclaimed.version).toBe(processing.version + 1);
@@ -569,21 +636,20 @@ describe('Worker completion race (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    // Worker transitions to PROCESSING (version 1 -> 2)
-    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-A',
     });
 
-    // Cancel the task (version 2 -> 3)
     await repo.cancelTask(task.id);
 
-    // Worker tries to complete with stale version 2 — should be rejected
     await expect(
-      repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() }),
+      repo.transitionStatus(task.id, 2, 'COMPLETED', {
+        completedAt: new Date(),
+        claimToken: processing.claimToken,
+      }),
     ).rejects.toThrow(StaleVersionError);
 
-    // Task should remain CANCELLED
     const dbTask = await repo.getTask(task.id);
     expect(dbTask!.status).toBe('CANCELLED');
   });
@@ -598,21 +664,26 @@ describe('Worker completion race (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    // Worker A transitions to PROCESSING (version 1 -> 2)
-    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-A',
     });
 
-    // Worker B reclaims (version 2 -> 3)
+    // Expire claim and reclaim by worker B
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
     await repo.reclaimStalledTask(task.id, 2, 'worker-B');
 
     // Worker A tries to complete with stale version 2
     await expect(
-      repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() }),
+      repo.transitionStatus(task.id, 2, 'COMPLETED', {
+        completedAt: new Date(),
+        claimToken: processing.claimToken,
+      }),
     ).rejects.toThrow(StaleVersionError);
 
-    // Task is still PROCESSING, now owned by worker-B
     const dbTask = await repo.getTask(task.id);
     expect(dbTask!.status).toBe('PROCESSING');
     expect(dbTask!.claimedBy).toBe('worker-B');
@@ -628,7 +699,7 @@ describe('Worker completion race (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-A',
     });
@@ -636,9 +707,388 @@ describe('Worker completion race (requires PostgreSQL)', () => {
     const requeued = await repo.transitionStatus(task.id, 2, 'QUEUED', {
       error: 'intermediate failure',
       retries: 1,
+      claimToken: processing.claimToken,
     });
 
     expect(requeued.claimedBy).toBeUndefined();
+    expect(requeued.claimToken).toBeUndefined();
     expect(requeued.status).toBe('QUEUED');
+  });
+});
+
+describe('Execution ownership protocol (requires PostgreSQL)', () => {
+  it('should reject reclaim when claim has not expired (live owner theft)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'live-owner-theft',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Claim is still valid (not expired) — reclaim must be rejected
+    await expect(
+      repo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+    ).rejects.toThrow(ClaimNotExpiredError);
+
+    // Task remains owned by worker-A
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.claimedBy).toBe('worker-A');
+    expect(dbTask!.claimToken).toBe(processing.claimToken);
+  });
+
+  it('should allow reclaim only after claim expires', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'expired-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Claim not expired — reclaim rejected
+    await expect(
+      repo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+    ).rejects.toThrow(ClaimNotExpiredError);
+
+    // Expire the claim
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
+    // Now reclaim succeeds
+    const reclaimed = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B');
+    expect(reclaimed.claimedBy).toBe('worker-B');
+    expect(reclaimed.claimToken).toBeDefined();
+    expect(reclaimed.claimToken).not.toBe(processing.claimToken);
+    expect(reclaimed.claimExpiresAt).toBeDefined();
+    expect(reclaimed.claimExpiresAt!.getTime()).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  it('should reject stale completion after ownership transfer (claim token mismatch)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'stale-completion',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processingA = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Expire claim and reclaim by worker B
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+    const processingB = await repo.reclaimStalledTask(task.id, processingA.version, 'worker-B');
+
+    // Worker A tries to complete with its old claim token but version 3
+    // (hypothetically if it had the right version somehow)
+    await expect(
+      repo.transitionStatus(task.id, processingB.version, 'COMPLETED', {
+        completedAt: new Date(),
+        claimToken: processingA.claimToken,
+      }),
+    ).rejects.toThrow(ClaimTokenMismatchError);
+
+    // Task remains PROCESSING owned by worker-B
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimedBy).toBe('worker-B');
+    expect(dbTask!.claimToken).toBe(processingB.claimToken);
+  });
+
+  it('should reject stale failure transition after ownership transfer', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'stale-failure',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processingA = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Expire claim and reclaim by worker B
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+    const processingB = await repo.reclaimStalledTask(task.id, processingA.version, 'worker-B');
+
+    // Worker A tries to fail the task with its old claim token
+    await expect(
+      repo.transitionStatus(task.id, processingB.version, 'FAILED', {
+        error: 'worker-A failed',
+        claimToken: processingA.claimToken,
+      }),
+    ).rejects.toThrow(ClaimTokenMismatchError);
+
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimedBy).toBe('worker-B');
+  });
+
+  it('should allow current owner to complete with correct claim token', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'owner-completes',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const completed = await repo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { output: 'success' },
+      claimToken: processing.claimToken,
+    });
+
+    expect(completed.status).toBe('COMPLETED');
+    expect(completed.claimToken).toBeUndefined();
+    expect(completed.claimExpiresAt).toBeUndefined();
+    expect(completed.claimedBy).toBeUndefined();
+  });
+
+  it('should allow cancellation to override ownership (no claim token required)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'cancel-beats-owner',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Cancel without providing claim token — cancellation overrides ownership
+    const cancelled = await repo.cancelTask(task.id);
+    expect(cancelled.status).toBe('CANCELLED');
+    expect(cancelled.claimToken).toBeUndefined();
+    expect(cancelled.claimExpiresAt).toBeUndefined();
+    expect(cancelled.claimedBy).toBeUndefined();
+
+    // Worker A can no longer complete with its claim token
+    await expect(
+      repo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+        completedAt: new Date(),
+        claimToken: processing.claimToken,
+      }),
+    ).rejects.toThrow(StaleVersionError);
+  });
+
+  it('should ensure only one worker wins concurrent initial claim (QUEUED -> PROCESSING)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'concurrent-claim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const results = await Promise.allSettled([
+      repo.transitionStatus(task.id, 1, 'PROCESSING', {
+        startedAt: new Date(),
+        claimedBy: 'worker-A',
+      }),
+      repo.transitionStatus(task.id, 1, 'PROCESSING', {
+        startedAt: new Date(),
+        claimedBy: 'worker-B',
+      }),
+    ]);
+
+    const fulfilled = results.filter(r => r.status === 'fulfilled');
+    const rejected = results.filter(r => r.status === 'rejected');
+
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+
+    const winner = (fulfilled[0] as PromiseFulfilledResult<typeof task>).value;
+    expect(winner.claimToken).toBeDefined();
+    expect(winner.claimExpiresAt).toBeDefined();
+
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimToken).toBe(winner.claimToken);
+  });
+
+  it('should reject transition without claim token when task has one', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'no-token-reject',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Try to complete without providing claim token
+    await expect(
+      repo.transitionStatus(task.id, 2, 'COMPLETED', {
+        completedAt: new Date(),
+      }),
+    ).rejects.toThrow(ClaimTokenMismatchError);
+  });
+});
+
+describe('Worker lifecycle integration (requires PostgreSQL)', () => {
+  it('should simulate full worker lifecycle with ownership protocol', async () => {
+    requirePg();
+
+    // 1. Create task
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'lifecycle-test',
+      priority: 'NORMAL',
+      payload: { input: 'data' },
+      maxRetries: 3,
+    });
+    expect(task.status).toBe('QUEUED');
+    expect(task.claimToken).toBeUndefined();
+
+    // 2. Worker A claims task (QUEUED -> PROCESSING)
+    const claimed = await repo.transitionStatus(task.id, task.version, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+    expect(claimed.status).toBe('PROCESSING');
+    expect(claimed.claimToken).toBeDefined();
+    expect(claimed.claimedBy).toBe('worker-A');
+    const tokenA = claimed.claimToken!;
+
+    // 3. Worker A completes with its claim token
+    const completed = await repo.transitionStatus(task.id, claimed.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-A' },
+      claimToken: tokenA,
+    });
+    expect(completed.status).toBe('COMPLETED');
+    expect(completed.claimToken).toBeUndefined();
+    expect(completed.claimedBy).toBeUndefined();
+  });
+
+  it('should simulate stalled worker recovery with ownership transfer', async () => {
+    requirePg();
+
+    // 1. Create and claim
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'stalled-lifecycle',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const claimedA = await repo.transitionStatus(task.id, task.version, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+    const tokenA = claimedA.claimToken!;
+    const versionA = claimedA.version;
+
+    // 2. Worker A crashes — claim expires
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
+    // 3. Worker B reclaims
+    const claimedB = await repo.reclaimStalledTask(task.id, versionA, 'worker-B');
+    expect(claimedB.claimedBy).toBe('worker-B');
+    expect(claimedB.claimToken).not.toBe(tokenA);
+    const tokenB = claimedB.claimToken!;
+
+    // 4. Worker A wakes up and tries to fail the task — REJECTED
+    await expect(
+      repo.transitionStatus(task.id, versionA, 'FAILED', {
+        error: 'worker-A late failure',
+        claimToken: tokenA,
+      }),
+    ).rejects.toThrow(); // StaleVersionError (version changed)
+
+    // 5. Worker B completes successfully with its token
+    const completed = await repo.transitionStatus(task.id, claimedB.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-B' },
+      claimToken: tokenB,
+    });
+    expect(completed.status).toBe('COMPLETED');
+  });
+
+  it('should simulate failure-retry lifecycle with claim token', async () => {
+    requirePg();
+
+    // 1. Create and claim
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'retry-lifecycle',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const claimed = await repo.transitionStatus(task.id, task.version, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // 2. Worker A fails (intermediate) — requeues with claim token
+    const requeued = await repo.transitionStatus(task.id, claimed.version, 'QUEUED', {
+      error: 'temporary error',
+      retries: 1,
+      claimToken: claimed.claimToken,
+    });
+    expect(requeued.status).toBe('QUEUED');
+    expect(requeued.claimToken).toBeUndefined();
+
+    // 3. Worker B picks up retried task
+    const claimedB = await repo.transitionStatus(task.id, requeued.version, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-B',
+    });
+    expect(claimedB.claimToken).toBeDefined();
+
+    // 4. Worker B completes
+    const completed = await repo.transitionStatus(task.id, claimedB.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-B' },
+      claimToken: claimedB.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
   });
 });
