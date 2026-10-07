@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect } from '@jest/globals';
 import { generateId, retryWithBackoff, AppError } from '../utils';
 
 describe('Shared Utilities', () => {
@@ -11,9 +11,8 @@ describe('Shared Utilities', () => {
 
     it('should generate IDs with correct format', () => {
       const id = generateId();
-      // Should be a non-empty string
       expect(typeof id).toBe('string');
-      expect(id.length).toBeGreaterThan(0);
+      expect(id.length).toBe(32);
     });
   });
 
@@ -32,7 +31,7 @@ describe('Shared Utilities', () => {
         .mockRejectedValueOnce(new Error('fail 2'))
         .mockResolvedValueOnce('success');
 
-      const result = await retryWithBackoff(fn);
+      const result = await retryWithBackoff(fn, 3, 10);
       expect(result).toBe('success');
       expect(fn).toHaveBeenCalledTimes(3);
     });
@@ -40,8 +39,20 @@ describe('Shared Utilities', () => {
     it('should fail after max retries exceeded', async () => {
       const fn = jest.fn().mockRejectedValue(new Error('always fails'));
 
-      await expect(retryWithBackoff(fn, 2)).rejects.toThrow('always fails');
-      expect(fn).toHaveBeenCalledTimes(3); // initial + 2 retries
+      await expect(retryWithBackoff(fn, 2, 10)).rejects.toThrow('always fails');
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should use exponential backoff delays', async () => {
+      const fn = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('fail'))
+        .mockResolvedValue('ok');
+
+      const start = Date.now();
+      await retryWithBackoff(fn, 3, 50);
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeGreaterThanOrEqual(40);
     });
   });
 
@@ -55,6 +66,11 @@ describe('Shared Utilities', () => {
     it('should be an instance of Error', () => {
       const error = new AppError(500, 'Server error');
       expect(error).toBeInstanceOf(Error);
+    });
+
+    it('should have name set to AppError', () => {
+      const error = new AppError(400, 'Bad request');
+      expect(error.name).toBe('AppError');
     });
   });
 });

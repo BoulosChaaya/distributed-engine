@@ -6,6 +6,7 @@ const config = {
   testMatch: ['**/__tests__/**/*.test.ts'],
   preset: 'ts-jest',
   moduleFileExtensions: ['ts', 'js', 'json'],
+  maxWorkers: 1,
 };
 
 module.exports = config;

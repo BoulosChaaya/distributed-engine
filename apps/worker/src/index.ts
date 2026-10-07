@@ -1,32 +1,34 @@
 import { Worker, Queue } from 'bullmq';
-import { log, retryWithBackoff, Task } from '@repo/shared';
-import { createClient } from 'redis';
+import IORedis from 'ioredis';
+import { Pool } from 'pg';
+import { log, TaskRepository, runMigrations } from '@repo/shared';
 import { randomUUID } from 'crypto';
 
-// Redis connection
-const redisClient = createClient({
+const WORKER_ID = randomUUID().substring(0, 8);
+
+const pgPool = new Pool({
+  host: process.env.POSTGRES_HOST || 'localhost',
+  port: parseInt(process.env.POSTGRES_PORT || '5432'),
+  database: process.env.POSTGRES_DB || 'distributed_engine',
+  user: process.env.POSTGRES_USER || 'postgres',
+  password: process.env.POSTGRES_PASSWORD,
+  max: 10,
+});
+
+pgPool.on('error', (err) => log('ERROR', 'PostgreSQL pool error', { error: err.message, workerId: WORKER_ID }));
+
+const redisClient = new IORedis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
-  retryStrategy: (times) => Math.min(times * 50, 2000),
+  password: process.env.REDIS_PASSWORD,
+  maxRetriesPerRequest: null,
 });
 
-redisClient.on('error', (err) => log('ERROR', 'Redis error', err));
-redisClient.on('connect', () => log('INFO', 'Redis connected'));
+redisClient.on('error', (err) => log('ERROR', 'Redis error', { error: err.message, workerId: WORKER_ID }));
+redisClient.on('connect', () => log('INFO', 'Redis connected', { workerId: WORKER_ID }));
 
-// Initialize queue
-const taskQueue = new Queue('tasks', {
-  connection: redisClient,
-  defaultJobOptions: {
-    removeOnComplete: true,
-    removeOnFail: false,
-  },
-});
+const taskRepo = new TaskRepository(pgPool);
 
-// Local task state cache (mirrors API's task store)
-const taskStore = new Map<string, Task>();
-
-// Worker identity and metrics
-const WORKER_ID = randomUUID().substring(0, 8);
 const workerMetrics = {
   id: WORKER_ID,
   startTime: Date.now(),
@@ -35,7 +37,6 @@ const workerMetrics = {
   jobsCompleted: 0,
 };
 
-// Helper: Update worker status in Redis for API visibility
 async function updateWorkerStatus() {
   try {
     const uptime = Math.floor((Date.now() - workerMetrics.startTime) / 1000);
@@ -49,89 +50,115 @@ async function updateWorkerStatus() {
       lastHeartbeat: new Date().toISOString(),
     };
 
-    // Store worker status in Redis with 30s TTL (heartbeat)
-    await redisClient.setEx(
+    await redisClient.setex(
       `worker:${workerMetrics.id}`,
       30,
-      JSON.stringify(status)
+      JSON.stringify(status),
     );
   } catch (error) {
-    log('WARN', 'Failed to update worker status', { error: String(error) });
+    log('WARN', 'Failed to update worker status', { error: String(error), workerId: WORKER_ID });
   }
 }
 
-// Job processor - handles task execution and status updates
 const worker = new Worker(
   'tasks',
   async (job) => {
-    const { taskId, task } = job.data;
-    log('INFO', 'Processing task', { taskId, name: task.name });
+    const { taskId, taskName } = job.data;
+    log('INFO', 'Processing task', { taskId, name: taskName, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID });
     workerMetrics.jobsProcessed++;
 
-    // Update task status to PROCESSING
-    task.status = 'PROCESSING';
-    task.updatedAt = new Date();
-    taskStore.set(taskId, task);
+    const currentTask = await taskRepo.getTask(taskId);
+    if (!currentTask) {
+      log('WARN', 'Task not found in database, skipping', { taskId, workerId: WORKER_ID });
+      return { status: 'SKIPPED', taskId, reason: 'not_found' };
+    }
+
+    if (currentTask.status === 'CANCELLED') {
+      log('INFO', 'Task was cancelled, skipping', { taskId, workerId: WORKER_ID });
+      return { status: 'SKIPPED', taskId, reason: 'cancelled' };
+    }
+
+    if (currentTask.status === 'COMPLETED') {
+      log('INFO', 'Task already completed, skipping', { taskId, workerId: WORKER_ID });
+      return { status: 'SKIPPED', taskId, reason: 'already_completed' };
+    }
 
     try {
-      // Simulate async work with retry logic
-      await retryWithBackoff(async () => {
-        // Simulate job execution (replace with real work)
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+      await taskRepo.transitionStatus(taskId, currentTask.version, 'PROCESSING', {
+        startedAt: new Date(),
+      });
+    } catch (error) {
+      log('WARN', 'Failed to transition task to PROCESSING', {
+        taskId, error: String(error), workerId: WORKER_ID,
+      });
+      return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
+    }
 
-        // Simulate occasional failures for testing
-        if (Math.random() < 0.1) {
-          throw new Error('Simulated processing failure');
-        }
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
-        return task;
+      const updatedTask = await taskRepo.getTask(taskId);
+      if (updatedTask && updatedTask.status === 'CANCELLED') {
+        log('INFO', 'Task cancelled during processing', { taskId, workerId: WORKER_ID });
+        return { status: 'CANCELLED', taskId };
+      }
+
+      await taskRepo.transitionStatus(taskId, currentTask.version + 1, 'COMPLETED', {
+        completedAt: new Date(),
+        result: { processedBy: WORKER_ID },
       });
 
-      // Update task status to COMPLETED
-      task.status = 'COMPLETED';
-      task.completedAt = new Date();
-      task.updatedAt = new Date();
-      taskStore.set(taskId, task);
       workerMetrics.jobsCompleted++;
-      log('INFO', 'Task completed', { taskId });
-
+      log('INFO', 'Task completed', { taskId, workerId: WORKER_ID });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
     } catch (error) {
-      // Update task status to FAILED
-      task.status = 'FAILED';
-      task.error = error instanceof Error ? error.message : String(error);
-      task.retries++;
-      task.updatedAt = new Date();
-      taskStore.set(taskId, task);
       workerMetrics.jobsFailed++;
+
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      try {
+        const latestTask = await taskRepo.getTask(taskId);
+        if (latestTask && latestTask.status === 'PROCESSING') {
+          await taskRepo.transitionStatus(taskId, latestTask.version, 'FAILED', {
+            error: errorMessage,
+            retries: latestTask.retries + 1,
+          });
+        }
+      } catch (transitionError) {
+        log('ERROR', 'Failed to transition task to FAILED', {
+          taskId, error: String(transitionError), workerId: WORKER_ID,
+        });
+      }
 
       log('ERROR', 'Task failed', {
         taskId,
-        error: String(error),
-        attempt: job.attemptsMade,
+        error: errorMessage,
+        attempt: job.attemptsMade + 1,
+        maxAttempts: job.opts.attempts,
+        workerId: WORKER_ID,
       });
+
       throw error;
     }
   },
   {
     connection: redisClient,
-    concurrency: 5, // Process 5 jobs in parallel
-    maxStalledCount: 2, // Restart job if stalled twice
-    stalledInterval: 5000, // Check for stalled jobs every 5s
-  }
+    concurrency: parseInt(process.env.QUEUE_CONCURRENCY || '5'),
+    maxStalledCount: 2,
+    stalledInterval: 5000,
+  },
 );
 
-// Event handlers for job lifecycle
 worker.on('active', (job) => {
   log('INFO', 'Job active', { jobId: job.id, workerId: WORKER_ID });
 });
 
 worker.on('completed', (job) => {
-  log('INFO', 'Job completed event', { jobId: job.id, workerId: WORKER_ID });
+  log('INFO', 'Job completed', { jobId: job.id, workerId: WORKER_ID });
 });
 
 worker.on('failed', (job, err) => {
-  log('WARN', 'Job failed event', {
+  log('WARN', 'Job failed', {
     jobId: job?.id,
     error: err.message,
     attempt: job?.attemptsMade,
@@ -147,40 +174,73 @@ worker.on('error', (err) => {
   log('ERROR', 'Worker error', { error: err.message, workerId: WORKER_ID });
 });
 
-// Periodic heartbeat - update worker status in Redis every 10s
 const heartbeatInterval = setInterval(() => {
   updateWorkerStatus();
 }, 10000);
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  log('INFO', 'Shutting down worker gracefully', { workerId: WORKER_ID });
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) {
+    log('WARN', 'Shutdown already in progress', { signal, workerId: WORKER_ID });
+    process.exit(1);
+  }
+
+  isShuttingDown = true;
+  log('INFO', 'Graceful shutdown initiated', { signal, workerId: WORKER_ID });
+
   clearInterval(heartbeatInterval);
-  await redisClient.del(`worker:${WORKER_ID}`); // Remove worker status
-  await worker.close();
-  await redisClient.quit();
+
+  try {
+    await redisClient.del(`worker:${WORKER_ID}`);
+  } catch (error) {
+    log('WARN', 'Failed to remove worker status', { error: String(error), workerId: WORKER_ID });
+  }
+
+  const shutdownTimeout = setTimeout(() => {
+    log('WARN', 'Shutdown timeout exceeded, forcing exit', { workerId: WORKER_ID });
+    process.exit(1);
+  }, 30000);
+
+  try {
+    await worker.close();
+    log('INFO', 'Worker closed', { workerId: WORKER_ID });
+  } catch (error) {
+    log('WARN', 'Error closing worker', { error: String(error), workerId: WORKER_ID });
+  }
+
+  try {
+    redisClient.disconnect();
+    log('INFO', 'Redis disconnected', { workerId: WORKER_ID });
+  } catch (error) {
+    log('WARN', 'Error disconnecting Redis', { error: String(error), workerId: WORKER_ID });
+  }
+
+  try {
+    await pgPool.end();
+    log('INFO', 'PostgreSQL pool closed', { workerId: WORKER_ID });
+  } catch (error) {
+    log('WARN', 'Error closing PostgreSQL pool', { error: String(error), workerId: WORKER_ID });
+  }
+
+  clearTimeout(shutdownTimeout);
+  log('INFO', 'Graceful shutdown complete', { workerId: WORKER_ID });
   process.exit(0);
-});
+}
 
-// Startup message
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 (async () => {
-  // Wait for Redis connection
-  await new Promise((resolve) => {
-    const checkConnection = setInterval(() => {
-      if (redisClient.isOpen) {
-        clearInterval(checkConnection);
-        resolve(undefined);
-      }
-    }, 100);
-  });
+  await runMigrations(pgPool);
+  log('INFO', 'Database migrations complete', { workerId: WORKER_ID });
 
-  // Publish initial heartbeat
   await updateWorkerStatus();
 
   log('INFO', 'Worker initialized and listening for tasks', {
     workerId: WORKER_ID,
-    concurrency: 5,
-    host: process.env.REDIS_HOST || 'localhost',
-    port: process.env.REDIS_PORT || '6379',
+    concurrency: process.env.QUEUE_CONCURRENCY || '5',
+    redisHost: process.env.REDIS_HOST || 'localhost',
+    pgHost: process.env.POSTGRES_HOST || 'localhost',
   });
 })();

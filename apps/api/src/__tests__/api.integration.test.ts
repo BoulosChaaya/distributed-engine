@@ -1,107 +1,86 @@
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
-import request from 'supertest';
+import { describe, it, expect } from '@jest/globals';
+import { SubmitTaskSchema, PaginationSchema, ValidationError } from '../validation';
 
-// Note: These are integration test templates
-// In real setup, you'd start a test server with Redis for these tests
+describe('API Validation', () => {
+  describe('SubmitTaskSchema', () => {
+    it('should accept valid task submission', () => {
+      const result = SubmitTaskSchema.parse({
+        name: 'test-task',
+        payload: { key: 'value' },
+        priority: 'HIGH',
+        maxRetries: 3,
+      });
 
-describe('API Integration Tests', () => {
-  // Mock the app for testing
-  // In production, these would connect to a test Redis instance
-
-  describe('POST /tasks', () => {
-    it('should submit a task with valid payload', async () => {
-      // When fully integrated with test Redis:
-      // const res = await request(app)
-      //   .post('/tasks')
-      //   .send({
-      //     name: 'test-task',
-      //     payload: { data: 'test' },
-      //     priority: 'HIGH'
-      //   });
-      //
-      // expect(res.status).toBe(201);
-      // expect(res.body.success).toBe(true);
-      // expect(res.body.data.id).toBeDefined();
-      // expect(res.body.data.status).toBe('QUEUED');
-
-      // Placeholder test for now
-      expect(true).toBe(true);
+      expect(result.name).toBe('test-task');
+      expect(result.priority).toBe('HIGH');
+      expect(result.maxRetries).toBe(3);
     });
 
-    it('should reject task with invalid name', async () => {
-      // const res = await request(app)
-      //   .post('/tasks')
-      //   .send({
-      //     name: '', // Empty name
-      //     payload: {}
-      //   });
-      //
-      // expect(res.status).toBe(422);
-      // expect(res.body.success).toBe(false);
-      // expect(res.body.error).toBe('Validation error');
-
-      expect(true).toBe(true);
+    it('should apply defaults for optional fields', () => {
+      const result = SubmitTaskSchema.parse({ name: 'minimal-task' });
+      expect(result.priority).toBe('NORMAL');
+      expect(result.maxRetries).toBe(3);
+      expect(result.payload).toEqual({});
     });
 
-    it('should reject task with invalid priority', async () => {
-      // const res = await request(app)
-      //   .post('/tasks')
-      //   .send({
-      //     name: 'test',
-      //     priority: 'INVALID_PRIORITY'
-      //   });
-      //
-      // expect(res.status).toBe(422);
+    it('should reject empty name', () => {
+      expect(() => SubmitTaskSchema.parse({ name: '' })).toThrow();
+    });
 
-      expect(true).toBe(true);
+    it('should reject invalid priority', () => {
+      expect(() => SubmitTaskSchema.parse({ name: 'test', priority: 'INVALID' })).toThrow();
+    });
+
+    it('should reject negative maxRetries', () => {
+      expect(() => SubmitTaskSchema.parse({ name: 'test', maxRetries: -1 })).toThrow();
+    });
+
+    it('should reject maxRetries > 10', () => {
+      expect(() => SubmitTaskSchema.parse({ name: 'test', maxRetries: 11 })).toThrow();
+    });
+
+    it('should accept all valid priorities', () => {
+      for (const priority of ['LOW', 'NORMAL', 'HIGH', 'CRITICAL']) {
+        const result = SubmitTaskSchema.parse({ name: 'test', priority });
+        expect(result.priority).toBe(priority);
+      }
     });
   });
 
-  describe('GET /tasks/:id', () => {
-    it('should retrieve existing task', async () => {
-      // const res = await request(app).get('/tasks/valid-task-id');
-      //
-      // expect(res.status).toBe(200);
-      // expect(res.body.success).toBe(true);
-      // expect(res.body.data.id).toBe('valid-task-id');
-
-      expect(true).toBe(true);
+  describe('PaginationSchema', () => {
+    it('should parse valid pagination', () => {
+      const result = PaginationSchema.parse({ page: '2', pageSize: '20' });
+      expect(result.page).toBe(2);
+      expect(result.pageSize).toBe(20);
     });
 
-    it('should return 404 for non-existent task', async () => {
-      // const res = await request(app).get('/tasks/non-existent-id');
-      //
-      // expect(res.status).toBe(404);
-      // expect(res.body.success).toBe(false);
-
-      expect(true).toBe(true);
+    it('should apply defaults', () => {
+      const result = PaginationSchema.parse({});
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(10);
     });
-  });
 
-  describe('GET /health', () => {
-    it('should return healthy status', async () => {
-      // const res = await request(app).get('/health');
-      //
-      // expect(res.status).toBe(200);
-      // expect(res.body.success).toBe(true);
-      // expect(res.body.data.status).toBe('healthy');
+    it('should reject page < 1', () => {
+      expect(() => PaginationSchema.parse({ page: '0' })).toThrow();
+    });
 
-      expect(true).toBe(true);
+    it('should reject pageSize > 100', () => {
+      expect(() => PaginationSchema.parse({ pageSize: '101' })).toThrow();
     });
   });
 
-  describe('GET /metrics', () => {
-    it('should return system metrics', async () => {
-      // const res = await request(app).get('/metrics');
-      //
-      // expect(res.status).toBe(200);
-      // expect(res.body.success).toBe(true);
-      // expect(res.body.data.uptime).toBeDefined();
-      // expect(res.body.data.requests).toBeDefined();
-      // expect(res.body.data.tasks).toBeDefined();
-      // expect(res.body.data.queue).toBeDefined();
-
-      expect(true).toBe(true);
+  describe('ValidationError', () => {
+    it('should format errors as JSON', () => {
+      try {
+        SubmitTaskSchema.parse({ name: '' });
+      } catch (e: any) {
+        const validationError = new ValidationError(e);
+        const json = validationError.toJSON();
+        expect(json.errors).toBeDefined();
+        expect(json.errors.length).toBeGreaterThan(0);
+        expect(json.errors[0].field).toBeDefined();
+        expect(json.errors[0].message).toBeDefined();
+      }
     });
   });
 });
