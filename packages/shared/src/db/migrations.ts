@@ -77,6 +77,14 @@ const MIGRATIONS = [
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claimed_by TEXT;
     `,
   },
+  {
+    version: 6,
+    name: 'add_task_claim_token',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claim_token TEXT;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ;
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

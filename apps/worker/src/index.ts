@@ -89,6 +89,8 @@ const worker = new Worker(
     }
 
     let taskVersion = currentTask.version;
+    let claimToken: string | undefined;
+    let currentRetries = currentTask.retries;
 
     if (currentTask.status === 'QUEUED') {
       try {
@@ -97,6 +99,8 @@ const worker = new Worker(
           claimedBy: WORKER_ID,
         });
         taskVersion = updated.version;
+        claimToken = updated.claimToken;
+        currentRetries = updated.retries;
       } catch (error) {
         log('WARN', 'Failed to transition task to PROCESSING', {
           taskId, error: String(error), workerId: WORKER_ID,
@@ -107,6 +111,8 @@ const worker = new Worker(
       try {
         const reclaimed = await taskRepo.reclaimStalledTask(taskId, taskVersion, WORKER_ID);
         taskVersion = reclaimed.version;
+        claimToken = reclaimed.claimToken;
+        currentRetries = reclaimed.retries;
         log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
       } catch (error) {
         log('WARN', 'Failed to reclaim stalled task', {
@@ -119,10 +125,6 @@ const worker = new Worker(
     try {
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
-      // Re-read task state before completing. If the task was cancelled during
-      // processing, the version will differ from taskVersion, and transitionStatus
-      // will reject the stale write with StaleVersionError. This explicit check
-      // provides a clear skip path without relying on the error.
       const updatedTask = await taskRepo.getTask(taskId);
       if (!updatedTask || updatedTask.status === 'CANCELLED' || updatedTask.status === 'FAILED') {
         log('INFO', 'Task no longer processable, skipping completion', {
@@ -134,6 +136,7 @@ const worker = new Worker(
       await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
         completedAt: new Date(),
         result: { processedBy: WORKER_ID },
+        claimToken,
       });
 
       workerMetrics.jobsCompleted++;
@@ -147,19 +150,18 @@ const worker = new Worker(
       const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
 
       try {
-        const latestTask = await taskRepo.getTask(taskId);
-        if (latestTask && latestTask.status === 'PROCESSING') {
-          if (isFinalAttempt) {
-            await taskRepo.transitionStatus(taskId, latestTask.version, 'FAILED', {
-              error: errorMessage,
-              retries: latestTask.retries + 1,
-            });
-          } else {
-            await taskRepo.transitionStatus(taskId, latestTask.version, 'QUEUED', {
-              error: errorMessage,
-              retries: latestTask.retries + 1,
-            });
-          }
+        if (isFinalAttempt) {
+          await taskRepo.transitionStatus(taskId, taskVersion, 'FAILED', {
+            error: errorMessage,
+            retries: currentRetries + 1,
+            claimToken,
+          });
+        } else {
+          await taskRepo.transitionStatus(taskId, taskVersion, 'QUEUED', {
+            error: errorMessage,
+            retries: currentRetries + 1,
+            claimToken,
+          });
         }
       } catch (transitionError) {
         log('ERROR', 'Failed to transition task after failure', {

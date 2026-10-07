@@ -738,10 +738,23 @@ describe('Outbox stop/drain guarantee (requires PostgreSQL + Redis)', () => {
       maxRetries: 3,
     });
 
+    // Barrier: resolve when processOutbox begins executing
+    let pollStartedResolve!: () => void;
+    const pollStartedPromise = new Promise<void>(r => { pollStartedResolve = r; });
+    const origProcess = drainPublisher.processOutbox.bind(drainPublisher);
+    let signalled = false;
+    (drainPublisher as any).processOutbox = async () => {
+      if (!signalled) {
+        signalled = true;
+        pollStartedResolve();
+      }
+      return origProcess();
+    };
+
     drainPublisher.start();
 
-    // Give time for the poll to start processing
-    await new Promise(r => setTimeout(r, 100));
+    // Deterministic: wait until the poll has actually started
+    await pollStartedPromise;
 
     // stop() should await the active poll, not abort it
     await drainPublisher.stop();
