@@ -120,7 +120,11 @@ If a worker crashes while processing a task:
 
 PROCESSING status alone is **not** sufficient evidence that a job stalled. A task in PROCESSING with a non-expired claim is actively being worked on by its owner. Reclaim is only permitted after the claim expires, which provides a bounded recovery window that prevents live-owner theft.
 
-**Execution ownership protocol**: Each PROCESSING transition atomically establishes a unique `claim_token` and a `claim_expires_at` (default 30s TTL). All transitions out of PROCESSING (`COMPLETED`, `FAILED`, `QUEUED`) must present the matching `claim_token` — a stale worker whose ownership was transferred cannot mutate the task. Cancellation (`cancelTask`) overrides ownership without requiring the token, since it is an external administrative action; it clears the token and bumps the version, so the stale worker's subsequent transition attempt fails with `StaleVersionError`.
+**Early BullMQ redelivery**: BullMQ's `stalledInterval` (5s) is shorter than the PG execution lease (30s). When BullMQ redelivers a stalled job before the PG lease expires, the receiving worker's `reclaimStalledTask` call throws `ClaimNotExpiredError`. The worker re-throws this error to BullMQ, which treats it as a job failure and retries with exponential backoff. This avoids acknowledging the job as completed (which would strand the task) and avoids exhausting BullMQ attempts before the lease can expire.
+
+**Execution ownership protocol**: Each PROCESSING transition atomically establishes a unique `claim_token` and a `claim_expires_at` (default 30s TTL, set via PG `NOW()` to avoid Node/PG clock skew). All transitions out of PROCESSING (`COMPLETED`, `FAILED`, `QUEUED`) must present the matching `claim_token` — a stale worker whose ownership was transferred cannot mutate the task. Cancellation (`cancelTask`) overrides ownership without requiring the token, since it is an external administrative action; it clears the token and bumps the version, so the stale worker's subsequent transition attempt fails with `StaleVersionError`.
+
+**Lease renewal**: The worker renews the execution lease at ~TTL/3 intervals (default 10s) while actively processing. `renewClaim(taskId, expectedClaimToken)` atomically verifies the task is PROCESSING with the matching claim token and extends `claim_expires_at` using PG `NOW()`. If renewal fails (ownership transferred, task cancelled), the renewal timer is cleared. The claim-token-protected transition remains the final safety guard.
 
 **Failure handler safety**: The worker's failure handler uses the stored `taskVersion` and `claimToken` from the initial claim — it does **not** re-read the latest task state. If ownership has transferred (version or claim token changed), the transition is rejected harmlessly. This prevents the scenario where a stale worker re-reads the latest version and mutates a task now owned by another execution.
 
@@ -143,14 +147,16 @@ BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be
 - Publishes heartbeat to Redis every 10 seconds (`worker:{id}` key with 30s TTL)
 - Validates task state in PG before processing (skips cancelled/completed/failed/missing tasks)
 - Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash, but only after the previous execution claim has expired (`claim_expires_at < NOW()`). Reclaim generates a new `claim_token` and sets a new expiry.
+- When BullMQ redelivers a stalled job before the PG lease expires, the worker throws `ClaimNotExpiredError` instead of acknowledging the job. This lets BullMQ retry the job with exponential backoff until the lease expires and reclaim succeeds.
+- Renews execution lease at ~TTL/3 intervals while actively processing. Renewal requires the matching `claim_token`. If renewal fails (ownership lost, task cancelled), the timer is cleared; the claim-token-protected transition remains the final guard against stale mutations.
 - Uses optimistic concurrency (version check) and execution ownership (claim token verification) on all state transitions out of PROCESSING
 - Graceful shutdown: stops consuming new jobs, waits for in-flight jobs to complete (30s timeout), removes heartbeat key, closes connections
 
 ### Shared Package (`packages/shared/`)
 
 - **State machine**: Defines valid task transitions (QUEUED, PROCESSING, COMPLETED, FAILED, CANCELLED) and enforces them at the repository layer
-- **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check + claim token verification for all transitions; includes `reclaimStalledTask` with lease expiry check for crash recovery
-- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection. Cancellation check uses `SELECT FOR UPDATE` for atomicity. Stops cleanly by draining in-progress polls.
+- **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check + claim token verification for all transitions; includes `reclaimStalledTask` with lease expiry check for crash recovery and `renewClaim` for lease extension by the active owner. All lease timestamps use PG `NOW()` as the single authoritative clock.
+- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
 - **Migrations**: Schema versioning with advisory lock for concurrent startup safety
 - **Types**: Task, OutboxEvent, WorkerStatus interfaces
 

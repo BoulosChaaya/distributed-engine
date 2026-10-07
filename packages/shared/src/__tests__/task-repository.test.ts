@@ -1092,3 +1092,467 @@ describe('Worker lifecycle integration (requires PostgreSQL)', () => {
     expect(completed.status).toBe('COMPLETED');
   });
 });
+
+describe('Early BullMQ redelivery before lease expiry (requires PostgreSQL)', () => {
+  it('should throw ClaimNotExpiredError when reclaim attempted before lease expires', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'early-redelivery',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker A claims task
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // BullMQ redelivers before lease expires — worker B tries to reclaim
+    const reclaimErr = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B')
+      .catch((e: unknown) => e);
+    expect(reclaimErr).toBeInstanceOf(ClaimNotExpiredError);
+
+    // Task remains owned by worker-A, version unchanged
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimedBy).toBe('worker-A');
+    expect(dbTask!.claimToken).toBe(processing.claimToken);
+    expect(dbTask!.version).toBe(processing.version);
+  });
+
+  it('should allow reclaim after lease expires following earlier rejection', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'deferred-reclaim',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // First attempt: lease not expired — rejected
+    await expect(
+      repo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+    ).rejects.toThrow(ClaimNotExpiredError);
+
+    // Expire the lease
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
+    // Second attempt: lease expired — succeeds
+    const reclaimed = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B');
+    expect(reclaimed.claimedBy).toBe('worker-B');
+    expect(reclaimed.claimToken).toBeDefined();
+    expect(reclaimed.claimToken).not.toBe(processing.claimToken);
+
+    // Worker B can complete
+    const completed = await repo.transitionStatus(task.id, reclaimed.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-B' },
+      claimToken: reclaimed.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
+  });
+
+  it('should not consume version when reclaim is rejected (task remains reclaimable later)', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'version-stable',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Multiple rejected reclaim attempts should not change version
+    for (let i = 0; i < 3; i++) {
+      await expect(
+        repo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+      ).rejects.toThrow(ClaimNotExpiredError);
+    }
+
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.version).toBe(processing.version);
+  });
+});
+
+describe('Lease renewal (requires PostgreSQL)', () => {
+  it('should renew claim with valid token', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-valid',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const originalExpiry = processing.claimExpiresAt!;
+
+    // Small delay so renewed expiry is measurably later
+    await new Promise(r => setTimeout(r, 50));
+
+    const renewed = await repo.renewClaim(task.id, processing.claimToken!);
+    expect(renewed.status).toBe('PROCESSING');
+    expect(renewed.claimToken).toBe(processing.claimToken);
+    expect(renewed.claimExpiresAt).toBeDefined();
+    expect(renewed.claimExpiresAt!.getTime()).toBeGreaterThan(originalExpiry.getTime());
+  });
+
+  it('should reject renewal with wrong claim token', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-wrong-token',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    await expect(
+      repo.renewClaim(task.id, 'wrong-token'),
+    ).rejects.toThrow(ClaimTokenMismatchError);
+  });
+
+  it('should reject renewal with stale token after ownership transfer', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-stale-token',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processingA = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Expire claim and let worker B reclaim
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+    await repo.reclaimStalledTask(task.id, processingA.version, 'worker-B');
+
+    // Worker A tries to renew with its old token
+    await expect(
+      repo.renewClaim(task.id, processingA.claimToken!),
+    ).rejects.toThrow(ClaimTokenMismatchError);
+  });
+
+  it('should reject renewal on CANCELLED task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-cancelled',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    await repo.cancelTask(task.id);
+
+    await expect(
+      repo.renewClaim(task.id, processing.claimToken!),
+    ).rejects.toThrow('status is CANCELLED, expected PROCESSING');
+  });
+
+  it('should reject renewal on COMPLETED task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-completed',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    await repo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+      completedAt: new Date(),
+      claimToken: processing.claimToken,
+    });
+
+    await expect(
+      repo.renewClaim(task.id, processing.claimToken!),
+    ).rejects.toThrow('status is COMPLETED, expected PROCESSING');
+  });
+
+  it('should reject renewal on FAILED task', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-failed',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    await repo.transitionStatus(task.id, processing.version, 'FAILED', {
+      error: 'test failure',
+      claimToken: processing.claimToken,
+    });
+
+    await expect(
+      repo.renewClaim(task.id, processing.claimToken!),
+    ).rejects.toThrow('status is FAILED, expected PROCESSING');
+  });
+
+  it('should extend expiry from current PG time, not from original expiry', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renew-extends-from-now',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Wait a bit, then renew
+    await new Promise(r => setTimeout(r, 100));
+
+    const renewed = await repo.renewClaim(task.id, processing.claimToken!);
+    const newExpiry = renewed.claimExpiresAt!.getTime();
+    const originalExpiry = processing.claimExpiresAt!.getTime();
+
+    // New expiry should be later than original by roughly the wait time
+    expect(newExpiry).toBeGreaterThan(originalExpiry);
+    // New expiry should be approximately NOW + claimTtl (30s), not original + 30s
+    const expectedMin = Date.now() + repo.claimTtl - 5000;
+    expect(newExpiry).toBeGreaterThan(expectedMin);
+  });
+
+  it('should reject renewal on non-existent task', async () => {
+    requirePg();
+
+    await expect(
+      repo.renewClaim('nonexistent-id', 'some-token'),
+    ).rejects.toThrow('not found');
+  });
+});
+
+describe('Long-running worker with lease renewal (requires PostgreSQL)', () => {
+  it('should prevent reclaim while renewal keeps lease fresh', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'long-running-renewed',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker A claims task
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Simulate renewal — extends lease
+    const renewed = await repo.renewClaim(task.id, processing.claimToken!);
+    expect(renewed.claimExpiresAt!.getTime()).toBeGreaterThan(processing.claimExpiresAt!.getTime() - 100);
+
+    // Worker B cannot reclaim while lease is fresh
+    await expect(
+      repo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+    ).rejects.toThrow(ClaimNotExpiredError);
+
+    // Worker A completes successfully
+    const completed = await repo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-A' },
+      claimToken: processing.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
+  });
+
+  it('should allow reclaim only after renewed lease expires', async () => {
+    requirePg();
+
+    const shortTtlRepo = new TaskRepository(pool, 100);
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'renewed-then-expired',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker A claims with short TTL
+    const processing = await shortTtlRepo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Renew the lease
+    await shortTtlRepo.renewClaim(task.id, processing.claimToken!);
+
+    // Still can't reclaim (lease is fresh from renewal)
+    await expect(
+      shortTtlRepo.reclaimStalledTask(task.id, processing.version, 'worker-B'),
+    ).rejects.toThrow(ClaimNotExpiredError);
+
+    // Expire the renewed lease
+    await pool.query(
+      `UPDATE tasks SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [task.id],
+    );
+
+    // Now reclaim succeeds
+    const reclaimed = await shortTtlRepo.reclaimStalledTask(task.id, processing.version, 'worker-B');
+    expect(reclaimed.claimedBy).toBe('worker-B');
+    expect(reclaimed.claimToken).not.toBe(processing.claimToken);
+  });
+});
+
+describe('Retry and failure interactions (requires PostgreSQL)', () => {
+  it('should distinguish execution failure from stalled redelivery', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'failure-vs-stall',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    // Worker A claims
+    const claimed = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Worker A fails the task (intermediate) — requeues
+    const requeued = await repo.transitionStatus(task.id, claimed.version, 'QUEUED', {
+      error: 'transient error',
+      retries: 1,
+      claimToken: claimed.claimToken,
+    });
+    expect(requeued.status).toBe('QUEUED');
+    expect(requeued.claimToken).toBeUndefined();
+    expect(requeued.retries).toBe(1);
+
+    // BullMQ retries — worker B picks up from QUEUED
+    const claimedB = await repo.transitionStatus(task.id, requeued.version, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-B',
+    });
+    expect(claimedB.claimToken).toBeDefined();
+
+    // Worker B completes
+    const completed = await repo.transitionStatus(task.id, claimedB.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-B' },
+      claimToken: claimedB.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
+    expect(completed.retries).toBe(1);
+  });
+
+  it('should handle final failure correctly', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'final-failure',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 1,
+    });
+
+    const claimed = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    const failed = await repo.transitionStatus(task.id, claimed.version, 'FAILED', {
+      error: 'permanent error',
+      retries: 1,
+      claimToken: claimed.claimToken,
+    });
+    expect(failed.status).toBe('FAILED');
+    expect(failed.error).toBe('permanent error');
+    expect(failed.retries).toBe(1);
+    expect(failed.claimToken).toBeUndefined();
+    expect(failed.claimedBy).toBeUndefined();
+  });
+
+  it('should not confuse temporarily non-reclaimable with permanent failure', async () => {
+    requirePg();
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'temp-non-reclaimable',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-A',
+    });
+
+    // Reclaim rejected — lease still valid
+    const err = await repo.reclaimStalledTask(task.id, processing.version, 'worker-B')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaimNotExpiredError);
+
+    // Task is NOT failed — still PROCESSING
+    const dbTask = await repo.getTask(task.id);
+    expect(dbTask!.status).toBe('PROCESSING');
+    expect(dbTask!.claimedBy).toBe('worker-A');
+
+    // Worker A can still complete
+    const completed = await repo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+      completedAt: new Date(),
+      result: { processedBy: 'worker-A' },
+      claimToken: processing.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
+  });
+});

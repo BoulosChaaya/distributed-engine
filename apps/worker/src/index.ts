@@ -1,7 +1,7 @@
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
-import { log, TaskRepository, runMigrations } from '@repo/shared';
+import { log, TaskRepository, ClaimNotExpiredError, runMigrations } from '@repo/shared';
 import { randomUUID } from 'crypto';
 
 const WORKER_ID = randomUUID().substring(0, 8);
@@ -28,6 +28,7 @@ redisClient.on('error', (err) => log('ERROR', 'Redis error', { error: err.messag
 redisClient.on('connect', () => log('INFO', 'Redis connected', { workerId: WORKER_ID }));
 
 const taskRepo = new TaskRepository(pgPool);
+const RENEWAL_INTERVAL = Math.floor(taskRepo.claimTtl / 3);
 
 const workerMetrics = {
   id: WORKER_ID,
@@ -91,6 +92,7 @@ const worker = new Worker(
     let taskVersion = currentTask.version;
     let claimToken: string | undefined;
     let currentRetries = currentTask.retries;
+    let renewalTimer: ReturnType<typeof setInterval> | undefined;
 
     if (currentTask.status === 'QUEUED') {
       try {
@@ -115,6 +117,12 @@ const worker = new Worker(
         currentRetries = reclaimed.retries;
         log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
       } catch (error) {
+        if (error instanceof ClaimNotExpiredError) {
+          log('INFO', 'Claim not expired, deferring for BullMQ retry', {
+            taskId, expiresAt: error.expiresAt.toISOString(), workerId: WORKER_ID,
+          });
+          throw error;
+        }
         log('WARN', 'Failed to reclaim stalled task', {
           taskId, error: String(error), workerId: WORKER_ID,
         });
@@ -123,6 +131,20 @@ const worker = new Worker(
     }
 
     try {
+      renewalTimer = setInterval(async () => {
+        if (!claimToken) return;
+        try {
+          await taskRepo.renewClaim(taskId, claimToken);
+          log('INFO', 'Lease renewed', { taskId, workerId: WORKER_ID });
+        } catch (renewError) {
+          log('WARN', 'Lease renewal failed', { taskId, error: String(renewError), workerId: WORKER_ID });
+          if (renewalTimer) {
+            clearInterval(renewalTimer);
+            renewalTimer = undefined;
+          }
+        }
+      }, RENEWAL_INTERVAL);
+
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       const updatedTask = await taskRepo.getTask(taskId);
@@ -180,6 +202,11 @@ const worker = new Worker(
       });
 
       throw error;
+    } finally {
+      if (renewalTimer) {
+        clearInterval(renewalTimer);
+        renewalTimer = undefined;
+      }
     }
   },
   {

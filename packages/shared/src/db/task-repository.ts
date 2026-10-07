@@ -183,12 +183,11 @@ export class TaskRepository {
 
       if (toStatus === 'PROCESSING') {
         const claimToken = generateId();
-        const claimExpiresAt = new Date(Date.now() + this.claimTtlMs);
         setClauses.push(`claim_token = $${paramIndex}`);
         values.push(claimToken);
         paramIndex++;
-        setClauses.push(`claim_expires_at = $${paramIndex}`);
-        values.push(claimExpiresAt);
+        setClauses.push(`claim_expires_at = NOW() + $${paramIndex} * INTERVAL '1 millisecond'`);
+        values.push(this.claimTtlMs);
         paramIndex++;
       } else if (current.status === 'PROCESSING') {
         setClauses.push('claim_token = NULL');
@@ -257,12 +256,58 @@ export class TaskRepository {
       }
 
       const claimToken = generateId();
-      const claimExpiresAt = new Date(Date.now() + this.claimTtlMs);
 
       const updateResult = await client.query(
-        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2, claim_token = $3, claim_expires_at = $4
+        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2, claim_token = $3, claim_expires_at = NOW() + $4 * INTERVAL '1 millisecond'
          WHERE id = $1 RETURNING *`,
-        [taskId, workerId || null, claimToken, claimExpiresAt],
+        [taskId, workerId || null, claimToken, this.claimTtlMs],
+      );
+
+      await client.query('COMMIT');
+      return rowToTask(updateResult.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  get claimTtl(): number {
+    return this.claimTtlMs;
+  }
+
+  async renewClaim(taskId: string, expectedClaimToken: string): Promise<Task> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const lockResult = await client.query(
+        'SELECT * FROM tasks WHERE id = $1 FOR UPDATE',
+        [taskId],
+      );
+
+      if (lockResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Task ${taskId} not found`);
+      }
+
+      const current = rowToTask(lockResult.rows[0]);
+
+      if (current.status !== 'PROCESSING') {
+        await client.query('ROLLBACK');
+        throw new Error(`Cannot renew claim on task ${taskId}: status is ${current.status}, expected PROCESSING`);
+      }
+
+      if (!current.claimToken || current.claimToken !== expectedClaimToken) {
+        await client.query('ROLLBACK');
+        throw new ClaimTokenMismatchError(taskId, expectedClaimToken, current.claimToken || 'none');
+      }
+
+      const updateResult = await client.query(
+        `UPDATE tasks SET claim_expires_at = NOW() + $2 * INTERVAL '1 millisecond', updated_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [taskId, this.claimTtlMs],
       );
 
       await client.query('COMMIT');
