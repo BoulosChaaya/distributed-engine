@@ -10,10 +10,20 @@ const PRIORITY_MAP: Record<string, number> = {
   CRITICAL: 0,
 };
 
+export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
 export class OutboxPublisher {
   private running = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly publisherId: string;
+
+  private circuitState: CircuitState = 'CLOSED';
+  private consecutiveFailures = 0;
+  private consecutiveSuccesses = 0;
+  private lastFailureTime = 0;
+  private readonly circuitFailureThreshold = 5;
+  private readonly circuitSuccessThreshold = 2;
+  private readonly circuitResetTimeoutMs = 30000;
 
   constructor(
     private pool: Pool,
@@ -41,6 +51,45 @@ export class OutboxPublisher {
     log('INFO', 'Outbox publisher stopped', { publisherId: this.publisherId });
   }
 
+  getCircuitState(): CircuitState {
+    if (
+      this.circuitState === 'OPEN' &&
+      Date.now() - this.lastFailureTime > this.circuitResetTimeoutMs
+    ) {
+      this.circuitState = 'HALF_OPEN';
+      this.consecutiveSuccesses = 0;
+    }
+    return this.circuitState;
+  }
+
+  private onBullMQSuccess(): void {
+    this.consecutiveFailures = 0;
+    if (this.circuitState === 'HALF_OPEN') {
+      this.consecutiveSuccesses++;
+      if (this.consecutiveSuccesses >= this.circuitSuccessThreshold) {
+        this.circuitState = 'CLOSED';
+        this.consecutiveSuccesses = 0;
+        log('INFO', 'Outbox circuit breaker CLOSED', { publisherId: this.publisherId });
+      }
+    }
+  }
+
+  private onBullMQFailure(): void {
+    this.lastFailureTime = Date.now();
+    if (this.circuitState === 'HALF_OPEN') {
+      this.circuitState = 'OPEN';
+      this.consecutiveFailures = 0;
+      this.consecutiveSuccesses = 0;
+      log('WARN', 'Outbox circuit breaker OPEN (half-open failure)', { publisherId: this.publisherId });
+      return;
+    }
+    this.consecutiveFailures++;
+    if (this.consecutiveFailures >= this.circuitFailureThreshold) {
+      this.circuitState = 'OPEN';
+      log('WARN', 'Outbox circuit breaker OPEN', { publisherId: this.publisherId, failures: this.consecutiveFailures });
+    }
+  }
+
   private schedulePoll(): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
@@ -54,6 +103,11 @@ export class OutboxPublisher {
   }
 
   async processOutbox(): Promise<number> {
+    const currentCircuitState = this.getCircuitState();
+    if (currentCircuitState === 'OPEN') {
+      return 0;
+    }
+
     const client = await this.pool.connect();
     let processed = 0;
 
@@ -93,19 +147,33 @@ export class OutboxPublisher {
           claimedAt: row.claimed_at ? new Date(row.claimed_at) : undefined,
         };
 
+        const taskCheck = await client.query(
+          `SELECT status FROM tasks WHERE id = $1`,
+          [event.taskId],
+        );
+        if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
+          await client.query(
+            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
+            [event.id],
+          );
+          log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
+          continue;
+        }
+
         try {
           await this.publishEvent(event);
+          this.onBullMQSuccess();
 
           await client.query(
             `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
             [event.id],
           );
 
-          await this.transitionTaskToQueued(event.taskId);
-
           processed++;
           log('INFO', 'Outbox event published', { eventId: event.id, taskId: event.taskId });
         } catch (error) {
+          this.onBullMQFailure();
+
           log('ERROR', 'Failed to publish outbox event', {
             eventId: event.id,
             taskId: event.taskId,
@@ -125,6 +193,10 @@ export class OutboxPublisher {
               [event.id],
             );
           }
+
+          if (this.getCircuitState() === 'OPEN') {
+            break;
+          }
         }
       }
     } finally {
@@ -137,6 +209,7 @@ export class OutboxPublisher {
   private async publishEvent(event: OutboxEvent): Promise<void> {
     const payload = event.payload as Record<string, unknown>;
     const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
+    const maxRetries = (payload.maxRetries as number) ?? 3;
 
     await this.taskQueue.add(
       payload.taskName as string,
@@ -144,25 +217,18 @@ export class OutboxPublisher {
         taskId: event.taskId,
         taskName: payload.taskName,
         payload: payload.payload,
-        maxRetries: payload.maxRetries,
+        maxRetries,
       },
       {
         jobId: event.taskId,
         priority,
+        attempts: maxRetries + 1,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
       },
     );
-  }
-
-  private async transitionTaskToQueued(taskId: string): Promise<void> {
-    try {
-      await this.pool.query(
-        `UPDATE tasks SET status = 'QUEUED', version = version + 1, updated_at = NOW()
-         WHERE id = $1 AND status = 'PENDING'`,
-        [taskId],
-      );
-    } catch (error) {
-      log('WARN', 'Failed to transition task to QUEUED after publish', { taskId, error: String(error) });
-    }
   }
 
   async getPendingCount(): Promise<number> {

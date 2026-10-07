@@ -11,7 +11,8 @@
     "test": "jest --config jest.config.cjs",
     "test:watch": "jest --config jest.config.cjs --watch",
     "test:coverage": "jest --config jest.config.cjs --coverage",
-    "lint": "pnpm -r run lint"
+    "lint": "pnpm -r run lint",
+    "verify": "pnpm run build && pnpm run test"
   },
   "devDependencies": {
     "@jest/globals": "^29.7.0",

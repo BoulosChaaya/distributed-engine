@@ -1,425 +1,170 @@
-# Distributed Task Execution Engine - Architecture
+# Architecture
 
-Complete architectural overview of the system design, data flow, and production considerations.
+Technical architecture of the distributed task execution engine.
 
 ## System Overview
 
-A production-grade distributed task execution system with three core components:
-
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    CLIENT APPLICATION                   │
-│  (Submits tasks via REST API)                           │
-└────────────────────┬────────────────────────────────────┘
-                     │ HTTP POST /tasks
-                     │ (JSON payload + priority)
-┌────────────────────▼────────────────────────────────────┐
-│                    API SERVER (Node.js + Express)       │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │ Responsibilities:                                │   │
-│  │ • Validate task input (Zod schemas)             │   │
-│  │ • Generate unique task IDs                      │   │
-│  │ • Enqueue to BullMQ (Redis-backed queue)        │   │
-│  │ • Store task metadata in-memory/Redis          │   │
-│  │ • Collect system metrics                        │   │
-│  │ • Circuit breaker for fault tolerance           │   │
-│  │ • Graceful shutdown on SIGTERM                  │   │
-│  └──────────────────────────────────────────────────┘   │
-└────────────────────┬────────────────────────────────────┘
-                     │ enqueue(jobId, {taskId, task})
-                     │ {"status": "QUEUED"}
-┌────────────────────▼──────────────┬────────────────────┐
-│                                    │                    │
-│   ┌─────────────────────────────┐  │  ┌─────────────────┤
-│   │   REDIS (In-Memory Store)   │  │  │  BullMQ Queue   │
-│   │                             │  │  │  (Job queue)    │
-│   │ Stores:                     │  │  │                 │
-│   │ • Job queue (tasks:pending) │◄─┼──┤ Persists tasks │
-│   │ • Worker heartbeats         │  │  │ on disk (AOF)   │
-│   │ • Session data              │  │  │                 │
-│   │ • Metrics (ephemeral)       │  │  └─────────────────┤
-│   │                             │  │                    │
-│   └─────────────────────────────┘  │                    │
-│                                    │                    │
-│         Persistent Volume (10Gi)   │                    │
-└────────────────────┬───────────────┴────────────────────┘
-                     │ BLPOP tasks:pending (blocking pop)
-                     │ {"taskId": "abc123", "task": {...}}
-┌────────────────────▼────────────────────────────────────┐
-│              WORKER POOL (5+ parallel instances)         │
-│  Each worker:                                           │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │ • Connects to Redis queue                        │   │
-│  │ • Pops job (blocks if queue empty)              │   │
-│  │ • Updates task: status → PROCESSING             │   │
-│  │ • Executes job with retry logic (exp backoff)   │   │
-│  │ • Publishes heartbeat every 10s                 │   │
-│  │ • Updates task: status → COMPLETED/FAILED       │   │
-│  │ • Graceful SIGTERM (finishes current job)       │   │
-│  └──────────────────────────────────────────────────┘   │
-└────────────────────┬────────────────────────────────────┘
-                     │ GET /workers
-                     │ (worker:* keys from Redis)
-┌────────────────────▼────────────────────────────────────┐
-│                    MONITORING & OBSERVABILITY            │
-│  • GET /metrics → System stats (queue depth, errors)    │
-│  • GET /health → Liveness probe (returns 503 if down)  │
-│  • GET /tasks/:id → Task status (QUEUED→PROCESSING)    │
-│  • Prometheus scrape every 30s                         │
-│  • Kubernetes HPA scales based on CPU/memory           │
-└─────────────────────────────────────────────────────────┘
+┌──────────┐     ┌──────────────────┐     ┌──────────────┐
+│  Client  │────▶│  API Server      │────▶│  PostgreSQL   │
+└──────────┘     │  (Express)       │     │  (source of   │
+                 │                  │     │   truth)      │
+                 │  - Validates     │     └──────┬───────┘
+                 │  - Creates task  │            │
+                 │    + outbox in   │     ┌──────▼───────┐
+                 │    one PG txn    │     │  Outbox      │
+                 └──────────────────┘     │  Publisher   │
+                                          │  (polls PG)  │
+                                          └──────┬───────┘
+                                                 │ BullMQ.add()
+                                          ┌──────▼───────┐
+                                          │    Redis     │
+                                          │  (BullMQ     │
+                                          │   queue)     │
+                                          └──────┬───────┘
+                                                 │
+                                          ┌──────▼───────┐
+                                          │   Workers    │
+                                          │  (BullMQ     │
+                                          │   consumers) │
+                                          └──────────────┘
 ```
 
-## Data Flow: Task Lifecycle
+## Data Flow
 
-### 1. Submission Phase
-
-```
-Client          API                  Redis/BullMQ
-  │              │                        │
-  ├─POST /tasks─→│                        │
-  │              │ validate (Zod)         │
-  │              │ generate ID            │
-  │              ├─enqueue job─────────→  │
-  │              │ store metadata         │
-  │              │◄─job confirmed────────┤
-  │←─201 QUEUED──│                        │
-  │
-Task Status: QUEUED
-Location: Redis queue, waiting for worker
-```
-
-### 2. Processing Phase
+### 1. Task Submission
 
 ```
-Worker          Redis               API (metrics)
-  │              │                       │
-  ├─BLPOP───────→│                       │
-  │◄─job data────│                       │
-  │              │                       │
-  │ status: PROCESSING                   │
-  │ update taskStore                     │
-  │              │                       │
-  │◄─retry logic + exponential backoff──→
-  │              │                       │
-  │ [execute 2s]                         │
-  │              │                       │
-  │ success OR   │                       │
-  │ error        │                       │
-  │              │                       │
-  │ status: COMPLETED/FAILED             │
-  │ update taskStore                     │
-  │              │                       │
-  └─heartbeat───→│ worker:{id} TTL=30s  │
-                 │                       │
-                 │◄──GET /metrics───────→
-                 │ completed++, failed++│
+Client                API                 PostgreSQL
+  │                    │                      │
+  │── POST /tasks ────▶│                      │
+  │                    │── BEGIN ─────────────▶│
+  │                    │── INSERT task ───────▶│  status='QUEUED', version=1
+  │                    │── INSERT outbox ─────▶│  status='PENDING'
+  │                    │── COMMIT ───────────▶│
+  │◀── 201 Created ───│                      │
 ```
 
-### 3. Completion Phase
+The task is created as QUEUED (not PENDING). This eliminates a race condition where a worker could pick up a job from BullMQ before the outbox publisher has transitioned the task from PENDING to QUEUED.
+
+### 2. Outbox Publication
 
 ```
-Client                    API
-  │                       │
-  └─GET /tasks/{id}───────→
-                          │ lookup taskStore
-                          │◄─{status: COMPLETED}
-                          │
-                          └─→ Client sees COMPLETED
+Outbox Publisher            PostgreSQL              BullMQ/Redis
+      │                         │                       │
+      │── poll (SELECT + FOR ──▶│                       │
+      │   UPDATE SKIP LOCKED)   │                       │
+      │◀── claimed events ─────│                       │
+      │                         │                       │
+      │── check task status ───▶│                       │
+      │   (skip if CANCELLED)   │                       │
+      │                         │                       │
+      │── BullMQ.add(jobId = ──────────────────────────▶│
+      │   taskId, attempts =    │                       │
+      │   maxRetries + 1)       │                       │
+      │                         │                       │
+      │── UPDATE outbox ───────▶│  status='DELIVERED'   │
+      │   status=DELIVERED      │                       │
 ```
 
-## Component Deep Dive
+Key properties:
+- **Idempotent publication**: Uses taskId as BullMQ jobId. Re-publishing the same event is a no-op in BullMQ.
+- **Per-job retry config**: Each BullMQ job gets `attempts = maxRetries + 1` from the task's configuration.
+- **Cancellation check**: Skips publishing for tasks that were cancelled between creation and publication.
+- **Circuit breaker**: After 5 consecutive BullMQ failures, the publisher enters OPEN state and stops attempting for 30 seconds.
 
-### API Server (`apps/api`)
-
-**Request Flow**:
-1. Client sends POST /tasks
-2. Express middleware logs, tracks active requests
-3. ValidationError if invalid (Zod schema fails)
-4. Circuit breaker wraps Redis enqueue
-5. If Redis down, task stored locally with PENDING status
-6. Response 201 with task data
-
-**Endpoints**:
-- `POST /tasks`: Submit new task
-- `GET /tasks/:id`: Fetch single task
-- `GET /tasks?page=1&pageSize=10`: List tasks (paginated)
-- `PUT /tasks/:id/cancel`: Cancel task
-- `GET /health`: Liveness probe (503 if circuit OPEN)
-- `GET /metrics`: System observability (uptime, request rates, error rates, queue depth)
-- `GET /workers`: Active worker pool status (heartbeats from Redis)
-
-**Key Production Features**:
-- **Validation**: All inputs validated with Zod (422 on error)
-- **Error Hierarchy**: ValidationError (422), AppError (custom), generic (500)
-- **Circuit Breaker**: Opens after 5 failures, auto-recovers in 30s
-- **Metrics**: Request count, error count, task counts by status
-- **Graceful Shutdown**: 30s timeout for in-flight requests, then force close
-
-### Worker Pool (`apps/worker`)
-
-**Job Processing**:
-1. Connect to Redis, listen on "tasks" queue
-2. BLPOP blocks until job available (no busy-waiting)
-3. Job data: {taskId, task, task.payload}
-4. Update status: QUEUED → PROCESSING
-5. Execute job with retryWithBackoff (exponential backoff, 3 attempts)
-6. On success: status → COMPLETED, log
-7. On failure: status → FAILED, log error
-8. Increment metrics (jobsProcessed, jobsCompleted/jobsFailed)
-
-**Concurrency**:
-- 5 workers per pod (configurable)
-- Multiple pods scale horizontally
-- No cross-worker state (fully distributed)
-
-**Health & Reliability**:
-- Periodic heartbeat (every 10s) to Redis
-- Heartbeat includes: uptime, jobsProcessed, jobsCompleted, jobsFailed
-- Redis TTL=30s (auto-cleanup if worker crashes)
-- Graceful SIGTERM: 25s preStop hook, then SIGKILL
-
-### Redis (`statefulset`)
-
-**Purpose**:
-- Primary: BullMQ queue storage (job queue, retry logic)
-- Secondary: Ephemeral state (worker heartbeats, metrics)
-
-**Data Structure**:
-```
-KEYS patterns:
-- tasks:pending → Job queue (list of job IDs)
-- tasks:completed → Completed jobs (for history)
-- worker:* → Worker status (JSON, TTL=30s)
-- metrics:* → System metrics (ephemeral)
-```
-
-**Persistence**:
-- AOF (Append-Only File) enabled
-- Every write logged to disk
-- Survives pod restart
-- PVC volume for durability
-
-**Failover**:
-- StatefulSet (stable hostname)
-- PVC snapshots for backup
-- Manual recovery from snapshot
-
-### Shared Types & Utilities (`packages/shared`)
-
-**Exports**:
-```typescript
-// Types
-Task, TaskStatus, TaskPriority
-Worker, WorkerStatus
-ApiResponse, PaginatedResponse
-
-// Utilities
-generateId() → unique string
-log(level, msg, context) → structured logging
-retryWithBackoff(fn, maxRetries) → exponential backoff
-AppError(statusCode, message) → HTTP-aware error
-```
-
-Used by all services (type safety across monorepo).
-
-## Production Architecture Patterns
-
-### 1. Fault Tolerance (Circuit Breaker)
+### 3. Task Processing
 
 ```
-API tries to enqueue task to Redis
-
-Success path:           Failure path:
-task → queue        ×5  failures detected
-✓ completed         →   Circuit OPEN
-                        ↓
-                    reject immediately
-                        ↓
-                    after 30s: HALF_OPEN
-                        ↓
-                    test one request
-                        ↓
-                    success: CLOSED
-                    or
-                    failure: back to OPEN
+Worker                  PostgreSQL              BullMQ/Redis
+  │                         │                       │
+  │◀── job consumed ───────────────────────────────│
+  │                         │                       │
+  │── SELECT task ─────────▶│                       │
+  │   (check status)        │                       │
+  │                         │                       │
+  │── transition to ───────▶│  QUEUED → PROCESSING  │
+  │   PROCESSING             │  version + 1          │
+  │   (SELECT FOR UPDATE +   │                       │
+  │    version check)        │                       │
+  │                         │                       │
+  │── [do work] ───────────▶│                       │
+  │                         │                       │
+  │── transition to ───────▶│  PROCESSING → COMPLETED│
+  │   COMPLETED              │  version + 1          │
 ```
 
-**Benefit**: Instead of cascading timeouts, user gets instant feedback.
+### 4. Failure and Retry
 
-### 2. Graceful Shutdown
+On task failure, the worker checks whether BullMQ has remaining retry attempts:
 
-```
-SIGTERM received (deployment terminating pod)
-       ↓
-HTTP server stops accepting NEW connections
-       ↓
-Active requests continue (max 30s)
-       ↓
-Poll: activeRequests == 0?
-       ↓
-Close BullMQ & Redis connections
-       ↓
-Exit process (Kubernetes replaces pod)
-```
+- **Intermediate failure** (more BullMQ attempts available): Transitions task PROCESSING → QUEUED in PG, then throws to let BullMQ retry with exponential backoff.
+- **Final failure** (no more BullMQ attempts): Transitions task PROCESSING → FAILED in PG.
 
-**Benefit**: No data loss, no duplicate processing during rolling updates.
+This keeps PG and BullMQ states synchronized. The PG state always reflects the actual task lifecycle.
 
-### 3. Metrics Observability
+## Component Details
 
-```
-API continuously collects:
-├── Request metrics (total, errors, error rate)
-├── Task metrics (total by status, completion rate, failure rate)
-├── Queue metrics (queue depth, active jobs, waiting jobs)
-└── System uptime
+### API Server (`apps/api/`)
 
-Worker publishes heartbeat every 10s:
-├── Uptime since start
-├── Jobs processed (lifetime)
-├── Jobs completed (lifetime)
-└── Jobs failed (lifetime)
+- Express HTTP server with Zod input validation
+- Creates tasks atomically with outbox events in a single PG transaction
+- Runs the outbox publisher as a background process
+- Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
+- `/metrics` returns JSON with task status counts, queue depth, and outbox stats
+- Graceful shutdown: stops accepting connections, drains in-flight requests, stops outbox publisher, closes connections
 
-/metrics endpoint aggregates all metrics for:
-├── Dashboards (real-time visibility)
-├── Alerting (thresholds: CPU, queue depth, error rate)
-└── Capacity planning (trend analysis)
-```
+### Worker (`apps/worker/`)
 
-## Scaling Strategy
+- BullMQ Worker consuming from the "tasks" queue
+- Publishes heartbeat to Redis every 10 seconds (`worker:{id}` key with 30s TTL)
+- Validates task state in PG before processing (skips cancelled/completed/missing tasks)
+- Uses optimistic concurrency (version check) on all state transitions
+- Graceful shutdown: stops consuming new jobs, waits for in-flight jobs to complete (30s timeout), removes heartbeat key, closes connections
 
-### Horizontal Scaling (HPA)
+### Shared Package (`packages/shared/`)
 
-**API Pods**:
-- Min: 3 (high availability)
-- Max: 10 (cost control)
-- Target CPU: 70% (scale up if exceeds)
-- Target Memory: 80% (scale up if exceeds)
+- **State machine**: Defines valid task transitions and enforces them at the repository layer
+- **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check for all transitions
+- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection
+- **Migrations**: Schema versioning with advisory lock for concurrent startup safety
+- **Types**: Task, OutboxEvent, WorkerStatus interfaces
 
-**Worker Pods**:
-- Min: 5 (ensure queue processing)
-- Max: 20 (cost control)
-- Target CPU: 75% (more aggressive)
-- Target Memory: 80%
+### Dashboard (`apps/web/`)
 
-### Example: Traffic Spike
+- Next.js app for viewing system state
+- Fetches global task counts from `/metrics` endpoint (not from a single page of `/tasks`)
+- Workers page shows live data from `/workers` endpoint (Redis heartbeats)
 
-```
-Normal: [API pod 1] [API pod 2] [API pod 3]
-        10 req/s, CPU 40%, Mem 50%
+## Concurrency and Safety
 
-Spike: [API pod 1] [API pod 2] [API pod 3] [API pod 4] [API pod 5]
-       50 req/s, CPU 70%, Mem 60% (auto-scaled)
+### Optimistic Concurrency Control
 
-After spike: [API pod 1] [API pod 2] [API pod 3]
-             (HPA scales down after 5+ min)
-```
+Every task has a `version` column, starting at 1. Each state transition:
+1. `SELECT ... FOR UPDATE` (row lock)
+2. Check `version = expectedVersion`
+3. Validate transition against state machine
+4. `UPDATE ... SET version = version + 1`
 
-## Security Layers
+If two processes race, only the first succeeds. The second gets a `StaleVersionError`.
 
-### Network
-- Pod-to-Pod (no external API calls from worker)
-- Kubernetes Service DNS (redis.distributed-engine.svc.cluster.local)
-- Network policies (restrict ingress/egress)
+### Migration Safety
 
-### Authentication
-- No public API (service mesh or OAuth for external)
-- Service accounts for inter-pod communication
+`runMigrations()` acquires a PostgreSQL advisory lock (`pg_advisory_lock(42)`) before checking and applying migrations. Multiple API/worker replicas can safely start concurrently — only one will run migrations, others will wait.
 
-### Data
-- Redis authentication (password protected)
-- Persistent volume encryption (at-rest)
-- TLS for data in-transit (if external)
+### At-Least-Once Delivery
 
-### Resource Limits
-- CPU: limits prevent runaway
-- Memory: limits prevent OOM kills
-- Disk: persistent volume quota
+The system guarantees at-least-once delivery, not exactly-once. Duplicate processing is possible in edge cases:
+- Worker completes work but crashes before writing COMPLETED to PG
+- BullMQ retries a job that was already processed
 
-## Debugging & Troubleshooting
+Task handlers should be idempotent to handle these cases safely.
 
-### Check System Health
+## Scaling Considerations
 
-```bash
-# Pod status
-kubectl get pods -n distributed-engine
+- **API servers**: Stateless, horizontally scalable. PG pool size is the main constraint.
+- **Workers**: Stateless, horizontally scalable. Each worker processes `QUEUE_CONCURRENCY` jobs concurrently.
+- **PostgreSQL**: Single instance (StatefulSet). For higher throughput, consider read replicas or connection pooling (PgBouncer).
+- **Redis**: Single instance (StatefulSet) with AOF persistence. BullMQ supports Redis Cluster for higher throughput, but this is not configured.
 
-# Resource usage
-kubectl top pods -n distributed-engine
-
-# Logs
-kubectl logs -f -n distributed-engine -l app=api
-kubectl logs -f -n distributed-engine -l app=worker
-
-# Metrics
-curl http://api:3000/metrics | jq .data.queue
-curl http://api:3000/workers
-```
-
-### Common Issues
-
-| Issue | Symptom | Check | Fix |
-|-------|---------|-------|-----|
-| Redis down | Circuit OPEN | `kubectl logs redis-0` | Check PVC mount |
-| Queue backing up | high queue.total | `kubectl top pods -l app=worker` | Scale workers |
-| Slow API | p95 latency >500ms | `kubectl top pods -l app=api` | Scale API |
-| Memory leak | Pod OOM | `kubectl describe pod` | Restart pod |
-
-## Performance Characteristics
-
-**Latencies** (p50/p95/p99):
-- API /health: 5ms / 10ms / 20ms
-- API /tasks POST: 50ms / 100ms / 200ms
-- API /metrics: 200ms / 500ms / 1000ms
-- Job processing: 2s (configurable)
-
-**Throughput**:
-- Single API pod: 500 req/s
-- 3 API pods: 1500 req/s
-- Single worker: 30 jobs/min (2s per job)
-- 5 workers: 150 jobs/min
-
-**Concurrency**:
-- API: stateless (scale horizontally)
-- Worker: 5 concurrent jobs per pod
-
-## Next Steps / Advanced Features
-
-Not yet implemented but valuable:
-
-1. **Service Mesh (Istio)**
-   - Traffic management
-   - Circuit breaking at mesh level
-   - Request tracing (distributed tracing)
-
-2. **Monitoring Stack**
-   - Prometheus scraping /metrics
-   - Grafana dashboards
-   - AlertManager for alerts
-
-3. **Log Aggregation**
-   - ELK/Loki for log storage
-   - Structured JSON logging
-   - Log-based alerting
-
-4. **Distributed Tracing**
-   - OpenTelemetry instrumentation
-   - Jaeger backend for visualization
-   - End-to-end request tracing
-
-5. **Advanced Scheduling**
-   - Task dependencies (run after task X)
-   - Delayed execution (run at specific time)
-   - Cron jobs (recurring tasks)
-
-6. **Multi-tenancy**
-   - Namespace isolation
-   - Per-tenant rate limiting
-   - Resource quotas by tenant
-
-## References
-
-- [Kubernetes Best Practices](https://kubernetes.io/docs/)
-- [12-Factor App](https://12factor.net/)
-- [Site Reliability Engineering](https://sre.google/)
-- [Domain-Driven Design](https://martinfowler.com/)
+HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling would require a custom metrics adapter (Prometheus + KEDA or similar), which is not included.

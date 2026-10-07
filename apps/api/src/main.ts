@@ -9,12 +9,10 @@ import {
   OutboxPublisher,
   runMigrations,
   InvalidTransitionError,
-  StaleVersionError,
 } from '@repo/shared';
 import { Task, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
 import { MetricsCollector } from './metrics';
-import { CircuitBreaker } from './circuitbreaker';
 import { ShutdownManager } from './shutdown';
 import { config } from './config';
 
@@ -45,11 +43,6 @@ redisClient.on('connect', () => log('INFO', 'Redis connected'));
 const taskQueue = new Queue('tasks', {
   connection: redisClient,
   defaultJobOptions: {
-    attempts: config.queue.maxAttempts,
-    backoff: {
-      type: 'exponential',
-      delay: config.queue.backoffDelayMs,
-    },
     removeOnComplete: 100,
     removeOnFail: false,
   },
@@ -66,12 +59,6 @@ const outboxPublisher = new OutboxPublisher(
 );
 
 const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher);
-
-const queueCircuitBreaker = new CircuitBreaker(
-  config.circuitBreaker.failureThreshold,
-  config.circuitBreaker.successThreshold,
-  config.circuitBreaker.resetTimeoutMs,
-);
 
 const shutdownManager = new ShutdownManager(config.gracefulShutdown.timeoutMs);
 
@@ -98,8 +85,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-app.get('/health', async (req: Request, res: Response) => {
-  const circuitState = queueCircuitBreaker.getState();
+app.get('/health', async (_req: Request, res: Response) => {
+  const outboxCircuitState = outboxPublisher.getCircuitState();
 
   let pgHealthy = false;
   try {
@@ -117,23 +104,23 @@ app.get('/health', async (req: Request, res: Response) => {
     // Redis unavailable
   }
 
-  const isReady = pgHealthy && redisHealthy && circuitState !== 'OPEN';
-  const isLive = pgHealthy;
+  const isReady = pgHealthy;
+  const isDegraded = !redisHealthy || outboxCircuitState !== 'CLOSED';
 
   const data = {
-    status: isReady ? 'healthy' : (isLive ? 'degraded' : 'unhealthy'),
+    status: isReady ? (isDegraded ? 'degraded' : 'healthy') : 'unhealthy',
     timestamp: new Date(),
-    circuitBreaker: circuitState,
+    outboxCircuitBreaker: outboxCircuitState,
     dependencies: {
       postgres: pgHealthy ? 'up' : 'down',
-      redis: redisHealthy ? 'up' : 'unknown',
+      redis: redisHealthy ? 'up' : 'down',
     },
   };
 
   res.status(isReady ? 200 : 503).json({ success: isReady, data, timestamp: new Date() });
 });
 
-app.get('/ready', async (req: Request, res: Response) => {
+app.get('/ready', async (_req: Request, res: Response) => {
   let pgHealthy = false;
   try {
     await pgPool.query('SELECT 1');
@@ -142,18 +129,9 @@ app.get('/ready', async (req: Request, res: Response) => {
     // PG unavailable
   }
 
-  let redisHealthy = false;
-  try {
-    await redisClient.ping();
-    redisHealthy = true;
-  } catch {
-    // Redis unavailable
-  }
-
-  const ready = pgHealthy && redisHealthy;
-  res.status(ready ? 200 : 503).json({
-    success: ready,
-    data: { postgres: pgHealthy ? 'up' : 'down', redis: redisHealthy ? 'up' : 'unknown' },
+  res.status(pgHealthy ? 200 : 503).json({
+    success: pgHealthy,
+    data: { postgres: pgHealthy ? 'up' : 'down' },
   });
 });
 
@@ -161,7 +139,7 @@ app.get('/live', (_req: Request, res: Response) => {
   res.json({ success: true, data: { status: 'alive' } });
 });
 
-app.get('/metrics', async (req: Request, res: Response, next: NextFunction) => {
+app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const metricsData = await metrics.getMetrics();
     res.json({ success: true, data: metricsData, timestamp: new Date() });
@@ -170,7 +148,7 @@ app.get('/metrics', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-app.get('/workers', async (req: Request, res: Response, next: NextFunction) => {
+app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     let workers: unknown[] = [];
     try {
@@ -284,7 +262,7 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunct
   }
 });
 
-app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   metrics.recordError();
 
   if (err instanceof ValidationError) {
@@ -343,4 +321,4 @@ start().catch((error) => {
   process.exit(1);
 });
 
-export { app, pgPool, taskRepo, outboxPublisher, queueCircuitBreaker, shutdownManager };
+export { app, pgPool, taskRepo, outboxPublisher, shutdownManager };

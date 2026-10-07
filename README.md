@@ -1,458 +1,219 @@
 # Distributed Task Execution Engine
 
-A production-grade distributed task execution system built with TypeScript, Node.js, BullMQ, Redis, and Kubernetes.
+A learning/portfolio distributed task execution engine with production-oriented reliability patterns. Built with TypeScript, Node.js, BullMQ, PostgreSQL, and Redis.
 
-## Overview
+## What This Is
 
-Process tasks asynchronously at scale with built-in fault tolerance, automatic scaling, and complete observability.
+An asynchronous task processing system demonstrating:
+
+- **Transactional outbox pattern** for reliable event publishing
+- **PostgreSQL as source of truth** for task state (not Redis)
+- **Optimistic concurrency control** with version columns
+- **State machine enforcement** on all task transitions
+- **At-least-once delivery** with idempotent job publication
+- **Circuit breaker** protecting the outbox publisher from Redis failures
+- **Graceful shutdown** for both API and worker processes
+
+This is **not** a production SaaS platform. It does not include service mesh, distributed tracing, log aggregation, advanced scheduling, or multi-tenancy. Those would be the next phase.
+
+## Architecture
 
 ```
 ┌─────────────────┐
 │   Client App    │
 └────────┬────────┘
-         │ /tasks POST
-┌────────▼────────────┐
-│   API Server (3)    │ ← Load balanced, auto-scales
-└────────┬────────────┘
-         │ enqueue
-┌────────▼────────────┐
-│   Redis Queue       │ ← Persistent, durable
-└────────┬────────────┘
-         │ pop
-┌────────▼────────────┐
-│  Workers Pool (5+)  │ ← Auto-scales based on queue depth
-└─────────────────────┘
+         │ POST /tasks
+┌────────▼────────────┐     ┌──────────────┐
+│   API Server (3)    │────▶│  PostgreSQL   │  ← Source of truth
+└─────────────────────┘     └──────┬───────┘
+                                   │ outbox poll
+                            ┌──────▼───────┐
+                            │ Outbox       │
+                            │ Publisher    │
+                            └──────┬───────┘
+                                   │ BullMQ add
+                            ┌──────▼───────┐
+                            │    Redis     │  ← Job queue only
+                            └──────┬───────┘
+                                   │ consume
+                            ┌──────▼───────┐
+                            │ Workers (5+) │
+                            └──────────────┘
 ```
+
+**Task submission flow:**
+
+1. API inserts task (status=QUEUED) + outbox event atomically in one PG transaction
+2. Outbox publisher polls PG for pending events, publishes to BullMQ using taskId as jobId (idempotent)
+3. Worker picks up job, transitions task QUEUED → PROCESSING → COMPLETED/FAILED in PG
+4. On intermediate failure with remaining BullMQ retries: PROCESSING → QUEUED
+5. On final failure (retries exhausted): PROCESSING → FAILED
 
 ## Quick Start
 
-### Local Development (Docker Compose)
+### Prerequisites
+
+- Node.js 20+
+- pnpm
+- Docker & Docker Compose (for PostgreSQL and Redis)
+
+### Local Development
 
 ```bash
-# Clone and setup
-git clone <repo>
-cd distributed-engine
 pnpm install
 
-# Start services
-docker-compose up -d
+# Start PostgreSQL and Redis
+docker-compose up -d postgres redis
 
-# Run API
+# Run API server
 pnpm -F @distributed-engine/api run dev
 
-# Run worker
+# Run worker (separate terminal)
 pnpm -F @distributed-engine/worker run dev
+```
 
-# Submit a task
+### Submit a Task
+
+```bash
 curl -X POST http://localhost:3000/tasks \
   -H "Content-Type: application/json" \
-  -d '{"name":"hello-world","priority":"HIGH"}'
-
-# Check metrics
-curl http://localhost:3000/metrics
+  -d '{"name":"hello-world","priority":"HIGH","maxRetries":3}'
 ```
 
-### Production (Kubernetes)
+### API Endpoints
 
-```bash
-# Build and push images
-docker build -f Dockerfile.api -t your-registry/distributed-engine-api:0.2.0 .
-docker push your-registry/distributed-engine-api:0.2.0
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /tasks | Create a task |
+| GET | /tasks | List tasks (paginated) |
+| GET | /tasks/:id | Get task by ID |
+| PUT | /tasks/:id/cancel | Cancel a task |
+| GET | /health | Health check (PG required, Redis informational) |
+| GET | /ready | Readiness probe (PG connectivity) |
+| GET | /live | Liveness probe (always 200) |
+| GET | /metrics | JSON metrics (task counts, queue depth, outbox stats) |
+| GET | /workers | Live worker list from Redis heartbeats |
 
-# Deploy
-kubectl apply -f k8s/redis.yaml
-kubectl apply -f k8s/api.yaml
-kubectl apply -f k8s/worker.yaml
-
-# Verify
-kubectl get pods -n distributed-engine
-```
-
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for complete production guide.
-
-## Architecture
-
-### Core Components
-
-**API Server** (`apps/api`)
-- Express REST server for task submission
-- Input validation with Zod schemas
-- Circuit breaker for fault tolerance
-- Graceful shutdown handling
-- Metrics collection and health checks
-- Endpoints: `/tasks`, `/health`, `/metrics`, `/workers`
-
-**Worker Pool** (`apps/worker`)
-- BullMQ consumer for job processing
-- Exponential backoff retry logic
-- Worker heartbeat for distributed visibility
-- Graceful SIGTERM handling
-- 5+ concurrent jobs per pod
-
-**Redis** (StatefulSet)
-- BullMQ queue backend
-- Persistent job storage (AOF)
-- Worker status tracking
-- 10Gi persistent volume
-
-**Shared Types** (`packages/shared`)
-- TypeScript type definitions
-- Utility functions (retry, ID generation)
-- Error handling classes
-- Used by API and workers
-
-### Key Features
-
-✅ **Fault Tolerance**
-- Circuit breaker auto-recovery
-- Graceful degradation when Redis down
-- Automatic job retry with exponential backoff
-
-✅ **Scalability**
-- Horizontal pod autoscaling (HPA)
-- Independent API/worker scaling
-- Queue-based decoupling
-
-✅ **Observability**
-- Real-time metrics endpoint
-- Worker heartbeats and status
-- Structured logging
-- Health check endpoints
-
-✅ **Production Ready**
-- Non-root containers
-- Resource limits and requests
-- Health checks for Kubernetes
-- Graceful shutdown for deployments
-
-## File Structure
+## Task State Machine
 
 ```
-distributed-engine/
-├── apps/
-│   ├── api/                 # REST API server
-│   │   ├── src/
-│   │   │   ├── main.ts      # Express server
-│   │   │   ├── validation.ts # Zod schemas
-│   │   │   ├── metrics.ts   # Metrics collector
-│   │   │   ├── circuitbreaker.ts
-│   │   │   ├── shutdown.ts
-│   │   │   ├── config.ts    # Configuration
-│   │   │   └── __tests__/
-│   │   └── jest.config.js
-│   ├── worker/              # Job processor
-│   │   ├── src/
-│   │   │   └── index.ts     # BullMQ worker
-│   │   └── jest.config.js
-│   └── web/                 # Next.js dashboard (optional)
-├── packages/
-│   ├── shared/              # Shared types & utils
-│   │   ├── src/
-│   │   │   ├── types.ts
-│   │   │   ├── utils.ts
-│   │   │   └── __tests__/
-│   │   └── jest.config.js
-│   └── ui/                  # React components (optional)
-├── k8s/                     # Kubernetes manifests
-│   ├── redis.yaml
-│   ├── api.yaml
-│   ├── worker.yaml
-│   └── README.md
-├── Dockerfile.api           # Production API image
-├── Dockerfile.worker        # Production worker image
-├── docker-compose.yml       # Local development
-├── jest.config.js           # Test configuration
-├── ARCHITECTURE.md          # System design
-├── DEPLOYMENT.md            # Operations guide
-└── README.md                # This file
+QUEUED ──▶ PROCESSING ──▶ COMPLETED
+  │  ▲        │  │  ▲
+  │  │        │  │  │
+  │  └────────┘  │  └── (BullMQ retry: intermediate failure)
+  │              │
+  │              ▼
+  │           FAILED ──▶ QUEUED (manual retry)
+  │              
+  ▼
+CANCELLED ◀── QUEUED | PROCESSING
 ```
 
-## Configuration
+- **QUEUED**: Task created and waiting for a worker
+- **PROCESSING**: Worker has picked up the task
+- **COMPLETED**: Task finished successfully (terminal)
+- **FAILED**: Task failed after all retries exhausted (terminal, can be manually re-queued)
+- **CANCELLED**: Task cancelled by user (terminal)
 
-Environment variables (see `apps/api/src/config.ts`):
+## Reliability Patterns
 
-```bash
-# Server
-PORT=3000
-NODE_ENV=production
+### Source of Truth: PostgreSQL
 
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=optional
+All task state lives in PostgreSQL. Redis/BullMQ is a job queue only — if Redis loses data, the outbox publisher will re-publish pending events. Tasks are never created in Redis first.
 
-# Queue
-QUEUE_CONCURRENCY=5
-QUEUE_MAX_ATTEMPTS=3
-QUEUE_BACKOFF_DELAY_MS=2000
+### Transactional Outbox
 
-# Circuit Breaker
-CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
-CIRCUIT_BREAKER_SUCCESS_THRESHOLD=2
-CIRCUIT_BREAKER_RESET_TIMEOUT_MS=30000
+Task creation and the outbox event are inserted in a single PG transaction. The outbox publisher polls for pending events and publishes to BullMQ. This guarantees at-least-once delivery: if the publisher crashes after BullMQ.add() but before marking the event DELIVERED, it will re-publish on the next poll. Duplicate publication is safe because BullMQ uses the taskId as jobId (idempotent).
 
-# Graceful Shutdown
-GRACEFUL_SHUTDOWN_TIMEOUT_MS=30000
+### Optimistic Concurrency
 
-# Logging
-LOG_LEVEL=INFO
-```
+Every task has a `version` column. State transitions use `SELECT FOR UPDATE` + version check. If two workers race to process the same task, only one wins — the other gets a `StaleVersionError`.
+
+### Circuit Breaker (Outbox Publisher)
+
+The outbox publisher has a built-in circuit breaker for BullMQ operations. After 5 consecutive failures, it stops attempting to publish (OPEN state). After 30 seconds, it tries one operation (HALF_OPEN). After 2 successes, it resumes normal operation (CLOSED). The `/health` endpoint reports this state.
+
+### At-Least-Once, Not Exactly-Once
+
+This system provides **at-least-once delivery**. A task may be processed more than once if:
+- The worker crashes after completing work but before writing COMPLETED to PG
+- BullMQ retries a job that the worker already processed
+
+Task handlers should be **idempotent** — processing the same task twice should produce the same result.
 
 ## Testing
 
 ```bash
-# Run all tests
-npm test
+# Run all tests (unit tests run without infrastructure)
+pnpm test
 
-# Watch mode
-npm run test:watch
+# Run with infrastructure (PostgreSQL + Redis required for integration tests)
+docker-compose up -d postgres redis
+pnpm test
 
-# Coverage report
-npm run test:coverage
+# Full verification (build + test)
+pnpm verify
 ```
 
-Test types:
-- **Unit tests**: Isolated functions (utils, circuit breaker)
-- **Integration tests**: API endpoints with dependencies (templated)
-- **E2E tests**: Full system workflows (future)
+Integration tests for TaskRepository and OutboxPublisher require PostgreSQL and Redis. When infrastructure is unavailable, these tests report the skip reason rather than silently passing.
 
-## API Endpoints
+## Project Structure
 
-### Task Management
-
-**POST /tasks** - Submit new task
-```bash
-curl -X POST http://localhost:3000/tasks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "process-image",
-    "payload": {"url": "https://..."},
-    "priority": "HIGH",
-    "maxRetries": 3
-  }'
-
-# Response
-{
-  "success": true,
-  "data": {
-    "id": "task_abc123",
-    "name": "process-image",
-    "status": "QUEUED",
-    "priority": "HIGH",
-    "createdAt": "2026-10-05T14:22:45.123Z"
-  }
-}
+```
+distributed-engine/
+├── apps/
+│   ├── api/           # Express REST API server
+│   ├── worker/        # BullMQ job processor
+│   └── web/           # Next.js dashboard
+├── packages/
+│   ├── shared/        # Types, state machine, DB layer, outbox
+│   └── ui/            # Shared React components
+├── k8s/               # Kubernetes manifests
+├── docker-compose.yml # Local development services
+├── Dockerfile.api     # API container image
+└── Dockerfile.worker  # Worker container image
 ```
 
-**GET /tasks/:id** - Get task status
-```bash
-curl http://localhost:3000/tasks/task_abc123
+## Configuration
 
-# Response
-{
-  "success": true,
-  "data": {
-    "id": "task_abc123",
-    "status": "COMPLETED",
-    "completedAt": "2026-10-05T14:23:05.456Z"
-  }
-}
-```
+All configuration is via environment variables with sensible defaults for local development.
 
-**GET /tasks** - List tasks (paginated)
-```bash
-curl "http://localhost:3000/tasks?page=1&pageSize=10"
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| PORT | 3000 | API server port |
+| REDIS_HOST | localhost | Redis hostname |
+| REDIS_PORT | 6379 | Redis port |
+| POSTGRES_HOST | localhost | PostgreSQL hostname |
+| POSTGRES_PORT | 5432 | PostgreSQL port |
+| POSTGRES_DB | distributed_engine | Database name |
+| POSTGRES_USER | postgres | Database user |
+| POSTGRES_PASSWORD | (none) | Database password |
+| POSTGRES_MAX_CONNECTIONS | 20 | PG pool size |
+| QUEUE_CONCURRENCY | 5 | Worker concurrent jobs |
+| QUEUE_MAX_ATTEMPTS | 3 | Default BullMQ retry attempts |
+| OUTBOX_POLL_INTERVAL_MS | 1000 | Outbox polling frequency |
+| OUTBOX_BATCH_SIZE | 10 | Events per outbox poll |
+| OUTBOX_MAX_ATTEMPTS | 5 | Max outbox publish attempts |
+| GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Shutdown drain timeout |
+| LOG_LEVEL | INFO | Logging level |
 
-**PUT /tasks/:id/cancel** - Cancel task
-```bash
-curl -X PUT http://localhost:3000/tasks/task_abc123/cancel
-```
+## Kubernetes Deployment
 
-### System Monitoring
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full deployment guide. The K8s manifests in `k8s/` provide:
 
-**GET /health** - Health check
-```bash
-curl http://localhost:3000/health
+- API: 3 replicas with HPA (3-10), readiness probe on `/ready` (PG only), liveness on `/live`
+- Workers: 5 replicas with HPA (5-20), graceful shutdown with 40s termination grace period
+- Redis: StatefulSet with AOF persistence
+- PostgreSQL: StatefulSet with persistent volume
 
-# Healthy response (HTTP 200)
-{"success": true, "data": {"status": "healthy", "circuitBreaker": "CLOSED"}}
+HPA scales on CPU and memory utilization. Queue-depth-based scaling requires a custom metrics adapter (not included).
 
-# Degraded response (HTTP 503 if circuit OPEN)
-{"success": false, "data": {"status": "degraded", "circuitBreaker": "OPEN"}}
-```
+## What's Not Included (Future Work)
 
-**GET /metrics** - System metrics
-```bash
-curl http://localhost:3000/metrics
-
-# Response
-{
-  "success": true,
-  "data": {
-    "timestamp": "2026-10-05T14:22:45.123Z",
-    "uptime": 3600,
-    "requests": {"total": 1250, "errors": 3, "errorRate": "0.24"},
-    "tasks": {"total": 150, "byStatus": {"COMPLETED": 120, "FAILED": 3}},
-    "queue": {"total": 27, "active": 5, "waiting": 22}
-  }
-}
-```
-
-**GET /workers** - Active worker status
-```bash
-curl http://localhost:3000/workers
-
-# Response
-{
-  "success": true,
-  "data": {
-    "total": 5,
-    "workers": [
-      {"id": "abc12345", "uptime": 3600, "jobsProcessed": 142, "jobsCompleted": 138, "jobsFailed": 4},
-      {"id": "xyz98765", "uptime": 3400, "jobsProcessed": 156, "jobsCompleted": 150, "jobsFailed": 6}
-    ]
-  }
-}
-```
-
-## Monitoring & Alerts
-
-### Key Metrics to Track
-
-- **API Response Time**: p50, p95, p99 (target: <100ms p95)
-- **Error Rate**: errors / total requests (target: <1%)
-- **Queue Depth**: jobs waiting (target: <1000)
-- **Worker Utilization**: active jobs / total capacity (target: 60-80%)
-- **Task Completion Rate**: COMPLETED / total (target: >95%)
-
-### Alert Thresholds
-
-```yaml
-- Alert if error rate > 5% for 5 minutes
-- Alert if queue depth > 1000 for 10 minutes
-- Alert if any worker pod down for 5 minutes
-- Alert if circuit breaker OPEN for 1 minute
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**High API latency**
-```bash
-# Check resource usage
-kubectl top pods -n distributed-engine -l app=api
-
-# Check queue depth
-curl http://api:3000/metrics | jq .data.queue
-
-# Scale if needed
-kubectl scale deployment api -n distributed-engine --replicas=5
-```
-
-**Queue backing up**
-```bash
-# Check worker status
-curl http://api:3000/workers
-
-# Check worker logs
-kubectl logs -f -n distributed-engine -l app=worker
-
-# Scale workers
-kubectl scale deployment worker -n distributed-engine --replicas=10
-```
-
-**Redis connectivity**
-```bash
-# Check Redis pod
-kubectl get pod -n distributed-engine -l app=redis
-
-# Check Redis logs
-kubectl logs redis-0 -n distributed-engine
-
-# Verify PVC mount
-kubectl describe pvc -n distributed-engine
-```
-
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed incident response playbooks.
-
-## Documentation
-
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** - System design, data flow, production patterns
-- **[DEPLOYMENT.md](./DEPLOYMENT.md)** - Deployment procedures, troubleshooting, incident response
-- **[k8s/README.md](./k8s/README.md)** - Kubernetes deployment guide
-
-## Development
-
-### Scripts
-
-```bash
-# Development
-pnpm dev                    # Start all services in dev mode
-pnpm build                  # Build all packages
-pnpm start                  # Start production services
-npm test                    # Run tests
-npm run test:watch         # Watch tests
-npm run test:coverage      # Coverage report
-
-# Individual packages
-pnpm -F @distributed-engine/api run dev
-pnpm -F @distributed-engine/worker run dev
-```
-
-### Adding New Features
-
-1. Update shared types in `packages/shared/src/types.ts`
-2. Add validation schemas in `apps/api/src/validation.ts`
-3. Implement in API or worker
-4. Add tests
-5. Update documentation
-6. Create commit with architectural explanation
-
-## Production Checklist
-
-- [ ] Tests passing (npm test)
-- [ ] Coverage >80% (npm run test:coverage)
-- [ ] Configuration reviewed
-- [ ] Images built and scanned
-- [ ] Redis persistence configured
-- [ ] Kubernetes manifests reviewed
-- [ ] Health checks verified
-- [ ] Monitoring dashboards set up
-- [ ] Incident playbooks documented
-- [ ] Team trained on operations
-
-## Performance
-
-**Single Instance**
-- API throughput: 500 req/s
-- Worker throughput: 30 jobs/min (2s per job)
-- Request latency: <100ms p95
-
-**Scaled Deployment (3 API, 5 workers)**
-- API throughput: 1500 req/s
-- Worker throughput: 150 jobs/min
-- Auto-scales up to 10 API pods, 20 workers
-
-## Next Steps
-
-1. **Monitoring**: Add Prometheus + Grafana dashboards
-2. **Tracing**: Integrate OpenTelemetry + Jaeger
-3. **Logging**: Add ELK or Loki for log aggregation
-4. **Advanced Features**: Task dependencies, delayed execution, cron jobs
-5. **Optimization**: Batch job processing, task deduplication
-
-## Support
-
-Issues, questions, or contributions? See the team or create an issue.
-
-## License
-
-[Your License Here]
-
----
-
-**Built with**: TypeScript • Node.js • Express • BullMQ • Redis • Kubernetes
-
-**Production Ready**: ✅ Fault-tolerant • ✅ Observable • ✅ Scalable • ✅ Documented
+- Service mesh (Istio)
+- Distributed tracing (OpenTelemetry/Jaeger)
+- Log aggregation (ELK/Loki)
+- Prometheus-format metrics endpoint
+- Advanced scheduling (cron, dependencies, DAGs)
+- Multi-tenancy
+- Authentication/authorization on the API

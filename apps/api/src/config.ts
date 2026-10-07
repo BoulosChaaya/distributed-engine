@@ -23,12 +23,6 @@ export interface AppConfig {
     backoffDelayMs: number;
   };
 
-  circuitBreaker: {
-    failureThreshold: number;
-    successThreshold: number;
-    resetTimeoutMs: number;
-  };
-
   gracefulShutdown: {
     timeoutMs: number;
   };
@@ -78,12 +72,6 @@ export function loadConfig(): AppConfig {
       backoffDelayMs: parseNumber(process.env.QUEUE_BACKOFF_DELAY_MS, 2000),
     },
 
-    circuitBreaker: {
-      failureThreshold: parseNumber(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD, 5),
-      successThreshold: parseNumber(process.env.CIRCUIT_BREAKER_SUCCESS_THRESHOLD, 2),
-      resetTimeoutMs: parseNumber(process.env.CIRCUIT_BREAKER_RESET_TIMEOUT_MS, 30000),
-    },
-
     gracefulShutdown: {
       timeoutMs: parseNumber(process.env.GRACEFUL_SHUTDOWN_TIMEOUT_MS, 30000),
     },
@@ -109,11 +97,32 @@ export function validateConfig(config: AppConfig): void {
   if (config.redis.port < 1 || config.redis.port > 65535) {
     errors.push('REDIS_PORT must be between 1 and 65535');
   }
+  if (config.postgres.port < 1 || config.postgres.port > 65535) {
+    errors.push('POSTGRES_PORT must be between 1 and 65535');
+  }
+  if (config.postgres.maxConnections < 1) {
+    errors.push('POSTGRES_MAX_CONNECTIONS must be at least 1');
+  }
   if (config.queue.concurrency < 1) {
     errors.push('QUEUE_CONCURRENCY must be at least 1');
   }
-  if (config.circuitBreaker.failureThreshold < 1) {
-    errors.push('CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1');
+  if (config.queue.maxAttempts < 1) {
+    errors.push('QUEUE_MAX_ATTEMPTS must be at least 1');
+  }
+  if (config.queue.backoffDelayMs < 0) {
+    errors.push('QUEUE_BACKOFF_DELAY_MS must be non-negative');
+  }
+  if (config.outbox.pollIntervalMs < 100) {
+    errors.push('OUTBOX_POLL_INTERVAL_MS must be at least 100');
+  }
+  if (config.outbox.batchSize < 1) {
+    errors.push('OUTBOX_BATCH_SIZE must be at least 1');
+  }
+  if (config.outbox.maxAttempts < 1) {
+    errors.push('OUTBOX_MAX_ATTEMPTS must be at least 1');
+  }
+  if (config.gracefulShutdown.timeoutMs < 1000) {
+    errors.push('GRACEFUL_SHUTDOWN_TIMEOUT_MS must be at least 1000');
   }
 
   if (errors.length > 0) {

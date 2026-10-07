@@ -4,7 +4,7 @@ import React, { useEffect, useState } from 'react';
 
 interface DashboardStats {
   totalTasks: number;
-  pendingTasks: number;
+  queuedTasks: number;
   processingTasks: number;
   completedTasks: number;
   failedTasks: number;
@@ -13,40 +13,42 @@ interface DashboardStats {
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats>({
     totalTasks: 0,
-    pendingTasks: 0,
+    queuedTasks: 0,
     processingTasks: 0,
     completedTasks: 0,
     failedTasks: 0,
   });
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchStats = async () => {
       try {
         const response = await fetch(
-          `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/tasks`
+          `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/metrics`
         );
         const data = await response.json();
 
         if (data.success) {
-          const tasks = data.data.items || [];
+          const byStatus = data.data.tasks.byStatus || {};
           setStats({
-            totalTasks: data.data.total || 0,
-            pendingTasks: tasks.filter((t: any) => t.status === 'PENDING').length,
-            processingTasks: tasks.filter((t: any) => t.status === 'PROCESSING').length,
-            completedTasks: tasks.filter((t: any) => t.status === 'COMPLETED').length,
-            failedTasks: tasks.filter((t: any) => t.status === 'FAILED').length,
+            totalTasks: data.data.tasks.total || 0,
+            queuedTasks: (byStatus.QUEUED || 0) + (byStatus.PENDING || 0),
+            processingTasks: byStatus.PROCESSING || 0,
+            completedTasks: byStatus.COMPLETED || 0,
+            failedTasks: byStatus.FAILED || 0,
           });
+          setError(null);
         }
-      } catch (error) {
-        console.error('Failed to fetch stats:', error);
+      } catch (err) {
+        setError('Unable to connect to API');
       } finally {
         setLoading(false);
       }
     };
 
     fetchStats();
-    const interval = setInterval(fetchStats, 5000); // Refresh every 5s
+    const interval = setInterval(fetchStats, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -57,6 +59,8 @@ export default function Dashboard() {
 
       {loading ? (
         <p>Loading...</p>
+      ) : error ? (
+        <p style={{ color: 'red' }}>{error}</p>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '16px' }}>
           <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
@@ -64,8 +68,8 @@ export default function Dashboard() {
             <p>Total Tasks</p>
           </div>
           <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.pendingTasks}</h3>
-            <p>Pending</p>
+            <h3>{stats.queuedTasks}</h3>
+            <p>Queued</p>
           </div>
           <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
             <h3>{stats.processingTasks}</h3>

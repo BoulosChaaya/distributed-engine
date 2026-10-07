@@ -28,6 +28,10 @@ describe('Task State Machine', () => {
       expect(isValidTransition('PROCESSING', 'FAILED')).toBe(true);
     });
 
+    it('should allow PROCESSING -> QUEUED (BullMQ retry)', () => {
+      expect(isValidTransition('PROCESSING', 'QUEUED')).toBe(true);
+    });
+
     it('should allow PROCESSING -> CANCELLED', () => {
       expect(isValidTransition('PROCESSING', 'CANCELLED')).toBe(true);
     });

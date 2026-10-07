@@ -1,4 +1,4 @@
-import { Worker, Queue } from 'bullmq';
+import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
 import { log, TaskRepository, runMigrations } from '@repo/shared';
@@ -115,18 +115,28 @@ const worker = new Worker(
       workerMetrics.jobsFailed++;
 
       const errorMessage = error instanceof Error ? error.message : String(error);
+      const maxAttempts = job.opts.attempts ?? 1;
+      const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
 
       try {
         const latestTask = await taskRepo.getTask(taskId);
         if (latestTask && latestTask.status === 'PROCESSING') {
-          await taskRepo.transitionStatus(taskId, latestTask.version, 'FAILED', {
-            error: errorMessage,
-            retries: latestTask.retries + 1,
-          });
+          if (isFinalAttempt) {
+            await taskRepo.transitionStatus(taskId, latestTask.version, 'FAILED', {
+              error: errorMessage,
+              retries: latestTask.retries + 1,
+            });
+          } else {
+            await taskRepo.transitionStatus(taskId, latestTask.version, 'QUEUED', {
+              error: errorMessage,
+              retries: latestTask.retries + 1,
+            });
+          }
         }
       } catch (transitionError) {
-        log('ERROR', 'Failed to transition task to FAILED', {
-          taskId, error: String(transitionError), workerId: WORKER_ID,
+        log('ERROR', 'Failed to transition task after failure', {
+          taskId, targetStatus: isFinalAttempt ? 'FAILED' : 'QUEUED',
+          error: String(transitionError), workerId: WORKER_ID,
         });
       }
 
@@ -134,7 +144,8 @@ const worker = new Worker(
         taskId,
         error: errorMessage,
         attempt: job.attemptsMade + 1,
-        maxAttempts: job.opts.attempts,
+        maxAttempts,
+        isFinalAttempt,
         workerId: WORKER_ID,
       });
 
