@@ -16,6 +16,7 @@ export interface Task {
   startedAt?: Date;
   completedAt?: Date;
   version: number;
+  claimedBy?: string;
 }
 
 export type WorkerStatus = 'ONLINE' | 'OFFLINE' | 'BUSY';

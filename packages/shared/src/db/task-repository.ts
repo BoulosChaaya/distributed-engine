@@ -31,6 +31,7 @@ function rowToTask(row: Record<string, unknown>): Task {
     updatedAt: new Date(row.updated_at as string),
     startedAt: row.started_at ? new Date(row.started_at as string) : undefined,
     completedAt: row.completed_at ? new Date(row.completed_at as string) : undefined,
+    claimedBy: (row.claimed_by as string) || undefined,
   };
 }
 
@@ -112,7 +113,7 @@ export class TaskRepository {
     taskId: string,
     expectedVersion: number,
     toStatus: TaskStatus,
-    extra?: Partial<Pick<Task, 'error' | 'result' | 'retries' | 'startedAt' | 'completedAt'>>,
+    extra?: Partial<Pick<Task, 'error' | 'result' | 'retries' | 'startedAt' | 'completedAt' | 'claimedBy'>>,
   ): Promise<Task> {
     const client = await this.pool.connect();
     try {
@@ -171,6 +172,14 @@ export class TaskRepository {
         paramIndex++;
       }
 
+      if (extra?.claimedBy !== undefined) {
+        setClauses.push(`claimed_by = $${paramIndex}`);
+        values.push(extra.claimedBy);
+        paramIndex++;
+      } else if (toStatus !== 'PROCESSING') {
+        setClauses.push('claimed_by = NULL');
+      }
+
       const updateResult = await client.query(
         `UPDATE tasks SET ${setClauses.join(', ')} WHERE id = $1 RETURNING *`,
         values,
@@ -186,7 +195,7 @@ export class TaskRepository {
     }
   }
 
-  async reclaimStalledTask(taskId: string, expectedVersion: number): Promise<Task> {
+  async reclaimStalledTask(taskId: string, expectedVersion: number, workerId?: string): Promise<Task> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -213,10 +222,15 @@ export class TaskRepository {
         throw new StaleVersionError(taskId, expectedVersion, current.version);
       }
 
+      if (current.claimedBy && current.claimedBy === workerId) {
+        await client.query('ROLLBACK');
+        throw new Error(`Cannot reclaim task ${taskId}: already claimed by this worker (${workerId})`);
+      }
+
       const updateResult = await client.query(
-        `UPDATE tasks SET version = version + 1, updated_at = NOW()
+        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2
          WHERE id = $1 RETURNING *`,
-        [taskId],
+        [taskId, workerId || null],
       );
 
       await client.query('COMMIT');
@@ -248,7 +262,7 @@ export class TaskRepository {
       assertValidTransition(current.status, 'CANCELLED');
 
       const updateResult = await client.query(
-        `UPDATE tasks SET status = 'CANCELLED', version = version + 1, updated_at = NOW()
+        `UPDATE tasks SET status = 'CANCELLED', version = version + 1, updated_at = NOW(), claimed_by = NULL
          WHERE id = $1 RETURNING *`,
         [taskId],
       );

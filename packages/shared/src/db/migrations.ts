@@ -9,7 +9,7 @@ const MIGRATIONS = [
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'PENDING',
+        status TEXT NOT NULL DEFAULT 'QUEUED',
         priority TEXT NOT NULL DEFAULT 'NORMAL',
         payload JSONB NOT NULL DEFAULT '{}',
         result JSONB,
@@ -68,6 +68,13 @@ const MIGRATIONS = [
     sql: `
       ALTER TABLE tasks DROP CONSTRAINT IF EXISTS valid_status;
       ALTER TABLE tasks ADD CONSTRAINT valid_status CHECK (status IN ('QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED'));
+    `,
+  },
+  {
+    version: 5,
+    name: 'add_task_claimed_by',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claimed_by TEXT;
     `,
   },
 ];
