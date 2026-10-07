@@ -46,7 +46,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
 
     expect(task.id).toBeDefined();
     expect(task.name).toBe('test-task');
-    expect(task.status).toBe('PENDING');
+    expect(task.status).toBe('QUEUED');
     expect(task.priority).toBe('HIGH');
     expect(task.version).toBe(1);
 
@@ -109,23 +109,21 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    const queued = await repo.transitionStatus(task.id, 1, 'QUEUED');
-    expect(queued.status).toBe('QUEUED');
-    expect(queued.version).toBe(2);
+    expect(task.status).toBe('QUEUED');
 
-    const processing = await repo.transitionStatus(task.id, 2, 'PROCESSING', {
+    const processing = await repo.transitionStatus(task.id, 1, 'PROCESSING', {
       startedAt: new Date(),
     });
     expect(processing.status).toBe('PROCESSING');
-    expect(processing.version).toBe(3);
+    expect(processing.version).toBe(2);
     expect(processing.startedAt).toBeDefined();
 
-    const completed = await repo.transitionStatus(task.id, 3, 'COMPLETED', {
+    const completed = await repo.transitionStatus(task.id, 2, 'COMPLETED', {
       completedAt: new Date(),
       result: { output: 'done' },
     });
     expect(completed.status).toBe('COMPLETED');
-    expect(completed.version).toBe(4);
+    expect(completed.version).toBe(3);
   });
 
   it('should reject invalid state transitions', async () => {
@@ -153,10 +151,10 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'QUEUED');
+    await repo.transitionStatus(task.id, 1, 'PROCESSING');
 
     await expect(
-      repo.transitionStatus(task.id, 1, 'PROCESSING'),
+      repo.transitionStatus(task.id, 1, 'CANCELLED'),
     ).rejects.toThrow(StaleVersionError);
   });
 
@@ -170,11 +168,9 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'QUEUED');
-
     const results = await Promise.allSettled([
-      repo.transitionStatus(task.id, 2, 'PROCESSING'),
-      repo.transitionStatus(task.id, 2, 'CANCELLED'),
+      repo.transitionStatus(task.id, 1, 'PROCESSING'),
+      repo.transitionStatus(task.id, 1, 'CANCELLED'),
     ]);
 
     const fulfilled = results.filter(r => r.status === 'fulfilled');
@@ -208,9 +204,8 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'QUEUED');
-    await repo.transitionStatus(task.id, 2, 'PROCESSING');
-    await repo.transitionStatus(task.id, 3, 'COMPLETED', { completedAt: new Date() });
+    await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    await repo.transitionStatus(task.id, 2, 'COMPLETED', { completedAt: new Date() });
 
     await expect(repo.cancelTask(task.id)).rejects.toThrow(InvalidTransitionError);
   });
@@ -228,14 +223,12 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       name: 'count-3', priority: 'NORMAL', payload: {}, maxRetries: 3,
     });
 
-    await repo.transitionStatus(t1.id, 1, 'QUEUED');
-    await repo.transitionStatus(t2.id, 1, 'QUEUED');
-    await repo.transitionStatus(t2.id, 2, 'PROCESSING');
+    await repo.transitionStatus(t1.id, 1, 'PROCESSING');
+    await repo.transitionStatus(t2.id, 1, 'PROCESSING');
 
     const counts = await repo.getTaskStatusCounts();
-    expect(counts.PENDING).toBe(1);
     expect(counts.QUEUED).toBe(1);
-    expect(counts.PROCESSING).toBe(1);
+    expect(counts.PROCESSING).toBe(2);
   });
 
   it('should handle FAILED -> QUEUED retry transition', async () => {
@@ -248,12 +241,50 @@ describe('TaskRepository (requires PostgreSQL)', () => {
       maxRetries: 3,
     });
 
-    await repo.transitionStatus(task.id, 1, 'QUEUED');
-    await repo.transitionStatus(task.id, 2, 'PROCESSING');
-    await repo.transitionStatus(task.id, 3, 'FAILED', { error: 'temporary error', retries: 1 });
+    await repo.transitionStatus(task.id, 1, 'PROCESSING');
+    await repo.transitionStatus(task.id, 2, 'FAILED', { error: 'temporary error', retries: 1 });
 
-    const retried = await repo.transitionStatus(task.id, 4, 'QUEUED');
+    const retried = await repo.transitionStatus(task.id, 3, 'QUEUED');
     expect(retried.status).toBe('QUEUED');
-    expect(retried.version).toBe(5);
+    expect(retried.version).toBe(4);
+  });
+
+  it('should handle PROCESSING -> QUEUED retry transition', async () => {
+    if (!repo) return;
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'processing-retry-task',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.transitionStatus(task.id, 1, 'PROCESSING');
+
+    const requeued = await repo.transitionStatus(task.id, 2, 'QUEUED', {
+      error: 'intermediate failure',
+      retries: 1,
+    });
+    expect(requeued.status).toBe('QUEUED');
+    expect(requeued.version).toBe(3);
+    expect(requeued.retries).toBe(1);
+  });
+
+  it('should handle atomicity: task and outbox event created together', async () => {
+    if (!repo) return;
+
+    const { task, outboxEvent } = await repo.createTaskWithOutbox({
+      name: 'atomic-test',
+      priority: 'NORMAL',
+      payload: { foo: 'bar' },
+      maxRetries: 3,
+    });
+
+    const dbTask = await pool.query('SELECT * FROM tasks WHERE id = $1', [task.id]);
+    const dbOutbox = await pool.query('SELECT * FROM outbox_events WHERE id = $1', [outboxEvent.id]);
+
+    expect(dbTask.rows.length).toBe(1);
+    expect(dbOutbox.rows.length).toBe(1);
+    expect(dbOutbox.rows[0].task_id).toBe(task.id);
   });
 });

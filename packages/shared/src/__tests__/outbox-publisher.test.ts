@@ -89,17 +89,17 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
     expect(pendingAfter).toBe(0);
   });
 
-  it('should transition task from PENDING to QUEUED after publish', async () => {
+  it('should keep task as QUEUED after publish (no status change needed)', async () => {
     if (!pgAvailable || !redisAvailable) return;
 
     const { task } = await repo.createTaskWithOutbox({
-      name: 'outbox-transition-test',
+      name: 'outbox-status-test',
       priority: 'NORMAL',
       payload: {},
       maxRetries: 3,
     });
 
-    expect(task.status).toBe('PENDING');
+    expect(task.status).toBe('QUEUED');
 
     await publisher.processOutbox();
 
@@ -122,6 +122,23 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
     const job = await queue.getJob(task.id);
     expect(job).not.toBeNull();
     expect(job!.id).toBe(task.id);
+  });
+
+  it('should set per-job BullMQ attempts from maxRetries', async () => {
+    if (!pgAvailable || !redisAvailable) return;
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'attempts-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 5,
+    });
+
+    await publisher.processOutbox();
+
+    const job = await queue.getJob(task.id);
+    expect(job).not.toBeNull();
+    expect(job!.opts.attempts).toBe(6);
   });
 
   it('should handle multiple outbox events in one batch', async () => {
@@ -184,6 +201,33 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
 
     const pending = await publisher.getPendingCount();
     expect(pending).toBe(0);
+  });
+
+  it('should skip publishing cancelled tasks', async () => {
+    if (!pgAvailable || !redisAvailable) return;
+
+    const { task } = await repo.createTaskWithOutbox({
+      name: 'cancel-skip-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    await repo.cancelTask(task.id);
+
+    const processed = await publisher.processOutbox();
+    expect(processed).toBe(0);
+
+    const pending = await publisher.getPendingCount();
+    expect(pending).toBe(0);
+
+    const job = await queue.getJob(task.id);
+    expect(job).toBeNull();
+  });
+
+  it('should start with circuit breaker CLOSED', () => {
+    if (!pgAvailable || !redisAvailable) return;
+    expect(publisher.getCircuitState()).toBe('CLOSED');
   });
 
   it('should handle atomicity: task and outbox event created together', async () => {

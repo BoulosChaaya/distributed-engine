@@ -6,7 +6,7 @@ metadata:
   labels:
     app: worker
 spec:
-  replicas: 5  # Five workers for parallel job processing
+  replicas: 5
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,7 +20,6 @@ spec:
       labels:
         app: worker
     spec:
-      # Pod anti-affinity spreads workers across nodes
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -36,10 +35,9 @@ spec:
 
       containers:
       - name: worker
-        image: distributed-engine-worker:0.1.0  # Set to your registry image
+        image: distributed-engine-worker:0.1.0
         imagePullPolicy: IfNotPresent
 
-        # Environment configuration
         env:
         - name: NODE_ENV
           value: "production"
@@ -49,6 +47,8 @@ spec:
           value: "6379"
         - name: LOG_LEVEL
           value: "INFO"
+        - name: QUEUE_CONCURRENCY
+          value: "5"
         - name: POSTGRES_HOST
           value: "postgres.distributed-engine.svc.cluster.local"
         - name: POSTGRES_PORT
@@ -63,7 +63,6 @@ spec:
               name: postgres-secret
               key: password
 
-        # Resource management - workers are CPU intensive
         resources:
           requests:
             memory: "512Mi"
@@ -72,18 +71,18 @@ spec:
             memory: "1Gi"
             cpu: "1000m"
 
-        # Graceful shutdown - wait for in-flight jobs
+        # preStop gives K8s time to stop routing; worker.close() then
+        # drains in-flight jobs within the remaining grace period.
         lifecycle:
           preStop:
             exec:
-              # Give worker 25s to finish current jobs
-              command: ["/bin/sh", "-c", "sleep 25"]
+              command: ["/bin/sh", "-c", "sleep 5"]
 
-      # Termination grace period for graceful job completion
-      terminationGracePeriodSeconds: 35  # 25s graceful shutdown + 10s buffer
+      # 5s preStop + 30s worker shutdown timeout + 5s buffer
+      terminationGracePeriodSeconds: 40
 
 ---
-# Horizontal Pod Autoscaler for workers - scale by queue depth
+# HPA scales on CPU and memory utilization
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -124,14 +123,13 @@ spec:
         periodSeconds: 60
 
 ---
-# PodDisruptionBudget - ensure worker availability
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: worker-pdb
   namespace: distributed-engine
 spec:
-  minAvailable: 3  # Keep at least 3 workers running
+  minAvailable: 3
   selector:
     matchLabels:
       app: worker

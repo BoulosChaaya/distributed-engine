@@ -2,37 +2,35 @@
 
 import React, { useEffect, useState } from 'react';
 
-interface Worker {
+interface WorkerInfo {
   id: string;
   status: string;
-  capacity: number;
-  activeJobs: number;
-  processedJobs: number;
-  failedJobs: number;
+  uptime: number;
+  jobsProcessed: number;
+  jobsCompleted: number;
+  jobsFailed: number;
   lastHeartbeat: string;
 }
 
 export default function WorkersPage() {
-  const [workers, setWorkers] = useState<Worker[]>([]);
+  const [workers, setWorkers] = useState<WorkerInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchWorkers = async () => {
       try {
-        // Placeholder: will fetch from real endpoint in next phase
-        setWorkers([
-          {
-            id: 'worker-1',
-            status: 'ONLINE',
-            capacity: 5,
-            activeJobs: 2,
-            processedJobs: 42,
-            failedJobs: 1,
-            lastHeartbeat: new Date().toISOString(),
-          },
-        ]);
-      } catch (error) {
-        console.error('Failed to fetch workers:', error);
+        const response = await fetch(
+          `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/workers`
+        );
+        const data = await response.json();
+
+        if (data.success) {
+          setWorkers(data.data.workers || []);
+          setError(null);
+        }
+      } catch (err) {
+        setError('Unable to connect to API');
       } finally {
         setLoading(false);
       }
@@ -46,10 +44,12 @@ export default function WorkersPage() {
   return (
     <div>
       <h1>Workers</h1>
-      <p>Connected worker instances</p>
+      <p>Connected worker instances (live from Redis heartbeats)</p>
 
       {loading ? (
         <p>Loading workers...</p>
+      ) : error ? (
+        <p style={{ color: 'red' }}>{error}</p>
       ) : (
         <div style={{ background: 'white', borderRadius: '4px', overflow: 'hidden' }}>
           {workers.length === 0 ? (
@@ -60,9 +60,9 @@ export default function WorkersPage() {
                 <tr>
                   <th>Worker ID</th>
                   <th>Status</th>
-                  <th>Capacity</th>
-                  <th>Active Jobs</th>
+                  <th>Uptime (s)</th>
                   <th>Processed</th>
+                  <th>Completed</th>
                   <th>Failed</th>
                   <th>Last Heartbeat</th>
                 </tr>
@@ -78,10 +78,10 @@ export default function WorkersPage() {
                         {worker.status}
                       </span>
                     </td>
-                    <td>{worker.capacity}</td>
-                    <td>{worker.activeJobs}</td>
-                    <td>{worker.processedJobs}</td>
-                    <td>{worker.failedJobs}</td>
+                    <td>{worker.uptime}</td>
+                    <td>{worker.jobsProcessed}</td>
+                    <td>{worker.jobsCompleted}</td>
+                    <td>{worker.jobsFailed}</td>
                     <td>{new Date(worker.lastHeartbeat).toLocaleTimeString()}</td>
                   </tr>
                 ))}

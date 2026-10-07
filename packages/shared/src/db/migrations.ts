@@ -67,35 +67,41 @@ const MIGRATIONS = [
 export async function runMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+    await client.query('SELECT pg_advisory_lock(42)');
 
-    const { rows } = await client.query('SELECT version FROM schema_migrations ORDER BY version');
-    const applied = new Set(rows.map((r: { version: number }) => r.version));
-
-    for (const migration of MIGRATIONS) {
-      if (migration.name === 'create_schema_migrations_table') continue;
-      if (applied.has(migration.version)) continue;
-
-      log('INFO', `Running migration ${migration.version}: ${migration.name}`);
-      await client.query('BEGIN');
-      try {
-        await client.query(migration.sql);
-        await client.query(
-          'INSERT INTO schema_migrations (version, name) VALUES ($1, $2)',
-          [migration.version, migration.name],
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        await client.query('COMMIT');
-        log('INFO', `Migration ${migration.version} applied successfully`);
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
+      `);
+
+      const { rows } = await client.query('SELECT version FROM schema_migrations ORDER BY version');
+      const applied = new Set(rows.map((r: { version: number }) => r.version));
+
+      for (const migration of MIGRATIONS) {
+        if (migration.name === 'create_schema_migrations_table') continue;
+        if (applied.has(migration.version)) continue;
+
+        log('INFO', `Running migration ${migration.version}: ${migration.name}`);
+        await client.query('BEGIN');
+        try {
+          await client.query(migration.sql);
+          await client.query(
+            'INSERT INTO schema_migrations (version, name) VALUES ($1, $2)',
+            [migration.version, migration.name],
+          );
+          await client.query('COMMIT');
+          log('INFO', `Migration ${migration.version} applied successfully`);
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        }
       }
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(42)');
     }
   } finally {
     client.release();

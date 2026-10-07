@@ -6,12 +6,12 @@ metadata:
   labels:
     app: api
 spec:
-  replicas: 3  # Three API instances for high availability
+  replicas: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1        # One extra pod during update
-      maxUnavailable: 0  # Zero downtime updates
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: api
@@ -19,12 +19,7 @@ spec:
     metadata:
       labels:
         app: api
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "3000"
-        prometheus.io/path: "/metrics"
     spec:
-      # Pod Disruption Budget - protect against node failures
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -40,13 +35,12 @@ spec:
 
       containers:
       - name: api
-        image: distributed-engine-api:0.1.0  # Set to your registry image
+        image: distributed-engine-api:0.1.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3000
           name: http
 
-        # Environment configuration
         env:
         - name: NODE_ENV
           value: "production"
@@ -58,10 +52,6 @@ spec:
           value: "6379"
         - name: LOG_LEVEL
           value: "INFO"
-        - name: QUEUE_CONCURRENCY
-          value: "10"
-        - name: CIRCUIT_BREAKER_RESET_TIMEOUT_MS
-          value: "60000"
         - name: GRACEFUL_SHUTDOWN_TIMEOUT_MS
           value: "30000"
         - name: POSTGRES_HOST
@@ -78,7 +68,6 @@ spec:
               name: postgres-secret
               key: password
 
-        # Resource management - prevent resource starvation
         resources:
           requests:
             memory: "256Mi"
@@ -87,7 +76,6 @@ spec:
             memory: "512Mi"
             cpu: "500m"
 
-        # Health checks for Kubernetes orchestration
         livenessProbe:
           httpGet:
             path: /live
@@ -106,24 +94,21 @@ spec:
           timeoutSeconds: 2
           failureThreshold: 2
 
-        # Graceful shutdown - 30s to drain requests
         lifecycle:
           preStop:
             exec:
-              command: ["/bin/sh", "-c", "sleep 5"]  # Wait for LB to stop routing
+              command: ["/bin/sh", "-c", "sleep 5"]
 
-      # Termination grace period matches GRACEFUL_SHUTDOWN_TIMEOUT_MS
-      terminationGracePeriodSeconds: 40  # 30s shutdown + 10s buffer
+      terminationGracePeriodSeconds: 40
 
 ---
-# Service for routing traffic to API pods
 apiVersion: v1
 kind: Service
 metadata:
   name: api
   namespace: distributed-engine
 spec:
-  type: LoadBalancer  # Expose externally
+  type: LoadBalancer
   selector:
     app: api
   ports:
@@ -133,7 +118,7 @@ spec:
     name: http
 
 ---
-# Horizontal Pod Autoscaler - scale based on CPU usage
+# HPA scales on CPU and memory utilization
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -174,14 +159,13 @@ spec:
         periodSeconds: 15
 
 ---
-# PodDisruptionBudget - ensure minimum replicas during maintenance
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: api-pdb
   namespace: distributed-engine
 spec:
-  minAvailable: 2  # Keep at least 2 pods running
+  minAvailable: 2
   selector:
     matchLabels:
       app: api

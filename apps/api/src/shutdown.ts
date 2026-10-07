@@ -2,6 +2,7 @@ import { Queue } from 'bullmq';
 import { Pool } from 'pg';
 import { log, OutboxPublisher } from '@repo/shared';
 import IORedis from 'ioredis';
+import type { Server } from 'http';
 
 export class ShutdownManager {
   private isShuttingDown = false;
@@ -16,7 +17,7 @@ export class ShutdownManager {
   }
 
   registerHandlers(
-    server: NodeJS.Server,
+    server: Server,
     deps: {
       taskQueue: Queue;
       redisClient: IORedis;
@@ -41,7 +42,7 @@ export class ShutdownManager {
   }
 
   private async shutdown(
-    server: NodeJS.Server,
+    server: Server,
     deps: {
       taskQueue: Queue;
       redisClient: IORedis;

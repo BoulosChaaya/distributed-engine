@@ -47,7 +47,7 @@ export class TaskRepository {
 
       const taskResult = await client.query(
         `INSERT INTO tasks (id, name, status, priority, payload, max_retries, retries, version, created_at, updated_at)
-         VALUES ($1, $2, 'PENDING', $3, $4, $5, 0, 1, NOW(), NOW())
+         VALUES ($1, $2, 'QUEUED', $3, $4, $5, 0, 1, NOW(), NOW())
          RETURNING *`,
         [taskId, input.name, input.priority, JSON.stringify(input.payload), input.maxRetries],
       );
