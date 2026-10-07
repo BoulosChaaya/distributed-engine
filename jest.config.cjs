@@ -1,9 +1,10 @@
 /** @type {import('jest').Config} */
 const config = {
   projects: [
-    '<rootDir>/packages/*/jest.config.js',
-    '<rootDir>/apps/*/jest.config.js',
+    '<rootDir>/packages/*/jest.config.cjs',
+    '<rootDir>/apps/*/jest.config.cjs',
   ],
+  maxWorkers: 1,
   testEnvironment: 'node',
   collectCoverageFrom: [
     '**/*.ts',

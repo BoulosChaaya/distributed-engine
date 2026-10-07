@@ -1,48 +1,49 @@
 import { Queue } from 'bullmq';
-import { Task, TaskStatus } from '@repo/shared';
+import { TaskRepository, OutboxPublisher } from '@repo/shared';
 
-// Metrics collector for monitoring system health
 export class MetricsCollector {
-  private tasksByStatus = new Map<TaskStatus, number>();
   private requestCount = 0;
   private errorCount = 0;
   private startTime = Date.now();
 
-  constructor(private taskStore: Map<string, Task>, private taskQueue: Queue) {
-    this.initializeStatusMap();
-  }
+  constructor(
+    private taskRepo: TaskRepository,
+    private taskQueue: Queue,
+    private outboxPublisher: OutboxPublisher,
+  ) {}
 
-  private initializeStatusMap() {
-    const statuses: TaskStatus[] = ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
-    statuses.forEach((status) => this.tasksByStatus.set(status, 0));
-  }
-
-  // Increment request counter
   recordRequest() {
     this.requestCount++;
   }
 
-  // Record error
   recordError() {
     this.errorCount++;
   }
 
-  // Get current metrics
   async getMetrics() {
-    // Recalculate status counts from task store
-    this.tasksByStatus.forEach((_, status) => this.tasksByStatus.set(status, 0));
+    const statusCounts = await this.taskRepo.getTaskStatusCounts();
+    const totalTasks = await this.taskRepo.getTaskCount();
 
-    for (const task of this.taskStore.values()) {
-      const current = this.tasksByStatus.get(task.status) || 0;
-      this.tasksByStatus.set(task.status, current + 1);
+    let queueTotal = 0;
+    let activeCount = 0;
+    let waitingCount = 0;
+    try {
+      queueTotal = await this.taskQueue.count();
+      activeCount = await this.taskQueue.getActiveCount();
+      waitingCount = await this.taskQueue.getWaitingCount();
+    } catch {
+      // Queue metrics unavailable
     }
 
-    // Get queue depth
-    const queueCount = await this.taskQueue.count();
-    const activeCount = await this.taskQueue.getActiveCount();
-    const waitingCount = await this.taskQueue.getWaitingCount();
+    let outboxPending = 0;
+    let outboxFailed = 0;
+    try {
+      outboxPending = await this.outboxPublisher.getPendingCount();
+      outboxFailed = await this.outboxPublisher.getFailedCount();
+    } catch {
+      // Outbox metrics unavailable
+    }
 
-    // Calculate uptime
     const uptime = Math.floor((Date.now() - this.startTime) / 1000);
 
     return {
@@ -54,28 +55,18 @@ export class MetricsCollector {
         errorRate: this.requestCount > 0 ? (this.errorCount / this.requestCount * 100).toFixed(2) : '0.00',
       },
       tasks: {
-        total: this.taskStore.size,
-        byStatus: Object.fromEntries(this.tasksByStatus),
+        total: totalTasks,
+        byStatus: statusCounts,
       },
       queue: {
-        total: queueCount,
+        total: queueTotal,
         active: activeCount,
         waiting: waitingCount,
       },
+      outbox: {
+        pending: outboxPending,
+        failed: outboxFailed,
+      },
     };
-  }
-
-  // Get task completion rate
-  getCompletionRate() {
-    const completed = this.tasksByStatus.get('COMPLETED') || 0;
-    const total = this.taskStore.size;
-    return total > 0 ? (completed / total * 100).toFixed(2) : '0.00';
-  }
-
-  // Get failure rate
-  getFailureRate() {
-    const failed = this.tasksByStatus.get('FAILED') || 0;
-    const total = this.taskStore.size;
-    return total > 0 ? (failed / total * 100).toFixed(2) : '0.00';
   }
 }

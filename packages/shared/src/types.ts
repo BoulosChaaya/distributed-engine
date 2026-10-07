@@ -1,4 +1,3 @@
-// Task types
 export type TaskStatus = 'PENDING' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type TaskPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
@@ -10,13 +9,15 @@ export interface Task {
   payload: Record<string, unknown>;
   retries: number;
   maxRetries: number;
+  result?: Record<string, unknown>;
+  error?: string;
   createdAt: Date;
   updatedAt: Date;
+  startedAt?: Date;
   completedAt?: Date;
-  error?: string;
+  version: number;
 }
 
-// Worker types
 export type WorkerStatus = 'ONLINE' | 'OFFLINE' | 'BUSY';
 
 export interface Worker {
@@ -29,7 +30,6 @@ export interface Worker {
   lastHeartbeat: Date;
 }
 
-// Queue message types
 export interface QueueMessage {
   taskId: string;
   task: Task;
@@ -37,7 +37,6 @@ export interface QueueMessage {
   attempt: number;
 }
 
-// API Response types
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
@@ -51,4 +50,17 @@ export interface PaginatedResponse<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+}
+
+export interface OutboxEvent {
+  id: string;
+  taskId: string;
+  eventType: 'TASK_CREATED';
+  payload: Record<string, unknown>;
+  status: 'PENDING' | 'DELIVERED' | 'FAILED';
+  attempts: number;
+  createdAt: Date;
+  processedAt?: Date;
+  claimedBy?: string;
+  claimedAt?: Date;
 }

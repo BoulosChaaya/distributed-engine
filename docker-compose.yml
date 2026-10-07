@@ -1,7 +1,23 @@
 version: '3.8'
 
 services:
-  # Redis - message queue and state store
+  postgres:
+    image: postgres:16-alpine
+    container_name: engine-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: distributed_engine
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     container_name: engine-redis
@@ -16,7 +32,6 @@ services:
       retries: 5
     command: redis-server --appendonly yes
 
-  # API Server
   api:
     build:
       context: .
@@ -29,19 +44,25 @@ services:
       PORT: 3000
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: distributed_engine
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       LOG_LEVEL: INFO
       QUEUE_CONCURRENCY: 5
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
-  # Worker - Job Processor (scale by running multiple instances)
   worker:
     build:
       context: .
@@ -51,27 +72,21 @@ services:
       NODE_ENV: development
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: distributed_engine
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       LOG_LEVEL: INFO
     depends_on:
       redis:
         condition: service_healthy
-
-  # Optional: Additional worker for parallel processing
-  # worker-2:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.worker
-  #   environment:
-  #     NODE_ENV: development
-  #     REDIS_HOST: redis
-  #     REDIS_PORT: 6379
-  #     LOG_LEVEL: INFO
-  #   depends_on:
-  #     redis:
-  #       condition: service_healthy
+      postgres:
+        condition: service_healthy
 
 volumes:
   redis_data:
+  postgres_data:
 
 networks:
   default:

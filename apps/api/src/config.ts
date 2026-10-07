@@ -1,43 +1,44 @@
-// Centralized configuration management
-// All environment variables and configuration in one place for production
-
 export interface AppConfig {
-  // Server
   port: number;
   nodeEnv: 'development' | 'staging' | 'production';
 
-  // Redis
   redis: {
     host: string;
     port: number;
     password?: string;
-    db?: number;
-    maxRetries: number;
-    retryDelayMs: number;
-    connectTimeoutMs: number;
-    keepAlive: boolean;
   };
 
-  // Queue
+  postgres: {
+    host: string;
+    port: number;
+    database: string;
+    user: string;
+    password?: string;
+    maxConnections: number;
+  };
+
   queue: {
     concurrency: number;
     maxAttempts: number;
     backoffDelayMs: number;
   };
 
-  // Circuit Breaker
   circuitBreaker: {
     failureThreshold: number;
     successThreshold: number;
     resetTimeoutMs: number;
   };
 
-  // Graceful Shutdown
   gracefulShutdown: {
     timeoutMs: number;
   };
 
-  // Logging
+  outbox: {
+    pollIntervalMs: number;
+    batchSize: number;
+    maxAttempts: number;
+  };
+
   logging: {
     level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
   };
@@ -49,14 +50,8 @@ function parseNumber(value: string | undefined, defaultValue: number): number {
   return isNaN(parsed) ? defaultValue : parsed;
 }
 
-function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
-  if (!value) return defaultValue;
-  return value.toLowerCase() === 'true' || value === '1';
-}
-
-// Load and validate configuration from environment
 export function loadConfig(): AppConfig {
-  const nodeEnv = (process.env.NODE_ENV as any) || 'development';
+  const nodeEnv = (process.env.NODE_ENV as AppConfig['nodeEnv']) || 'development';
 
   return {
     port: parseNumber(process.env.PORT, 3000),
@@ -66,11 +61,15 @@ export function loadConfig(): AppConfig {
       host: process.env.REDIS_HOST || 'localhost',
       port: parseNumber(process.env.REDIS_PORT, 6379),
       password: process.env.REDIS_PASSWORD,
-      db: parseNumber(process.env.REDIS_DB, 0),
-      maxRetries: parseNumber(process.env.REDIS_MAX_RETRIES, 10),
-      retryDelayMs: parseNumber(process.env.REDIS_RETRY_DELAY_MS, 50),
-      connectTimeoutMs: parseNumber(process.env.REDIS_CONNECT_TIMEOUT_MS, 10000),
-      keepAlive: parseBoolean(process.env.REDIS_KEEP_ALIVE, true),
+    },
+
+    postgres: {
+      host: process.env.POSTGRES_HOST || 'localhost',
+      port: parseNumber(process.env.POSTGRES_PORT, 5432),
+      database: process.env.POSTGRES_DB || 'distributed_engine',
+      user: process.env.POSTGRES_USER || 'postgres',
+      password: process.env.POSTGRES_PASSWORD,
+      maxConnections: parseNumber(process.env.POSTGRES_MAX_CONNECTIONS, 20),
     },
 
     queue: {
@@ -89,28 +88,30 @@ export function loadConfig(): AppConfig {
       timeoutMs: parseNumber(process.env.GRACEFUL_SHUTDOWN_TIMEOUT_MS, 30000),
     },
 
+    outbox: {
+      pollIntervalMs: parseNumber(process.env.OUTBOX_POLL_INTERVAL_MS, 1000),
+      batchSize: parseNumber(process.env.OUTBOX_BATCH_SIZE, 10),
+      maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
+    },
+
     logging: {
-      level: (process.env.LOG_LEVEL as any) || 'INFO',
+      level: (process.env.LOG_LEVEL as AppConfig['logging']['level']) || 'INFO',
     },
   };
 }
 
-// Validate configuration
 export function validateConfig(config: AppConfig): void {
   const errors: string[] = [];
 
   if (config.port < 1 || config.port > 65535) {
     errors.push('PORT must be between 1 and 65535');
   }
-
   if (config.redis.port < 1 || config.redis.port > 65535) {
     errors.push('REDIS_PORT must be between 1 and 65535');
   }
-
   if (config.queue.concurrency < 1) {
     errors.push('QUEUE_CONCURRENCY must be at least 1');
   }
-
   if (config.circuitBreaker.failureThreshold < 1) {
     errors.push('CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1');
   }
@@ -120,6 +121,5 @@ export function validateConfig(config: AppConfig): void {
   }
 }
 
-// Export singleton config instance
 export const config = loadConfig();
 validateConfig(config);

@@ -13,10 +13,13 @@
   "dependencies": {
     "@repo/shared": "workspace:*",
     "bullmq": "^5.0.0",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
     "redis": "^4.6.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.23.1",
     "ts-node": "^10.9.1",
     "typescript": "^5.2.0"
   }

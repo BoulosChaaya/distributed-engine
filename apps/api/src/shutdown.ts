@@ -1,47 +1,37 @@
-import { Express } from 'express';
 import { Queue } from 'bullmq';
-import { createClient, RedisClientType } from 'redis';
-import { log } from '@repo/shared';
+import { Pool } from 'pg';
+import { log, OutboxPublisher } from '@repo/shared';
+import IORedis from 'ioredis';
 
-// Graceful shutdown manager for production
 export class ShutdownManager {
   private isShuttingDown = false;
   private activeRequests = 0;
 
   constructor(
-    private app: Express,
-    private redisClient: RedisClientType,
-    private taskQueue: Queue,
-    private shutdownTimeout: number = 30000 // 30 second timeout
+    private shutdownTimeout: number = 30000,
   ) {}
 
-  // Register shutdown handlers (call this once after server start)
-  registerHandlers(server: NodeJS.Server) {
-    process.on('SIGTERM', () => this.shutdown(server, 'SIGTERM'));
-    process.on('SIGINT', () => this.shutdown(server, 'SIGINT'));
-
-    // Handle uncaught exceptions gracefully
-    process.on('uncaughtException', (error) => {
-      log('ERROR', 'Uncaught exception, initiating shutdown', {
-        error: error.message,
-        stack: error.stack
-      });
-      this.shutdown(server, 'uncaughtException');
-    });
-
-    // Handle unhandled promise rejections
-    process.on('unhandledRejection', (reason) => {
-      log('ERROR', 'Unhandled rejection, initiating shutdown', {
-        reason: String(reason)
-      });
-      this.shutdown(server, 'unhandledRejection');
-    });
+  get shuttingDown(): boolean {
+    return this.isShuttingDown;
   }
 
-  // Track request lifecycle for graceful draining
+  registerHandlers(
+    server: NodeJS.Server,
+    deps: {
+      taskQueue: Queue;
+      redisClient: IORedis;
+      pgPool: Pool;
+      outboxPublisher: OutboxPublisher;
+    },
+  ) {
+    const shutdown = (signal: string) => this.shutdown(server, deps, signal);
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  }
+
   incrementRequests() {
     if (this.isShuttingDown) {
-      throw new Error('Server is shutting down, no new requests accepted');
+      throw new Error('Server is shutting down');
     }
     this.activeRequests++;
   }
@@ -50,7 +40,16 @@ export class ShutdownManager {
     this.activeRequests--;
   }
 
-  private async shutdown(server: NodeJS.Server, signal: string) {
+  private async shutdown(
+    server: NodeJS.Server,
+    deps: {
+      taskQueue: Queue;
+      redisClient: IORedis;
+      pgPool: Pool;
+      outboxPublisher: OutboxPublisher;
+    },
+    signal: string,
+  ) {
     if (this.isShuttingDown) {
       log('WARN', 'Shutdown already in progress, forcing exit', { signal });
       process.exit(1);
@@ -59,49 +58,57 @@ export class ShutdownManager {
     this.isShuttingDown = true;
     log('INFO', 'Graceful shutdown initiated', { signal, activeRequests: this.activeRequests });
 
-    // Stop accepting new requests
     server.close(() => {
-      log('INFO', 'HTTP server closed, no longer accepting connections');
+      log('INFO', 'HTTP server closed');
     });
 
-    // Wait for active requests to drain (with timeout)
+    await deps.outboxPublisher.stop();
+
     const drainStart = Date.now();
-    const drainCheck = setInterval(() => {
-      const elapsed = Date.now() - drainStart;
-      if (this.activeRequests === 0) {
-        clearInterval(drainCheck);
-        this.closeConnections();
-      } else if (elapsed > this.shutdownTimeout) {
-        clearInterval(drainCheck);
-        log('WARN', 'Shutdown timeout exceeded, forcing close', {
-          activeRequests: this.activeRequests,
-          elapsed
-        });
-        this.closeConnections();
-      }
-    }, 100);
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (this.activeRequests === 0 || Date.now() - drainStart > this.shutdownTimeout) {
+          clearInterval(check);
+          if (this.activeRequests > 0) {
+            log('WARN', 'Shutdown timeout, forcing close', { activeRequests: this.activeRequests });
+          }
+          resolve();
+        }
+      }, 100);
+    });
+
+    await this.closeConnections(deps);
+    process.exit(0);
   }
 
-  private async closeConnections() {
-    log('INFO', 'Closing all connections');
+  private async closeConnections(deps: {
+    taskQueue: Queue;
+    redisClient: IORedis;
+    pgPool: Pool;
+  }) {
+    log('INFO', 'Closing connections');
 
     try {
-      // Close the queue (which closes its internal connections)
-      await this.taskQueue.close();
+      await deps.taskQueue.close();
       log('INFO', 'Task queue closed');
     } catch (error) {
       log('WARN', 'Error closing task queue', { error: String(error) });
     }
 
     try {
-      // Close Redis connection
-      await this.redisClient.quit();
+      deps.redisClient.disconnect();
       log('INFO', 'Redis connection closed');
     } catch (error) {
-      log('WARN', 'Error closing Redis connection', { error: String(error) });
+      log('WARN', 'Error closing Redis', { error: String(error) });
+    }
+
+    try {
+      await deps.pgPool.end();
+      log('INFO', 'PostgreSQL pool closed');
+    } catch (error) {
+      log('WARN', 'Error closing PostgreSQL pool', { error: String(error) });
     }
 
     log('INFO', 'Graceful shutdown complete');
-    process.exit(0);
   }
 }

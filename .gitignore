@@ -148,5 +148,8 @@ vite.config.ts.timestamp-*
 # Turbo Repo
 .turbo
 
+# Redis dump
+dump.rdb
+
 # Claude remote (security - never commit tokens)
 .claude/remote/

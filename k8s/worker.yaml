@@ -49,6 +49,19 @@ spec:
           value: "6379"
         - name: LOG_LEVEL
           value: "INFO"
+        - name: POSTGRES_HOST
+          value: "postgres.distributed-engine.svc.cluster.local"
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_DB
+          value: "distributed_engine"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: password
 
         # Resource management - workers are CPU intensive
         resources:
