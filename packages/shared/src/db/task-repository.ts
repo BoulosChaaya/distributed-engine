@@ -2,6 +2,7 @@ import { Pool } from 'pg';
 import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types';
 import { assertValidTransition } from '../state-machine';
 import { generateId } from '../utils';
+import { injectTraceContext } from '../telemetry/propagation';
 
 export interface CreateTaskInput {
   name: string;
@@ -63,11 +64,14 @@ export class TaskRepository {
         maxRetries: input.maxRetries,
       };
 
+      const traceCtx = injectTraceContext();
+      const hasTraceContext = Object.keys(traceCtx).length > 0;
+
       const outboxResult = await client.query(
-        `INSERT INTO outbox_events (id, task_id, event_type, payload, status, attempts, created_at)
-         VALUES ($1, $2, 'TASK_CREATED', $3, 'PENDING', 0, NOW())
+        `INSERT INTO outbox_events (id, task_id, event_type, payload, status, attempts, created_at, trace_context)
+         VALUES ($1, $2, 'TASK_CREATED', $3, 'PENDING', 0, NOW(), $4)
          RETURNING *`,
-        [outboxId, taskId, JSON.stringify(outboxPayload)],
+        [outboxId, taskId, JSON.stringify(outboxPayload), hasTraceContext ? JSON.stringify(traceCtx) : null],
       );
 
       await client.query('COMMIT');
@@ -82,6 +86,7 @@ export class TaskRepository {
         attempts: outboxResult.rows[0].attempts,
         createdAt: new Date(outboxResult.rows[0].created_at),
         processedAt: outboxResult.rows[0].processed_at ? new Date(outboxResult.rows[0].processed_at) : undefined,
+        traceContext: outboxResult.rows[0].trace_context ?? undefined,
       };
 
       return { task, outboxEvent };
