@@ -1,6 +1,6 @@
 import { Queue } from 'bullmq';
 import { Pool } from 'pg';
-import { log, OutboxPublisher } from '@repo/shared';
+import { log, OutboxPublisher, shutdownTelemetry } from '@repo/shared';
 import IORedis from 'ioredis';
 import type { Server } from 'http';
 
@@ -81,6 +81,7 @@ export class ShutdownManager {
     });
 
     await this.closeConnections(deps);
+    await shutdownTelemetry();
     process.exit(timedOut ? 1 : 0);
   }
 

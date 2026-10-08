@@ -9,12 +9,20 @@ import {
   OutboxPublisher,
   runMigrations,
   InvalidTransitionError,
+  initTelemetry,
+  tracing,
 } from '@repo/shared';
 import { Task, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
 import { MetricsCollector } from './metrics';
 import { ShutdownManager } from './shutdown';
 import { config } from './config';
+
+initTelemetry({
+  serviceName: 'distributed-engine-api',
+  enableHttpInstrumentation: true,
+  enablePgInstrumentation: true,
+});
 
 const app = express();
 
@@ -180,12 +188,27 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = SubmitTaskSchema.parse(req.body);
 
-    const { task } = await taskRepo.createTaskWithOutbox({
-      name: validatedData.name,
-      priority: validatedData.priority,
-      payload: validatedData.payload,
-      maxRetries: validatedData.maxRetries,
-    });
+    const span = tracing.startTaskCreation('pending', validatedData.name, validatedData.priority);
+
+    let task: Task;
+    try {
+      const result = await tracing.withActiveSpan(span, () =>
+        taskRepo.createTaskWithOutbox({
+          name: validatedData.name,
+          priority: validatedData.priority,
+          payload: validatedData.payload,
+          maxRetries: validatedData.maxRetries,
+        }),
+      );
+      task = result.task;
+      span.setAttribute('task.id', task.id);
+      tracing.setSpanOk(span);
+    } catch (error) {
+      tracing.recordError(span, error);
+      throw error;
+    } finally {
+      tracing.endSpan(span);
+    }
 
     log('INFO', 'Task created', { taskId: task.id, name: task.name });
 
