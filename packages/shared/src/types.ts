@@ -66,4 +66,5 @@ export interface OutboxEvent {
   processedAt?: Date;
   claimedBy?: string;
   claimedAt?: Date;
+  traceContext?: Record<string, string>;
 }

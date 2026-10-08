@@ -85,6 +85,13 @@ const MIGRATIONS = [
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ;
     `,
   },
+  {
+    version: 7,
+    name: 'add_outbox_trace_context',
+    sql: `
+      ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS trace_context JSONB;
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {
