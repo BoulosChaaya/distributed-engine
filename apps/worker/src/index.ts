@@ -1,8 +1,24 @@
 import { Worker, DelayedError } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
-import { log, TaskRepository, ClaimNotExpiredError, runMigrations } from '@repo/shared';
+import {
+  log,
+  TaskRepository,
+  ClaimNotExpiredError,
+  runMigrations,
+  initTelemetry,
+  shutdownTelemetry,
+  tracing,
+  extractTraceContext,
+  TRACE_CONTEXT_KEY,
+} from '@repo/shared';
 import { randomUUID } from 'crypto';
+
+initTelemetry({
+  serviceName: 'distributed-engine-worker',
+  enableHttpInstrumentation: false,
+  enablePgInstrumentation: true,
+});
 
 const WORKER_ID = randomUUID().substring(0, 8);
 
@@ -62,31 +78,40 @@ async function updateWorkerStatus() {
   }
 }
 
-const worker = new Worker(
-  'tasks',
-  async (job) => {
-    const { taskId, taskName } = job.data;
-    log('INFO', 'Processing task', { taskId, name: taskName, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID });
-    workerMetrics.jobsProcessed++;
+import type { Job } from 'bullmq';
+import type { Span } from '@opentelemetry/api';
 
+async function processTask(
+  job: Job,
+  taskId: string,
+  parentSpan: Span,
+): Promise<Record<string, unknown>> {
     const currentTask = await taskRepo.getTask(taskId);
     if (!currentTask) {
       log('WARN', 'Task not found in database, skipping', { taskId, workerId: WORKER_ID });
+      parentSpan.setAttribute('task.skipped', true);
+      parentSpan.setAttribute('task.skip_reason', 'not_found');
       return { status: 'SKIPPED', taskId, reason: 'not_found' };
     }
 
     if (currentTask.status === 'CANCELLED') {
       log('INFO', 'Task was cancelled, skipping', { taskId, workerId: WORKER_ID });
+      parentSpan.setAttribute('task.skipped', true);
+      parentSpan.setAttribute('task.skip_reason', 'cancelled');
       return { status: 'SKIPPED', taskId, reason: 'cancelled' };
     }
 
     if (currentTask.status === 'COMPLETED') {
       log('INFO', 'Task already completed, skipping', { taskId, workerId: WORKER_ID });
+      parentSpan.setAttribute('task.skipped', true);
+      parentSpan.setAttribute('task.skip_reason', 'already_completed');
       return { status: 'SKIPPED', taskId, reason: 'already_completed' };
     }
 
     if (currentTask.status === 'FAILED') {
       log('INFO', 'Task already failed, skipping', { taskId, workerId: WORKER_ID });
+      parentSpan.setAttribute('task.skipped', true);
+      parentSpan.setAttribute('task.skip_reason', 'already_failed');
       return { status: 'SKIPPED', taskId, reason: 'already_failed' };
     }
 
@@ -97,6 +122,7 @@ const worker = new Worker(
     let ownershipLost = false;
 
     if (currentTask.status === 'QUEUED') {
+      const claimSpan = tracing.startTaskClaim(taskId, WORKER_ID, 'initial');
       try {
         const updated = await taskRepo.transitionStatus(taskId, taskVersion, 'PROCESSING', {
           startedAt: new Date(),
@@ -105,21 +131,29 @@ const worker = new Worker(
         taskVersion = updated.version;
         claimToken = updated.claimToken;
         currentRetries = updated.retries;
+        tracing.setSpanOk(claimSpan);
       } catch (error) {
+        tracing.recordError(claimSpan, error);
         log('WARN', 'Failed to transition task to PROCESSING', {
           taskId, error: String(error), workerId: WORKER_ID,
         });
         return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
+      } finally {
+        tracing.endSpan(claimSpan);
       }
     } else if (currentTask.status === 'PROCESSING') {
+      const reclaimSpan = tracing.startTaskClaim(taskId, WORKER_ID, 'reclaim');
       try {
         const reclaimed = await taskRepo.reclaimStalledTask(taskId, taskVersion, WORKER_ID);
         taskVersion = reclaimed.version;
         claimToken = reclaimed.claimToken;
         currentRetries = reclaimed.retries;
         log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
+        tracing.setSpanOk(reclaimSpan);
       } catch (error) {
         if (error instanceof ClaimNotExpiredError) {
+          reclaimSpan.setAttribute('task.claim.deferred', true);
+          tracing.endSpan(reclaimSpan);
           const deferUntil = error.expiresAt.getTime() + LEASE_DEFERRAL_MARGIN_MS;
           log('INFO', 'Lease not expired, deferring job via moveToDelayed', {
             taskId, expiresAt: error.expiresAt.toISOString(),
@@ -129,10 +163,13 @@ const worker = new Worker(
           await job.moveToDelayed(deferUntil, job.token);
           throw new DelayedError();
         }
+        tracing.recordError(reclaimSpan, error);
         log('WARN', 'Failed to reclaim stalled task', {
           taskId, error: String(error), workerId: WORKER_ID,
         });
         return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
+      } finally {
+        tracing.endSpan(reclaimSpan);
       }
     }
 
@@ -156,6 +193,7 @@ const worker = new Worker(
 
       if (ownershipLost) {
         log('INFO', 'Ownership lost during execution, aborting', { taskId, workerId: WORKER_ID });
+        parentSpan.setAttribute('task.ownership_lost', true);
         return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
 
@@ -169,14 +207,24 @@ const worker = new Worker(
 
       if (ownershipLost) {
         log('INFO', 'Ownership lost before completion, aborting', { taskId, workerId: WORKER_ID });
+        parentSpan.setAttribute('task.ownership_lost', true);
         return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
 
-      await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
-        completedAt: new Date(),
-        result: { processedBy: WORKER_ID },
-        claimToken,
-      });
+      const completeSpan = tracing.startTaskComplete(taskId, WORKER_ID);
+      try {
+        await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
+          completedAt: new Date(),
+          result: { processedBy: WORKER_ID },
+          claimToken,
+        });
+        tracing.setSpanOk(completeSpan);
+      } catch (error) {
+        tracing.recordError(completeSpan, error);
+        throw error;
+      } finally {
+        tracing.endSpan(completeSpan);
+      }
 
       workerMetrics.jobsCompleted++;
       log('INFO', 'Task completed', { taskId, workerId: WORKER_ID });
@@ -188,6 +236,7 @@ const worker = new Worker(
       const maxAttempts = job.opts.attempts ?? 1;
       const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
 
+      const failSpan = tracing.startTaskFail(taskId, WORKER_ID, isFinalAttempt);
       try {
         if (isFinalAttempt) {
           await taskRepo.transitionStatus(taskId, taskVersion, 'FAILED', {
@@ -202,11 +251,15 @@ const worker = new Worker(
             claimToken,
           });
         }
+        failSpan.setAttribute('task.status', isFinalAttempt ? 'FAILED' : 'QUEUED');
       } catch (transitionError) {
+        tracing.recordError(failSpan, transitionError);
         log('ERROR', 'Failed to transition task after failure', {
           taskId, targetStatus: isFinalAttempt ? 'FAILED' : 'QUEUED',
           error: String(transitionError), workerId: WORKER_ID,
         });
+      } finally {
+        tracing.endSpan(failSpan);
       }
 
       log('ERROR', 'Task failed', {
@@ -225,6 +278,47 @@ const worker = new Worker(
         renewalTimer = undefined;
       }
     }
+}
+
+const worker = new Worker(
+  'tasks',
+  async (job) => {
+    const { taskId, taskName } = job.data;
+    log('INFO', 'Processing task', { taskId, name: taskName, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID });
+    workerMetrics.jobsProcessed++;
+
+    const traceCarrier = job.data[TRACE_CONTEXT_KEY] as Record<string, string> | undefined;
+    const parentCtx = extractTraceContext(traceCarrier);
+    const processSpan = tracing.startTaskProcess(
+      taskId,
+      taskName ?? 'unknown',
+      WORKER_ID,
+      job.attemptsMade + 1,
+      parentCtx,
+    );
+
+    if (job.data.publishedAt) {
+      processSpan.setAttribute('task.queue_delay_ms',
+        Date.now() - new Date(job.data.publishedAt as string).getTime(),
+      );
+    }
+
+    return tracing.withActiveSpan(processSpan, async () => {
+      try {
+        const result = await processTask(job, taskId, processSpan);
+        tracing.setSpanOk(processSpan);
+        return result;
+      } catch (error) {
+        if (!(error instanceof DelayedError)) {
+          tracing.recordError(processSpan, error);
+        } else {
+          processSpan.setAttribute('task.deferred', true);
+        }
+        throw error;
+      } finally {
+        tracing.endSpan(processSpan);
+      }
+    });
   },
   {
     connection: redisClient,
@@ -307,6 +401,8 @@ async function gracefulShutdown(signal: string) {
   } catch (error) {
     log('WARN', 'Error closing PostgreSQL pool', { error: String(error), workerId: WORKER_ID });
   }
+
+  await shutdownTelemetry();
 
   clearTimeout(shutdownTimeout);
   log('INFO', 'Graceful shutdown complete', { workerId: WORKER_ID });

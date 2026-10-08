@@ -21,6 +21,17 @@
     "typescript": "^5.2.0"
   },
   "dependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/context-async-hooks": "2.12.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.0",
+    "@opentelemetry/instrumentation": "0.223.0",
+    "@opentelemetry/instrumentation-http": "0.223.0",
+    "@opentelemetry/instrumentation-pg": "0.75.0",
+    "@opentelemetry/resources": "2.12.0",
+    "@opentelemetry/sdk-node": "0.223.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
+    "@opentelemetry/sdk-trace-node": "2.12.0",
+    "@opentelemetry/semantic-conventions": "1.43.0",
     "bullmq": "^5.81.5",
     "ioredis": "^5.11.1",
     "pg": "^8.23.1"
