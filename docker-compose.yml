@@ -84,6 +84,21 @@ services:
       postgres:
         condition: service_healthy
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    container_name: engine-otel-collector
+    profiles:
+      - tracing
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "16686:16686" # Jaeger UI
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    depends_on:
+      - api
+      - worker
+
 volumes:
   redis_data:
   postgres_data:

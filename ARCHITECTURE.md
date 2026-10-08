@@ -199,3 +199,99 @@ Task handlers should be idempotent to handle these cases safely.
 - **Redis**: Single instance (StatefulSet) with AOF persistence. BullMQ supports Redis Cluster for higher throughput, but this is not configured.
 
 HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling would require a custom metrics adapter (Prometheus + KEDA or similar), which is not included.
+
+## Distributed Tracing (OpenTelemetry)
+
+### What a Trace Represents
+
+A single trace follows one task through its entire lifecycle:
+
+```
+API (task.create)                         [PRODUCER span]
+  └── OutboxPublisher (outbox.publish)    [INTERNAL span]
+        └── Worker (task.process)         [CONSUMER span]
+              ├── task.claim              [INTERNAL span]
+              ├── task.complete           [INTERNAL span]
+              └── task.fail              [INTERNAL span]
+```
+
+Each task submission creates a root span in the API. The trace context propagates through the outbox event (stored in PG as JSONB) into BullMQ job data, then into the worker. The worker's `task.process` span links back to the original trace via W3C `traceparent`, forming a single distributed trace across async service boundaries.
+
+**Task ID vs Trace ID**: A `task.id` is a business identifier (UUIDv4) stored in PG and used throughout the system for lookups, cancellations, and state transitions. A `traceId` is an OpenTelemetry identifier (32 hex chars) that groups related spans for observability. Both appear as span attributes, but they serve different purposes. A single task maps to one trace under normal operation; retries create child spans within the same trace when the trace context survives in BullMQ job data.
+
+### Context Propagation Path
+
+```
+API POST /tasks
+  │  injectTraceContext() → W3C traceparent carrier
+  │  stored in outbox_events.trace_context (JSONB)
+  ▼
+OutboxPublisher.processOutbox()
+  │  reads trace_context from outbox row
+  │  includes carrier in BullMQ job.data[TRACE_CONTEXT_KEY]
+  ▼
+Worker job handler
+  │  extractTraceContext(job.data[TRACE_CONTEXT_KEY]) → OTel Context
+  │  task.process span created with extracted context as parent
+  ▼
+Worker processTask()
+     child spans (task.claim, task.complete, task.fail) inherit context
+```
+
+The `TRACE_CONTEXT_KEY` constant (`'traceContext'`) is the standard key used in BullMQ job data to carry the W3C trace context carrier object. This is a `Record<string, string>` containing at minimum a `traceparent` field.
+
+### Instrumented Components
+
+| Component | Spans Created | SpanKind |
+|-----------|--------------|----------|
+| API server | `task.create` | PRODUCER |
+| Outbox publisher | `outbox.publish` | INTERNAL |
+| Worker | `task.process` | CONSUMER |
+| Worker | `task.claim` (initial/reclaim) | INTERNAL |
+| Worker | `task.complete` | INTERNAL |
+| Worker | `task.fail` | INTERNAL |
+
+Auto-instrumentation is enabled for:
+- **HTTP** (API only): Incoming requests are traced automatically; health/ready/live probes are excluded via `ignoreIncomingRequestHook`
+- **PostgreSQL** (API and worker): All `pg` queries are traced as child spans of the active context
+
+### Configuration
+
+Tracing is configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTEL_SDK_DISABLED` | `false` | Disables the OTel SDK entirely (no-op tracer) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | OTLP HTTP endpoint (e.g. `http://otel-collector:4318`). If unset, no exporter is configured (spans go to the registered span processor only, useful for testing) |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio (0.0–1.0). `1.0` traces everything; `0.1` samples 10% of traces |
+| `OTEL_LOG_LEVEL` | `warn` | Diagnostic log level for OTel internals (`none`, `error`, `warn`, `info`, `debug`, `verbose`, `all`) |
+
+### Local Development
+
+To trace locally with Jaeger:
+
+1. Add the `otel-collector` service to `docker-compose.yml` (already included as an optional profile)
+2. Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318` on the `api` and `worker` services
+3. Open Jaeger UI at `http://localhost:16686`
+
+Without an OTLP endpoint configured, tracing still works internally (context propagates end-to-end) but spans are not exported to any backend.
+
+### Failure Isolation
+
+**Critical invariant: the business system never depends on tracing for correctness.**
+
+- Every tracing call (`startSpan`, `endSpan`, `recordError`, `injectTraceContext`, `extractTraceContext`) is wrapped in `try/catch`. Failures log a warning and return safe defaults (no-op spans, `ROOT_CONTEXT`, empty carriers).
+- If the OTel SDK fails to initialize, `initTelemetry` logs the error and continues. All subsequent `tracing.*` calls use no-op spans from the API's default tracer.
+- `shutdownTelemetry` has a configurable timeout (default 5s) so a hung exporter never blocks process exit.
+- Missing, null, or malformed trace context in outbox events or BullMQ jobs is handled gracefully: `extractTraceContext` returns `ROOT_CONTEXT`, and the worker creates a new root span instead. This ensures backward compatibility with tasks created before tracing was added.
+
+### Security
+
+- No secrets, credentials, PII, or task payloads are included in span attributes. Spans carry only: task IDs, worker IDs, status values, priority levels, timing measurements, and error messages.
+- The OTLP exporter connects to the Collector, which is a cluster-internal service. No traces leave the cluster unless the Collector is explicitly configured to export them.
+
+### Known Limitations
+
+- Trace context propagation depends on BullMQ job data. If BullMQ drops or corrupts job data, the trace chain breaks (worker creates a new root span). The task itself processes correctly regardless.
+- The cancellation race window (between outbox publisher's status check and `BullMQ.add()`) means a cancelled task may get a BullMQ job with a valid trace context. The worker skips it harmlessly.
+- Queue delay measurement (`task.queue_delay_ms` span attribute) uses wall-clock difference between `publishedAt` in job data and `Date.now()` at the worker. Clock skew between machines introduces measurement error, not correctness issues.
