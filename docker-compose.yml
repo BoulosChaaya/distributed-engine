@@ -84,6 +84,16 @@ services:
       postgres:
         condition: service_healthy
 
+  jaeger:
+    image: jaegertracing/jaeger:2.1.0
+    container_name: engine-jaeger
+    profiles:
+      - tracing
+    ports:
+      - "16686:16686" # Jaeger UI
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.102.0
     container_name: engine-otel-collector
@@ -92,12 +102,10 @@ services:
     ports:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
-      - "16686:16686" # Jaeger UI
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
     depends_on:
-      - api
-      - worker
+      - jaeger
 
 volumes:
   redis_data:
