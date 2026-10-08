@@ -3,7 +3,7 @@ import { Queue } from 'bullmq';
 import { log, generateId } from '../utils';
 import { OutboxEvent } from '../types';
 import { tracing } from '../telemetry/spans';
-import { TRACE_CONTEXT_KEY, injectTraceContext } from '../telemetry/propagation';
+import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
 
 const PRIORITY_MAP: Record<string, number> = {
   LOW: 10,
@@ -225,63 +225,66 @@ export class OutboxPublisher {
   }
 
   private async publishEvent(event: OutboxEvent, client: import('pg').PoolClient): Promise<boolean> {
-    const span = tracing.startOutboxPublish(event.id, event.taskId);
+    const restoredCtx = extractTraceContext(event.traceContext);
+    const span = tracing.startOutboxPublish(event.id, event.taskId, restoredCtx);
 
-    try {
-      const payload = event.payload as Record<string, unknown>;
-      const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
-      const maxRetries = (payload.maxRetries as number) ?? 3;
+    return tracing.withActiveSpan(span, async () => {
+      try {
+        const payload = event.payload as Record<string, unknown>;
+        const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
+        const maxRetries = (payload.maxRetries as number) ?? 3;
 
-      // Best-effort cancellation check. This is NOT atomic with the BullMQ.add()
-      // below — a cancellation can commit between this read and the add. If that
-      // happens, BullMQ will hold a job for a cancelled task. The worker guards
-      // (status check before processing) ensure such a job is skipped harmlessly.
-      // PostgreSQL is the authoritative source of task state.
-      const taskCheck = await client.query(
-        `SELECT status FROM tasks WHERE id = $1`,
-        [event.taskId],
-      );
+        // Best-effort cancellation check. This is NOT atomic with the BullMQ.add()
+        // below — a cancellation can commit between this read and the add. If that
+        // happens, BullMQ will hold a job for a cancelled task. The worker guards
+        // (status check before processing) ensure such a job is skipped harmlessly.
+        // PostgreSQL is the authoritative source of task state.
+        const taskCheck = await client.query(
+          `SELECT status FROM tasks WHERE id = $1`,
+          [event.taskId],
+        );
 
-      if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
-        log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
-        span.setAttribute('outbox.skipped', true);
-        span.setAttribute('outbox.skip_reason', 'cancelled');
-        tracing.setSpanOk(span);
-        return false;
-      }
+        if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
+          log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
+          span.setAttribute('outbox.skipped', true);
+          span.setAttribute('outbox.skip_reason', 'cancelled');
+          tracing.setSpanOk(span);
+          return false;
+        }
 
-      const jobTraceContext = event.traceContext ?? injectTraceContext();
+        const jobTraceContext = injectTraceContext();
 
-      await this.taskQueue.add(
-        payload.taskName as string,
-        {
-          taskId: event.taskId,
-          taskName: payload.taskName,
-          payload: payload.payload,
-          maxRetries,
-          [TRACE_CONTEXT_KEY]: jobTraceContext,
-          publishedAt: new Date().toISOString(),
-        },
-        {
-          jobId: event.taskId,
-          priority,
-          attempts: maxRetries + 1,
-          backoff: {
-            type: 'exponential',
-            delay: 2000,
+        await this.taskQueue.add(
+          payload.taskName as string,
+          {
+            taskId: event.taskId,
+            taskName: payload.taskName,
+            payload: payload.payload,
+            maxRetries,
+            [TRACE_CONTEXT_KEY]: jobTraceContext,
+            publishedAt: new Date().toISOString(),
           },
-        },
-      );
+          {
+            jobId: event.taskId,
+            priority,
+            attempts: maxRetries + 1,
+            backoff: {
+              type: 'exponential',
+              delay: 2000,
+            },
+          },
+        );
 
-      this.onBullMQSuccess();
-      tracing.setSpanOk(span);
-      return true;
-    } catch (error) {
-      tracing.recordError(span, error);
-      throw error;
-    } finally {
-      tracing.endSpan(span);
-    }
+        this.onBullMQSuccess();
+        tracing.setSpanOk(span);
+        return true;
+      } catch (error) {
+        tracing.recordError(span, error);
+        throw error;
+      } finally {
+        tracing.endSpan(span);
+      }
+    });
   }
 
   async getPendingCount(): Promise<number> {

@@ -11,9 +11,6 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 import { AsyncHooksContextManager } from '@opentelemetry/context-async-hooks';
 import { context, trace, Tracer, diag, DiagLogLevel } from '@opentelemetry/api';
-import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
-import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
-import { registerInstrumentations } from '@opentelemetry/instrumentation';
 
 export interface TelemetryConfig {
   serviceName: string;
@@ -22,13 +19,10 @@ export interface TelemetryConfig {
   otlpEndpoint?: string;
   sampleRate?: number;
   useBatchProcessor?: boolean;
-  enableHttpInstrumentation?: boolean;
-  enablePgInstrumentation?: boolean;
   spanProcessor?: SpanProcessor;
 }
 
 let provider: NodeTracerProvider | null = null;
-let instrumentationCleanup: (() => void) | null = null;
 
 function parseSampleRate(): number | undefined {
   const envVal = process.env.OTEL_TRACES_SAMPLER_ARG;
@@ -88,25 +82,6 @@ export function initTelemetry(config: TelemetryConfig): void {
   });
 
   provider.register();
-
-  const instrumentations = [];
-  if (config.enableHttpInstrumentation !== false) {
-    instrumentations.push(new HttpInstrumentation({
-      ignoreIncomingRequestHook: (req) => {
-        const url = req.url ?? '';
-        return url === '/health' || url === '/ready' || url === '/live';
-      },
-    }));
-  }
-  if (config.enablePgInstrumentation !== false) {
-    instrumentations.push(new PgInstrumentation({
-      enhancedDatabaseReporting: false,
-    }));
-  }
-
-  if (instrumentations.length > 0) {
-    instrumentationCleanup = registerInstrumentations({ instrumentations });
-  }
 }
 
 export async function shutdownTelemetry(timeoutMs: number = 5000): Promise<void> {
@@ -121,15 +96,6 @@ export async function shutdownTelemetry(timeoutMs: number = 5000): Promise<void>
     ]);
   } catch {
     // Telemetry shutdown failure must not block process exit
-  }
-
-  if (instrumentationCleanup) {
-    try {
-      instrumentationCleanup();
-    } catch {
-      // Best-effort cleanup
-    }
-    instrumentationCleanup = null;
   }
 
   provider = null;

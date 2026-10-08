@@ -20,8 +20,6 @@ import { config } from './config';
 
 initTelemetry({
   serviceName: 'distributed-engine-api',
-  enableHttpInstrumentation: true,
-  enablePgInstrumentation: true,
 });
 
 const app = express();

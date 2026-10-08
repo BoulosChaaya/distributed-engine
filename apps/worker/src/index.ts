@@ -16,8 +16,6 @@ import { randomUUID } from 'crypto';
 
 initTelemetry({
   serviceName: 'distributed-engine-worker',
-  enableHttpInstrumentation: false,
-  enablePgInstrumentation: true,
 });
 
 const WORKER_ID = randomUUID().substring(0, 8);

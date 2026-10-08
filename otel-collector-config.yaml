@@ -14,8 +14,8 @@ processors:
 exporters:
   debug:
     verbosity: basic
-  jaeger:
-    endpoint: 0.0.0.0:16686
+  otlphttp/jaeger:
+    endpoint: http://jaeger:4318
 
 extensions:
   health_check:
@@ -27,4 +27,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [debug, otlphttp/jaeger]

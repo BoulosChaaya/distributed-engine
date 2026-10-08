@@ -431,4 +431,66 @@ describe('Distributed trace correlation', () => {
 
     apiSpan.end();
   });
+
+  it('should form correct parent chain: API → publisher → worker via parentSpanContext', async () => {
+    exporter.reset();
+
+    const tracer = trace.getTracer('test');
+    const apiSpan = tracer.startSpan('POST /tasks');
+    const apiCtx = trace.setSpan(context.active(), apiSpan);
+    const traceId = apiSpan.spanContext().traceId;
+
+    let taskId: string;
+    let createSpanId: string;
+    await context.with(apiCtx, async () => {
+      const createSpan = tracing.startTaskCreation('pending', 'parent-chain-test', 'HIGH');
+      createSpanId = createSpan.spanContext().spanId;
+      const result = await tracing.withActiveSpan(createSpan, () =>
+        repo.createTaskWithOutbox({
+          name: 'parent-chain-test',
+          priority: 'HIGH',
+          payload: {},
+          maxRetries: 2,
+        }),
+      );
+      taskId = result.task.id;
+      createSpan.setAttribute('task.id', taskId);
+      tracing.endSpan(createSpan);
+    });
+
+    const publisher = new OutboxPublisher(pool, queue, 60000, 10, 3);
+    await publisher.processOutbox();
+
+    const job = await queue.getJob(taskId!);
+    expect(job).toBeDefined();
+
+    const jobCtx = extractTraceContext(job!.data[TRACE_CONTEXT_KEY]);
+    const processSpan = tracing.startTaskProcess(
+      taskId!, 'parent-chain-test', 'test-worker', 1, jobCtx,
+    );
+    tracing.endSpan(processSpan);
+    apiSpan.end();
+
+    const spans = exporter.getFinishedSpans();
+
+    const taskCreateSpan = spans.find(s => s.name === 'task.create');
+    const outboxPublishSpan = spans.find(s => s.name === 'outbox.publish');
+    const taskProcessSpan = spans.find(s => s.name === 'task.process');
+
+    expect(taskCreateSpan).toBeDefined();
+    expect(outboxPublishSpan).toBeDefined();
+    expect(taskProcessSpan).toBeDefined();
+
+    expect(taskCreateSpan!.spanContext().traceId).toBe(traceId);
+    expect(outboxPublishSpan!.spanContext().traceId).toBe(traceId);
+    expect(taskProcessSpan!.spanContext().traceId).toBe(traceId);
+
+    expect((outboxPublishSpan as any).parentSpanContext?.spanId).toBe(createSpanId!);
+    expect((outboxPublishSpan as any).parentSpanContext?.traceId).toBe(traceId);
+
+    expect((taskProcessSpan as any).parentSpanContext?.spanId).toBe(
+      outboxPublishSpan!.spanContext().spanId,
+    );
+    expect((taskProcessSpan as any).parentSpanContext?.traceId).toBe(traceId);
+  });
 });

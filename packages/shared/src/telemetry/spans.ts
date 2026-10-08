@@ -20,16 +20,21 @@ export const tracing = {
     });
   },
 
-  startOutboxPublish(eventId: string, taskId: string): Span {
-    return getTracer().startSpan('outbox.publish', {
-      kind: SpanKind.PRODUCER,
-      attributes: {
-        'outbox.event.id': eventId,
-        'task.id': taskId,
-        'messaging.system': 'bullmq',
-        'messaging.operation': 'publish',
+  startOutboxPublish(eventId: string, taskId: string, parentContext?: Context): Span {
+    const ctx = parentContext ?? context.active();
+    return getTracer().startSpan(
+      'outbox.publish',
+      {
+        kind: SpanKind.PRODUCER,
+        attributes: {
+          'outbox.event.id': eventId,
+          'task.id': taskId,
+          'messaging.system': 'bullmq',
+          'messaging.operation': 'publish',
+        },
       },
-    });
+      ctx,
+    );
   },
 
   startTaskProcess(
