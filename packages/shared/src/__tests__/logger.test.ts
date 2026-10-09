@@ -34,18 +34,14 @@ describe('Logger', () => {
   describe('Structured output with common fields', () => {
     it('should emit structured JSON with required common envelope', () => {
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        {
-          level: 'debug',
-          base: { service: 'test-service', environment: 'test' },
-          timestamp: pino.stdTimeFunctions.isoTime,
-          formatters: { level(label: string) { return { level: label }; } },
-        },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'test-service',
+        environment: 'test',
+        level: 'debug',
+        destination: stream,
+      });
 
-      pinoInstance.info('test message');
+      logger.info('test message');
 
       expect(lines.length).toBe(1);
       const parsed = parseLine(lines[0]);
@@ -56,38 +52,42 @@ describe('Logger', () => {
       expect(parsed).toHaveProperty('msg', 'test message');
     });
 
-    it('should include correct service identity', () => {
-      const logger = createLogger({ service: 'api', environment: 'production', level: 'info' });
-      expect(logger).toBeDefined();
-      expect(typeof logger.info).toBe('function');
-      expect(typeof logger.error).toBe('function');
-      expect(typeof logger.warn).toBe('function');
-      expect(typeof logger.debug).toBe('function');
-    });
-
     it('should support all log levels', () => {
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        {
-          level: 'debug',
-          base: { service: 'level-test', environment: 'test' },
-          timestamp: pino.stdTimeFunctions.isoTime,
-          formatters: { level(label: string) { return { level: label }; } },
-        },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'level-test',
+        environment: 'test',
+        level: 'debug',
+        destination: stream,
+      });
 
-      pinoInstance.debug('debug msg');
-      pinoInstance.info('info msg');
-      pinoInstance.warn('warn msg');
-      pinoInstance.error('error msg');
+      logger.debug('debug msg');
+      logger.info('info msg');
+      logger.warn('warn msg');
+      logger.error('error msg');
 
       expect(lines.length).toBe(4);
       expect(parseLine(lines[0]).level).toBe('debug');
       expect(parseLine(lines[1]).level).toBe('info');
       expect(parseLine(lines[2]).level).toBe('warn');
       expect(parseLine(lines[3]).level).toBe('error');
+    });
+
+    it('should include structured fields in log output', () => {
+      const { stream, lines } = createCaptureStream();
+      const logger = createLogger({
+        service: 'api',
+        environment: 'test',
+        level: 'debug',
+        destination: stream,
+      });
+
+      logger.info('Task received', { taskId: 'task-123', attempt: 1 });
+
+      const parsed = parseLine(lines[0]);
+      expect(parsed.taskId).toBe('task-123');
+      expect(parsed.attempt).toBe(1);
+      expect(parsed.msg).toBe('Task received');
     });
   });
 
@@ -96,11 +96,10 @@ describe('Logger', () => {
       const { stream: s1, lines: l1 } = createCaptureStream();
       const { stream: s2, lines: l2 } = createCaptureStream();
       const { stream: s3, lines: l3 } = createCaptureStream();
-      const pino = require('pino');
 
-      const apiLogger = pino({ base: { service: 'api', environment: 'development' } }, s1);
-      const pubLogger = pino({ base: { service: 'outbox-publisher', environment: 'development' } }, s2);
-      const workerLogger = pino({ base: { service: 'worker', environment: 'development' } }, s3);
+      const apiLogger = createLogger({ service: 'api', environment: 'development', level: 'info', destination: s1 });
+      const pubLogger = createLogger({ service: 'outbox-publisher', environment: 'development', level: 'info', destination: s2 });
+      const workerLogger = createLogger({ service: 'worker', environment: 'development', level: 'info', destination: s3 });
 
       apiLogger.info('api log');
       pubLogger.info('publisher log');
@@ -109,6 +108,20 @@ describe('Logger', () => {
       expect(parseLine(l1[0]).service).toBe('api');
       expect(parseLine(l2[0]).service).toBe('outbox-publisher');
       expect(parseLine(l3[0]).service).toBe('worker');
+    });
+
+    it('should include environment in output', () => {
+      const { stream, lines } = createCaptureStream();
+      const logger = createLogger({
+        service: 'api',
+        environment: 'production',
+        level: 'info',
+        destination: stream,
+      });
+
+      logger.info('test');
+
+      expect(parseLine(lines[0]).environment).toBe('production');
     });
   });
 
@@ -146,23 +159,15 @@ describe('Logger', () => {
       const expectedSpanId = span.spanContext().spanId;
 
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        {
-          level: 'info',
-          base: { service: 'test', environment: 'test' },
-          formatters: { level(label: string) { return { level: label }; } },
-        },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'test',
+        environment: 'test',
+        level: 'info',
+        destination: stream,
+      });
 
       context.with(ctx, () => {
-        const activeSpan = trace.getSpan(context.active());
-        const spanCtx = activeSpan?.spanContext();
-        pinoInstance.info({
-          traceId: spanCtx?.traceId,
-          spanId: spanCtx?.spanId,
-        }, 'traced message');
+        logger.info('traced message');
 
         span.end();
 
@@ -177,18 +182,15 @@ describe('Logger', () => {
 
     it('should produce valid log without traceId/spanId when no active span exists', () => {
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        {
-          level: 'info',
-          base: { service: 'test', environment: 'test' },
-          formatters: { level(label: string) { return { level: label }; } },
-        },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'test',
+        environment: 'test',
+        level: 'info',
+        destination: stream,
+      });
 
       context.with(ROOT_CONTEXT, () => {
-        pinoInstance.info('no trace');
+        logger.info('no trace');
 
         const parsed = parseLine(lines[0]);
         expect(parsed.msg).toBe('no trace');
@@ -199,17 +201,16 @@ describe('Logger', () => {
     });
 
     it('should never fabricate traceId or spanId', () => {
-      const logger = createLogger({ service: 'test', environment: 'test', level: 'info' });
-
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        { level: 'info', base: { service: 'test', environment: 'test' } },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'test',
+        environment: 'test',
+        level: 'info',
+        destination: stream,
+      });
 
       context.with(ROOT_CONTEXT, () => {
-        pinoInstance.info('no span');
+        logger.info('no span');
         const parsed = parseLine(lines[0]);
         expect(parsed.traceId).toBeUndefined();
         expect(parsed.spanId).toBeUndefined();
@@ -220,28 +221,21 @@ describe('Logger', () => {
   describe('Sensitive field redaction', () => {
     it('should redact configured sensitive paths', () => {
       const { stream, lines } = createCaptureStream();
-      const pino = require('pino');
-      const pinoInstance = pino(
-        {
-          level: 'info',
-          base: { service: 'test', environment: 'test' },
-          redact: {
-            paths: ['password', 'secret', 'token', 'authorization', 'apiKey', 'api_key',
-                     'credential', 'connectionString', 'connection_string', 'cookie', 'x-api-key'],
-            censor: '[REDACTED]',
-          },
-        },
-        stream,
-      );
+      const logger = createLogger({
+        service: 'test',
+        environment: 'test',
+        level: 'info',
+        destination: stream,
+      });
 
-      pinoInstance.info({
+      logger.info('sensitive test', {
         password: 'super-secret-password',
         token: 'Bearer abc123',
         authorization: 'Bearer xyz',
         apiKey: 'key-12345',
         cookie: 'session=abc123',
         safeField: 'visible',
-      }, 'sensitive test');
+      });
 
       const parsed = parseLine(lines[0]);
       expect(parsed.password).toBe('[REDACTED]');
@@ -254,11 +248,42 @@ describe('Logger', () => {
   });
 
   describe('Child logger', () => {
-    it('should create child loggers with bound context', () => {
-      const logger = createLogger({ service: 'test', environment: 'test', level: 'debug' });
+    it('should create child loggers with bound context in output', () => {
+      const { stream, lines } = createCaptureStream();
+      const logger = createLogger({
+        service: 'worker',
+        environment: 'test',
+        level: 'debug',
+        destination: stream,
+      });
       const child = logger.child({ workerId: 'worker-1' });
-      expect(child).toBeDefined();
-      expect(typeof child.info).toBe('function');
+
+      child.info('Task claimed', { taskId: 'task-456' });
+
+      const parsed = parseLine(lines[0]);
+      expect(parsed.workerId).toBe('worker-1');
+      expect(parsed.taskId).toBe('task-456');
+      expect(parsed.service).toBe('worker');
+      expect(parsed.msg).toBe('Task claimed');
+    });
+
+    it('should support nested child loggers', () => {
+      const { stream, lines } = createCaptureStream();
+      const logger = createLogger({
+        service: 'worker',
+        environment: 'test',
+        level: 'debug',
+        destination: stream,
+      });
+      const child = logger.child({ workerId: 'w-1' });
+      const grandchild = child.child({ taskId: 'task-99' });
+
+      grandchild.info('deep log');
+
+      const parsed = parseLine(lines[0]);
+      expect(parsed.workerId).toBe('w-1');
+      expect(parsed.taskId).toBe('task-99');
+      expect(parsed.service).toBe('worker');
     });
   });
 });
@@ -348,6 +373,49 @@ describe('Error serialization', () => {
     const safe = serializeError(error, false);
     expect(safe.stack).toBeUndefined();
   });
+
+  it('should scrub connection strings with embedded credentials from error messages', () => {
+    const error = new Error('Connection failed: postgresql://admin:s3cret@db.host:5432/mydb');
+    const safe = serializeError(error);
+
+    expect(safe.message).not.toContain('s3cret');
+    expect(safe.message).toContain('[REDACTED]');
+    expect(safe.message).toContain('db.host');
+  });
+
+  it('should scrub Bearer tokens from error messages', () => {
+    const error = new Error('Auth failed with Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig');
+    const safe = serializeError(error);
+
+    expect(safe.message).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+    expect(safe.message).toContain('Bearer [REDACTED]');
+  });
+
+  it('should scrub password=value patterns from error messages', () => {
+    const error = new Error('login failed password=supersecret host=db.local');
+    const safe = serializeError(error);
+
+    expect(safe.message).not.toContain('supersecret');
+    expect(safe.message).toContain('[REDACTED]');
+    expect(safe.message).toContain('host=db.local');
+  });
+
+  it('should scrub credentials from error cause messages', () => {
+    const cause = new Error('redis://:MyS3cretPwd@cache.internal:6379');
+    const error = new Error('Connection pool exhausted', { cause });
+    const safe = serializeError(error);
+
+    expect(safe.message).not.toContain('MyS3cretPwd');
+    expect(safe.message).toContain('[REDACTED]');
+    expect(safe.message).toContain('caused by');
+  });
+
+  it('should scrub credentials from string errors', () => {
+    const safe = serializeError('ECONNREFUSED postgresql://app:hunter2@db:5432/prod');
+
+    expect(safe.message).not.toContain('hunter2');
+    expect(safe.message).toContain('[REDACTED]');
+  });
 });
 
 describe('Logger integration with createLogger', () => {
@@ -366,25 +434,9 @@ describe('Logger integration with createLogger', () => {
     expect(() => logger.error('error message', { taskId: 'task-1' })).not.toThrow();
   });
 
-  it('should support structured fields in log context', () => {
-    const logger = createLogger({ service: 'worker', environment: 'test', level: 'debug' });
-    expect(() =>
-      logger.info('Task received', {
-        taskId: 'task-123',
-        workerId: 'worker-A',
-        attempt: 1,
-      }),
-    ).not.toThrow();
-  });
-
-  it('should support child loggers with workerId binding', () => {
-    const logger = createLogger({ service: 'worker', environment: 'test', level: 'debug' });
-    const child = logger.child({ workerId: 'worker-B' });
-    expect(() => child.info('Task claimed', { taskId: 'task-456' })).not.toThrow();
-  });
-
   it('should support representative API logging use case', () => {
-    const logger = createLogger({ service: 'api', environment: 'test', level: 'debug' });
+    const { stream } = createCaptureStream();
+    const logger = createLogger({ service: 'api', environment: 'test', level: 'debug', destination: stream });
     expect(() => {
       logger.info('Task creation requested', { taskName: 'my-task', priority: 'HIGH' });
       logger.info('Task created', { taskId: 'task-789', taskName: 'my-task', priority: 'HIGH' });
@@ -394,7 +446,8 @@ describe('Logger integration with createLogger', () => {
   });
 
   it('should support representative publisher logging use case', () => {
-    const logger = createLogger({ service: 'outbox-publisher', environment: 'test', level: 'debug' });
+    const { stream } = createCaptureStream();
+    const logger = createLogger({ service: 'outbox-publisher', environment: 'test', level: 'debug', destination: stream });
     const pubLogger = logger.child({ publisherId: 'pub-abc' });
     expect(() => {
       pubLogger.info('Outbox event published', { eventId: 'evt-1', taskId: 'task-1' });
@@ -404,7 +457,8 @@ describe('Logger integration with createLogger', () => {
   });
 
   it('should support representative worker logging use case', () => {
-    const logger = createLogger({ service: 'worker', environment: 'test', level: 'debug' });
+    const { stream } = createCaptureStream();
+    const logger = createLogger({ service: 'worker', environment: 'test', level: 'debug', destination: stream });
     const workerLogger = logger.child({ workerId: 'w-abc12' });
     expect(() => {
       workerLogger.info('Task received', { taskId: 'task-1', taskName: 'process-order', attempt: 1 });

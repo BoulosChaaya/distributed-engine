@@ -184,18 +184,9 @@ export class OutboxPublisher {
           traceContext: row.trace_context ?? undefined,
         };
 
+        let published: boolean;
         try {
-          const published = await this.publishEvent(event, client);
-
-          await client.query(
-            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
-            [event.id],
-          );
-
-          if (published) {
-            processed++;
-            this.logger.info('Outbox event published', { eventId: event.id, taskId: event.taskId });
-          }
+          published = await this.publishEvent(event, client);
         } catch (error) {
           this.onBullMQFailure();
 
@@ -222,6 +213,25 @@ export class OutboxPublisher {
           if (this.getCircuitState() === 'OPEN') {
             break;
           }
+          continue;
+        }
+
+        try {
+          await client.query(
+            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
+            [event.id],
+          );
+        } catch (pgError) {
+          this.logger.error('Failed to mark outbox event as delivered after successful queue publication', {
+            eventId: event.id,
+            taskId: event.taskId,
+            reason: String(pgError),
+          });
+        }
+
+        if (published) {
+          processed++;
+          this.logger.info('Outbox event published', { eventId: event.id, taskId: event.taskId });
         }
       }
     } finally {

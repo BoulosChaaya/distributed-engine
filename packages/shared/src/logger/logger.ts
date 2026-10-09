@@ -6,6 +6,7 @@ export interface LoggerOptions {
   service: string;
   environment?: string;
   level?: string;
+  destination?: import('stream').Writable;
 }
 
 export interface Logger {
@@ -76,9 +77,9 @@ function wrapChild(pinoChild: pino.Logger): Logger {
 }
 
 export function createLogger(options: LoggerOptions): Logger {
-  const { service, environment, level } = options;
+  const { service, environment, level, destination } = options;
 
-  const pinoInstance = pino({
+  const pinoOptions: pino.LoggerOptions = {
     level: (level ?? process.env.LOG_LEVEL ?? 'info').toLowerCase(),
     redact: {
       paths: REDACT_PATHS,
@@ -101,7 +102,9 @@ export function createLogger(options: LoggerOptions): Logger {
         return serializeError(err);
       },
     },
-  });
+  };
+
+  const pinoInstance = destination ? pino(pinoOptions, destination) : pino(pinoOptions);
 
   return wrapChild(pinoInstance);
 }

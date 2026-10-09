@@ -15,7 +15,7 @@ discovery.relabel "engine_containers" {
     action        = "keep"
   }
 
-  // Extract service label from container name
+  // Set fallback service label from container name (overridden by JSON extraction)
   rule {
     source_labels = ["__meta_docker_container_name"]
     regex         = "/engine-(.*)"
@@ -30,12 +30,6 @@ discovery.relabel "engine_containers" {
     target_label  = "service"
     replacement   = "worker"
   }
-
-  // Set environment label
-  rule {
-    replacement  = "development"
-    target_label = "environment"
-  }
 }
 
 loki.source.docker "engine_logs" {
@@ -45,17 +39,21 @@ loki.source.docker "engine_logs" {
 }
 
 loki.process "json_logs" {
-  // Parse JSON structured logs to extract the level field as a label
+  // Parse JSON structured logs to extract labels from Pino output
   stage.json {
-    expressions = { level = "level" }
-  }
-
-  stage.label_drop {
-    values = []
+    expressions = {
+      level       = "level",
+      json_service     = "service",
+      json_environment = "environment",
+    }
   }
 
   stage.labels {
-    values = { level = "" }
+    values = {
+      level       = "",
+      service     = "json_service",
+      environment = "json_environment",
+    }
   }
 
   forward_to = [loki.write.local.receiver]

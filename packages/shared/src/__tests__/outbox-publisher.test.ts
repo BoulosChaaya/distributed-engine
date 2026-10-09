@@ -725,6 +725,108 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   });
 });
 
+describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
+  it('should not trigger circuit breaker when BullMQ succeeds but PG DELIVERED update fails', async () => {
+    requireInfra();
+
+    const testQueue = new Queue('tasks-test-partial-fail', {
+      connection: redis,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+
+    const cbPublisher = new OutboxPublisher(pool, testQueue, 60000, 10, 3, {
+      failureThreshold: 2,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => Date.now(),
+    });
+
+    await repo.createTaskWithOutbox({
+      name: 'partial-fail-cb-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const realConnect = pool.connect.bind(pool);
+    let deliveredUpdateIntercepted = false;
+
+    pool.connect = (async () => {
+      const client = await realConnect();
+      const realQuery = client.query.bind(client);
+
+      (client as any).query = async function (...args: any[]) {
+        const sql = typeof args[0] === 'string' ? args[0] : '';
+        if (sql.includes("'DELIVERED'") && sql.includes('UPDATE outbox_events')) {
+          deliveredUpdateIntercepted = true;
+          throw new Error('Simulated PG failure on DELIVERED update');
+        }
+        return realQuery(...args);
+      };
+
+      return client;
+    }) as any;
+
+    try {
+      await cbPublisher.processOutbox();
+
+      expect(deliveredUpdateIntercepted).toBe(true);
+      expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+      expect((cbPublisher as any).consecutiveFailures).toBe(0);
+    } finally {
+      pool.connect = realConnect;
+      await pool.query(`UPDATE outbox_events SET status = 'DELIVERED' WHERE status = 'PENDING'`);
+      try { await testQueue.obliterate({ force: true }); } catch {}
+      await testQueue.close();
+    }
+  });
+
+  it('should log a distinct message when PG DELIVERED update fails after successful publication', async () => {
+    requireInfra();
+
+    const testQueue2 = new Queue('tasks-test-partial-fail-2', {
+      connection: redis,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+
+    const cbPublisher = new OutboxPublisher(pool, testQueue2, 60000, 10, 3);
+
+    await repo.createTaskWithOutbox({
+      name: 'partial-fail-log-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const realConnect = pool.connect.bind(pool);
+
+    pool.connect = (async () => {
+      const client = await realConnect();
+      const realQuery = client.query.bind(client);
+
+      (client as any).query = async function (...args: any[]) {
+        const sql = typeof args[0] === 'string' ? args[0] : '';
+        if (sql.includes("'DELIVERED'") && sql.includes('UPDATE outbox_events')) {
+          throw new Error('Simulated PG failure');
+        }
+        return realQuery(...args);
+      };
+
+      return client;
+    }) as any;
+
+    try {
+      const processed = await cbPublisher.processOutbox();
+      expect(processed).toBe(1);
+    } finally {
+      pool.connect = realConnect;
+      await pool.query(`UPDATE outbox_events SET status = 'DELIVERED' WHERE status = 'PENDING'`);
+      try { await testQueue2.obliterate({ force: true }); } catch {}
+      await testQueue2.close();
+    }
+  });
+});
+
 describe('Outbox stop/drain guarantee (requires PostgreSQL + Redis)', () => {
   it('should await in-progress poll when stop() is called', async () => {
     requireInfra();

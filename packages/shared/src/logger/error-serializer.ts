@@ -21,11 +21,23 @@ function isSensitiveKey(key: string): boolean {
   return SENSITIVE_PATTERNS.some((p) => p.test(key));
 }
 
+function scrubCredentials(text: string): string {
+  let result = text;
+  result = result.replace(/:\/\/([^:@\s]*:)[^@\s]+@/gi, '://$1[REDACTED]@');
+  result = result.replace(/(Bearer|Basic)\s+\S+/gi, '$1 [REDACTED]');
+  result = result.replace(
+    /(password|secret|token|api[_-]?key|credential|authorization|cookie)\s*[=:]\s*\S+/gi,
+    '$1=[REDACTED]',
+  );
+  return result;
+}
+
 function sanitizeMessage(message: string): string {
-  if (message.length > MAX_MESSAGE_LENGTH) {
-    return message.substring(0, MAX_MESSAGE_LENGTH) + '…[truncated]';
+  let result = scrubCredentials(message);
+  if (result.length > MAX_MESSAGE_LENGTH) {
+    return result.substring(0, MAX_MESSAGE_LENGTH) + '…[truncated]';
   }
-  return message;
+  return result;
 }
 
 function sanitizeStack(stack: string | undefined, includeStack: boolean): string | undefined {
@@ -33,9 +45,7 @@ function sanitizeStack(stack: string | undefined, includeStack: boolean): string
   const lines = stack.split('\n');
   const truncated = lines.slice(0, MAX_STACK_LINES);
   let result = truncated.join('\n');
-  for (const pattern of SENSITIVE_PATTERNS) {
-    result = result.replace(pattern, '[REDACTED]');
-  }
+  result = scrubCredentials(result);
   return result;
 }
 
