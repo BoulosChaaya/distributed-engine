@@ -295,3 +295,233 @@ Without an OTLP endpoint configured, tracing still works internally (context pro
 - Trace context propagation depends on BullMQ job data. If BullMQ drops or corrupts job data, the trace chain breaks (worker creates a new root span). The task itself processes correctly regardless.
 - The cancellation race window (between outbox publisher's status check and `BullMQ.add()`) means a cancelled task may get a BullMQ job with a valid trace context. The worker skips it harmlessly.
 - Queue delay measurement (`task.queue_delay_ms` span attribute) uses wall-clock difference between `publishedAt` in job data and `Date.now()` at the worker. Clock skew between machines introduces measurement error, not correctness issues.
+
+## Centralized Structured Logging (Pino / Alloy / Loki / Grafana)
+
+### Observability Stack Overview
+
+The engine has two complementary observability systems:
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │           Distributed Tracing                │
+  API ──┐                │  OpenTelemetry → OTel Collector → Jaeger     │
+  Publisher ─┤           │  (causal journey of a single task)           │
+  Worker ──┘             └──────────────────────────────────────────────┘
+
+                         ┌──────────────────────────────────────────────┐
+                         │           Centralized Logging                │
+  API ──┐                │  Pino → stdout → Grafana Alloy → Loki       │
+  Publisher ─┤ stdout    │  → Grafana (query/investigate)              │
+  Worker ──┘             └──────────────────────────────────────────────┘
+```
+
+**Responsibilities:**
+
+| System | Purpose | Source of truth? |
+|--------|---------|-----------------|
+| PostgreSQL | Durable business state (tasks, outbox) | **Yes** |
+| Redis / BullMQ | Queue coordination | No |
+| OpenTelemetry / Jaeger | Distributed trace of one task's lifecycle | No |
+| Pino / Alloy / Loki / Grafana | Operational logs (debugging, investigation) | No |
+
+**Critical invariant:** Logs are operational telemetry, not business state. Logging infrastructure failure (Alloy, Loki, Grafana) must never affect task correctness, transaction commits, retries, lease renewals, or graceful shutdown. The application writes structured JSON to stdout; Alloy reads container logs and forwards to Loki. Applications have no direct Loki connection.
+
+### Shared Logger (`packages/shared/src/logger/`)
+
+A centralized Pino-based logger providing:
+
+- **Structured JSON output** with consistent common envelope: `time`, `level`, `service`, `environment`, `msg`.
+- **Service identity**: `api`, `outbox-publisher`, `worker` — distinguishes runtime components.
+- **Environment**: `development`, `test`, `production` — from `NODE_ENV`.
+- **OpenTelemetry correlation**: Automatically enriches logs with `traceId` and `spanId` from the active OTel context. If no valid span exists, the log is emitted without trace fields — never fabricated or guessed.
+- **Child loggers**: Bind context like `workerId` once; every subsequent log inherits it.
+- **Centralized redaction**: Sensitive keys (`password`, `secret`, `token`, `authorization`, `apiKey`, `credential`, `connectionString`, `cookie`) are redacted at the Pino serializer level as defense in depth.
+- **Safe error serialization**: Errors are serialized to `{name, message, stack?}` with message truncation, stack line limiting, and sensitive field scrubbing. Arbitrary objects are not blindly dumped.
+
+### Log Schema
+
+Every structured log includes:
+
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "worker",
+  "environment": "development",
+  "msg": "Task durably completed",
+  "taskId": "abc123",
+  "workerId": "w-1234",
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "spanId": "b7ad6b7169203331"
+}
+```
+
+Optional event-specific fields (present only where meaningful):
+
+| Field | Meaning |
+|-------|---------|
+| `taskId` | Business task identity |
+| `taskName` | Task name |
+| `workerId` | Worker instance ID |
+| `publisherId` | Outbox publisher instance ID |
+| `eventId` | Outbox event ID |
+| `attempt` | Execution/retry attempt number |
+| `maxAttempts` | Maximum attempts allowed |
+| `retryable` | Whether further retries are available |
+| `reason` | Human-readable error/skip reason |
+| `errorType` | Error class name |
+| `durationMs` | Operation duration |
+| `traceId` | OTel trace ID (auto-enriched, never fabricated) |
+| `spanId` | OTel span ID (auto-enriched, never fabricated) |
+
+### Correlation Semantics
+
+- **`taskId`** = business task identity across its lifetime
+- **`traceId`** = one distributed causal journey (OTel)
+- **`spanId`** = one operation within that trace (OTel)
+- **`attempt`** = execution/retry attempt number
+
+These are independent concepts. `taskId` is not `traceId`. No fake trace/span correlation is generated.
+
+### Log Levels
+
+| Level | Usage |
+|-------|-------|
+| `debug` | Diagnostic detail (lease renewals, BullMQ job lifecycle events) |
+| `info` | Meaningful operational events (task created, claimed, completed, startup) |
+| `warn` | Unusual conditions (ownership lost, circuit breaker opened, lease renewal failed) |
+| `error` | Failed operations (task execution failed, connection errors, unhandled errors) |
+
+A failed attempt is `error` even if retry policy permits another attempt. Successful periodic lease renewals are `debug` to avoid noise.
+
+### Instrumented Events
+
+**API:**
+- Task creation requested / created / rejected (validation) / failed
+- Redis/PostgreSQL connection events
+- Graceful shutdown lifecycle
+
+**Outbox Publisher:**
+- Event published / failed to publish / exhausted retries
+- Circuit breaker state changes
+- Cancelled task skip
+
+**Worker:**
+- Task received / claimed / execution started / durably completed
+- Lease deferral (another valid lease exists)
+- Ownership lost
+- Execution attempt failed (with attempt/maxAttempts/retryable)
+- Task failure persistence failed
+- Lease renewal (debug level)
+- BullMQ job lifecycle (stalled, failed)
+- Graceful shutdown lifecycle
+
+### Sensitive Data Policy
+
+- Passwords, authorization headers, cookies, API keys, credentials, connection strings, and complete task payloads are never logged.
+- Pino redaction is configured as defense in depth for known sensitive key paths.
+- Error serialization scrubs sensitive patterns from arbitrary thrown objects.
+- Redaction does not make arbitrary payload dumping acceptable — sensitive data is prevented from entering the pipeline, not just masked on exit.
+
+### Audit Boundary
+
+Operational logs may be incomplete and are not authoritative business records. If a future security/business requirement demands guaranteed audit history, that belongs in a durable transactional audit mechanism (PostgreSQL), not in Loki.
+
+### Docker Compose Profiles
+
+Logging infrastructure uses Docker Compose profiles to avoid forcing it on developers who only need core services:
+
+| Profile | Services | Command |
+|---------|----------|---------|
+| (none) | postgres, redis, api, worker | `docker compose up` |
+| `tracing` | + jaeger, otel-collector | `docker compose --profile tracing up` |
+| `logging` | + loki, alloy, grafana | `docker compose --profile logging up` |
+| `observability` | + all tracing + all logging | `docker compose --profile observability up` |
+
+### Infrastructure Components
+
+**Grafana Alloy** (`alloy-config.alloy`):
+- Discovers engine containers via Docker socket
+- Extracts `service` label from container name
+- Parses JSON logs to extract `level` as a Loki label
+- Forwards to Loki at `http://loki:3100`
+
+**Grafana Loki** (`loki-config.yaml`):
+- Single-node development configuration
+- TSDB storage with filesystem backend
+- Persistent volume for local evaluation
+- Structured metadata enabled for queryable fields
+- **Not production-ready** — no replication, no retention policy
+
+**Grafana** (port 3001):
+- Auto-provisioned Loki data source via `grafana/provisioning/datasources/`
+- Anonymous admin access for local development
+
+### Loki Labels and Cardinality
+
+Low-cardinality labels only:
+
+| Label | Values |
+|-------|--------|
+| `service` | `api`, `worker-1` (container name derived) |
+| `environment` | `development`, `production` |
+| `level` | `debug`, `info`, `warn`, `error` |
+
+High-cardinality values (`taskId`, `traceId`, `spanId`, `workerId`, `attempt`) are structured log fields, queryable via LogQL JSON parsing — **never Loki labels**.
+
+### Investigation Workflow
+
+**Find logs for a specific task:**
+```logql
+{service=~"api|worker.*"} | json | taskId="abc123"
+```
+
+**Find error logs from the worker:**
+```logql
+{service=~"worker.*", level="error"} | json
+```
+
+**Correlate logs with traces:**
+```logql
+{service=~"api|worker.*"} | json | traceId="0af7651916cd43dd8448eb211c80319c"
+```
+
+Then open the `traceId` in Jaeger UI (`http://localhost:16686`) to see the distributed trace.
+
+**Find all logs for a task across its lifecycle:**
+```logql
+{service=~"api|worker.*|outbox-publisher"} | json | taskId="abc123"
+```
+
+### Ports
+
+| Service | Port | URL |
+|---------|------|-----|
+| API | 3000 | `http://localhost:3000` |
+| Jaeger UI | 16686 | `http://localhost:16686` |
+| OTel Collector gRPC | 4317 | — |
+| OTel Collector HTTP | 4318 | — |
+| Loki | 3100 | `http://localhost:3100` |
+| Grafana | 3001 | `http://localhost:3001` |
+
+### Failure Semantics
+
+The logging pipeline is designed to fail open:
+
+1. Application writes structured JSON to stdout — this never fails (even if the process's stdout is a broken pipe, the application's business logic is unaffected).
+2. Alloy reads container logs — if Alloy crashes, logs continue to stdout; when Alloy recovers, it resumes from where it left off.
+3. If Loki is unavailable, Alloy buffers and retries — no log data reaches the application.
+4. If Grafana is unavailable, logs are still in Loki and can be queried later.
+
+At no point does a failure in steps 2–4 affect API transactions, outbox publishing, worker processing, task state, retry decisions, lease renewal, or graceful shutdown.
+
+### Development vs. Production
+
+This local configuration is a development/evaluation setup. Production deployment would require:
+
+- Loki cluster with replication and appropriate retention policies
+- Alloy deployed as a DaemonSet/sidecar with resource limits
+- Grafana with proper authentication and RBAC
+- Network policies for log transport security
+- Alerting rules (out of scope for this slice)

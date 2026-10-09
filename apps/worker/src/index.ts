@@ -2,7 +2,6 @@ import { Worker, DelayedError } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
 import {
-  log,
   TaskRepository,
   ClaimNotExpiredError,
   runMigrations,
@@ -11,6 +10,7 @@ import {
   tracing,
   extractTraceContext,
   TRACE_CONTEXT_KEY,
+  createLogger,
 } from '@repo/shared';
 import { randomUUID } from 'crypto';
 
@@ -19,6 +19,12 @@ initTelemetry({
 });
 
 const WORKER_ID = randomUUID().substring(0, 8);
+
+const logger = createLogger({
+  service: 'worker',
+  environment: process.env.NODE_ENV ?? 'development',
+  level: process.env.LOG_LEVEL,
+}).child({ workerId: WORKER_ID });
 
 const pgPool = new Pool({
   host: process.env.POSTGRES_HOST || 'localhost',
@@ -29,7 +35,7 @@ const pgPool = new Pool({
   max: 10,
 });
 
-pgPool.on('error', (err) => log('ERROR', 'PostgreSQL pool error', { error: err.message, workerId: WORKER_ID }));
+pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { reason: err.message }));
 
 const redisClient = new IORedis({
   host: process.env.REDIS_HOST || 'localhost',
@@ -38,8 +44,8 @@ const redisClient = new IORedis({
   maxRetriesPerRequest: null,
 });
 
-redisClient.on('error', (err) => log('ERROR', 'Redis error', { error: err.message, workerId: WORKER_ID }));
-redisClient.on('connect', () => log('INFO', 'Redis connected', { workerId: WORKER_ID }));
+redisClient.on('error', (err) => logger.error('Redis connection error', { reason: err.message }));
+redisClient.on('connect', () => logger.info('Redis connected'));
 
 const taskRepo = new TaskRepository(pgPool);
 const RENEWAL_INTERVAL = Math.floor(taskRepo.claimTtl / 3);
@@ -72,7 +78,7 @@ async function updateWorkerStatus() {
       JSON.stringify(status),
     );
   } catch (error) {
-    log('WARN', 'Failed to update worker status', { error: String(error), workerId: WORKER_ID });
+    logger.warn('Failed to update worker status', { reason: String(error) });
   }
 }
 
@@ -86,28 +92,28 @@ async function processTask(
 ): Promise<Record<string, unknown>> {
     const currentTask = await taskRepo.getTask(taskId);
     if (!currentTask) {
-      log('WARN', 'Task not found in database, skipping', { taskId, workerId: WORKER_ID });
+      logger.warn('Task not found in database, skipping', { taskId });
       parentSpan.setAttribute('task.skipped', true);
       parentSpan.setAttribute('task.skip_reason', 'not_found');
       return { status: 'SKIPPED', taskId, reason: 'not_found' };
     }
 
     if (currentTask.status === 'CANCELLED') {
-      log('INFO', 'Task was cancelled, skipping', { taskId, workerId: WORKER_ID });
+      logger.info('Task was cancelled, skipping', { taskId });
       parentSpan.setAttribute('task.skipped', true);
       parentSpan.setAttribute('task.skip_reason', 'cancelled');
       return { status: 'SKIPPED', taskId, reason: 'cancelled' };
     }
 
     if (currentTask.status === 'COMPLETED') {
-      log('INFO', 'Task already completed, skipping', { taskId, workerId: WORKER_ID });
+      logger.info('Task already completed, skipping', { taskId });
       parentSpan.setAttribute('task.skipped', true);
       parentSpan.setAttribute('task.skip_reason', 'already_completed');
       return { status: 'SKIPPED', taskId, reason: 'already_completed' };
     }
 
     if (currentTask.status === 'FAILED') {
-      log('INFO', 'Task already failed, skipping', { taskId, workerId: WORKER_ID });
+      logger.info('Task already failed, skipping', { taskId });
       parentSpan.setAttribute('task.skipped', true);
       parentSpan.setAttribute('task.skip_reason', 'already_failed');
       return { status: 'SKIPPED', taskId, reason: 'already_failed' };
@@ -129,11 +135,13 @@ async function processTask(
         taskVersion = updated.version;
         claimToken = updated.claimToken;
         currentRetries = updated.retries;
+        logger.info('Task claimed', { taskId });
         tracing.setSpanOk(claimSpan);
       } catch (error) {
         tracing.recordError(claimSpan, error);
-        log('WARN', 'Failed to transition task to PROCESSING', {
-          taskId, error: String(error), workerId: WORKER_ID,
+        logger.warn('Failed to transition task to PROCESSING', {
+          taskId,
+          reason: String(error),
         });
         return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
       } finally {
@@ -146,24 +154,25 @@ async function processTask(
         taskVersion = reclaimed.version;
         claimToken = reclaimed.claimToken;
         currentRetries = reclaimed.retries;
-        log('INFO', 'Reclaimed stalled task', { taskId, workerId: WORKER_ID });
+        logger.info('Reclaimed stalled task', { taskId });
         tracing.setSpanOk(reclaimSpan);
       } catch (error) {
         if (error instanceof ClaimNotExpiredError) {
           reclaimSpan.setAttribute('task.claim.deferred', true);
           tracing.endSpan(reclaimSpan);
           const deferUntil = error.expiresAt.getTime() + LEASE_DEFERRAL_MARGIN_MS;
-          log('INFO', 'Lease not expired, deferring job via moveToDelayed', {
-            taskId, expiresAt: error.expiresAt.toISOString(),
+          logger.info('Lease not expired, deferring job', {
+            taskId,
+            expiresAt: error.expiresAt.toISOString(),
             deferUntil: new Date(deferUntil).toISOString(),
-            workerId: WORKER_ID,
           });
           await job.moveToDelayed(deferUntil, job.token);
           throw new DelayedError();
         }
         tracing.recordError(reclaimSpan, error);
-        log('WARN', 'Failed to reclaim stalled task', {
-          taskId, error: String(error), workerId: WORKER_ID,
+        logger.warn('Failed to reclaim stalled task', {
+          taskId,
+          reason: String(error),
         });
         return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
       } finally {
@@ -176,9 +185,9 @@ async function processTask(
         if (!claimToken) return;
         try {
           await taskRepo.renewClaim(taskId, claimToken);
-          log('INFO', 'Lease renewed', { taskId, workerId: WORKER_ID });
+          logger.debug('Lease renewed', { taskId });
         } catch (renewError) {
-          log('WARN', 'Lease renewal failed, ownership lost', { taskId, error: String(renewError), workerId: WORKER_ID });
+          logger.warn('Lease renewal failed, ownership lost', { taskId, reason: String(renewError) });
           ownershipLost = true;
           if (renewalTimer) {
             clearInterval(renewalTimer);
@@ -187,24 +196,26 @@ async function processTask(
         }
       }, RENEWAL_INTERVAL);
 
+      logger.info('Task execution started', { taskId });
+
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       if (ownershipLost) {
-        log('INFO', 'Ownership lost during execution, aborting', { taskId, workerId: WORKER_ID });
+        logger.warn('Ownership lost during execution, aborting', { taskId });
         parentSpan.setAttribute('task.ownership_lost', true);
         return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
 
       const updatedTask = await taskRepo.getTask(taskId);
       if (!updatedTask || updatedTask.status === 'CANCELLED' || updatedTask.status === 'FAILED') {
-        log('INFO', 'Task no longer processable, skipping completion', {
-          taskId, status: updatedTask?.status, workerId: WORKER_ID,
+        logger.info('Task no longer processable, skipping completion', {
+          taskId, status: updatedTask?.status,
         });
         return { status: 'SKIPPED', taskId, reason: updatedTask?.status?.toLowerCase() || 'not_found' };
       }
 
       if (ownershipLost) {
-        log('INFO', 'Ownership lost before completion, aborting', { taskId, workerId: WORKER_ID });
+        logger.warn('Ownership lost before completion, aborting', { taskId });
         parentSpan.setAttribute('task.ownership_lost', true);
         return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
@@ -225,7 +236,7 @@ async function processTask(
       }
 
       workerMetrics.jobsCompleted++;
-      log('INFO', 'Task completed', { taskId, workerId: WORKER_ID });
+      logger.info('Task durably completed', { taskId });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
     } catch (error) {
       workerMetrics.jobsFailed++;
@@ -252,21 +263,22 @@ async function processTask(
         failSpan.setAttribute('task.status', isFinalAttempt ? 'FAILED' : 'QUEUED');
       } catch (transitionError) {
         tracing.recordError(failSpan, transitionError);
-        log('ERROR', 'Failed to transition task after failure', {
-          taskId, targetStatus: isFinalAttempt ? 'FAILED' : 'QUEUED',
-          error: String(transitionError), workerId: WORKER_ID,
+        logger.error('Task failure persistence failed', {
+          taskId,
+          targetStatus: isFinalAttempt ? 'FAILED' : 'QUEUED',
+          reason: String(transitionError),
         });
       } finally {
         tracing.endSpan(failSpan);
       }
 
-      log('ERROR', 'Task failed', {
+      logger.error('Task execution failed', {
         taskId,
-        error: errorMessage,
+        reason: errorMessage,
         attempt: job.attemptsMade + 1,
         maxAttempts,
-        isFinalAttempt,
-        workerId: WORKER_ID,
+        retryable: !isFinalAttempt,
+        errorType: error instanceof Error ? error.name : 'UnknownError',
       });
 
       throw error;
@@ -282,7 +294,7 @@ const worker = new Worker(
   'tasks',
   async (job) => {
     const { taskId, taskName } = job.data;
-    log('INFO', 'Processing task', { taskId, name: taskName, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID });
+    logger.info('Task received', { taskId, taskName, jobId: job.id, attempt: job.attemptsMade + 1 });
     workerMetrics.jobsProcessed++;
 
     const traceCarrier = job.data[TRACE_CONTEXT_KEY] as Record<string, string> | undefined;
@@ -326,29 +338,24 @@ const worker = new Worker(
   },
 );
 
-worker.on('active', (job) => {
-  log('INFO', 'Job active', { jobId: job.id, workerId: WORKER_ID });
-});
-
 worker.on('completed', (job) => {
-  log('INFO', 'Job completed', { jobId: job.id, workerId: WORKER_ID });
+  logger.debug('BullMQ job completed', { jobId: job.id });
 });
 
 worker.on('failed', (job, err) => {
-  log('WARN', 'Job failed', {
+  logger.warn('BullMQ job failed', {
     jobId: job?.id,
-    error: err.message,
+    reason: err.message,
     attempt: job?.attemptsMade,
-    workerId: WORKER_ID,
   });
 });
 
 worker.on('stalled', (jobId) => {
-  log('WARN', 'Job stalled', { jobId, workerId: WORKER_ID });
+  logger.warn('BullMQ job stalled', { jobId });
 });
 
 worker.on('error', (err) => {
-  log('ERROR', 'Worker error', { error: err.message, workerId: WORKER_ID });
+  logger.error('Worker error', { reason: err.message, errorType: err.name });
 });
 
 const heartbeatInterval = setInterval(() => {
@@ -359,51 +366,51 @@ let isShuttingDown = false;
 
 async function gracefulShutdown(signal: string) {
   if (isShuttingDown) {
-    log('WARN', 'Shutdown already in progress', { signal, workerId: WORKER_ID });
+    logger.warn('Shutdown already in progress, forcing exit', { signal });
     process.exit(1);
   }
 
   isShuttingDown = true;
-  log('INFO', 'Graceful shutdown initiated', { signal, workerId: WORKER_ID });
+  logger.info('Graceful shutdown initiated', { signal });
 
   clearInterval(heartbeatInterval);
 
   try {
     await redisClient.del(`worker:${WORKER_ID}`);
   } catch (error) {
-    log('WARN', 'Failed to remove worker status', { error: String(error), workerId: WORKER_ID });
+    logger.warn('Failed to remove worker status', { reason: String(error) });
   }
 
   const shutdownTimeout = setTimeout(() => {
-    log('WARN', 'Shutdown timeout exceeded, forcing exit', { workerId: WORKER_ID });
+    logger.warn('Shutdown timeout exceeded, forcing exit');
     process.exit(1);
   }, 30000);
 
   try {
     await worker.close();
-    log('INFO', 'Worker closed', { workerId: WORKER_ID });
+    logger.info('Worker closed');
   } catch (error) {
-    log('WARN', 'Error closing worker', { error: String(error), workerId: WORKER_ID });
+    logger.warn('Error closing worker', { reason: String(error) });
   }
 
   try {
     redisClient.disconnect();
-    log('INFO', 'Redis disconnected', { workerId: WORKER_ID });
+    logger.info('Redis disconnected');
   } catch (error) {
-    log('WARN', 'Error disconnecting Redis', { error: String(error), workerId: WORKER_ID });
+    logger.warn('Error disconnecting Redis', { reason: String(error) });
   }
 
   try {
     await pgPool.end();
-    log('INFO', 'PostgreSQL pool closed', { workerId: WORKER_ID });
+    logger.info('PostgreSQL pool closed');
   } catch (error) {
-    log('WARN', 'Error closing PostgreSQL pool', { error: String(error), workerId: WORKER_ID });
+    logger.warn('Error closing PostgreSQL pool', { reason: String(error) });
   }
 
   await shutdownTelemetry();
 
   clearTimeout(shutdownTimeout);
-  log('INFO', 'Graceful shutdown complete', { workerId: WORKER_ID });
+  logger.info('Graceful shutdown complete');
   process.exit(0);
 }
 
@@ -412,14 +419,11 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 (async () => {
   await runMigrations(pgPool);
-  log('INFO', 'Database migrations complete', { workerId: WORKER_ID });
+  logger.info('Database migrations complete');
 
   await updateWorkerStatus();
 
-  log('INFO', 'Worker initialized and listening for tasks', {
-    workerId: WORKER_ID,
-    concurrency: process.env.QUEUE_CONCURRENCY || '5',
-    redisHost: process.env.REDIS_HOST || 'localhost',
-    pgHost: process.env.POSTGRES_HOST || 'localhost',
+  logger.info('Worker initialized and listening for tasks', {
+    concurrency: parseInt(process.env.QUEUE_CONCURRENCY || '5'),
   });
 })();

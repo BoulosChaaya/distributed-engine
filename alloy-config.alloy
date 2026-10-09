@@ -1,0 +1,68 @@
+// Grafana Alloy configuration for collecting Docker container logs
+// and forwarding them to Loki.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "engine_containers" {
+  targets = discovery.docker.containers.targets
+
+  // Keep only containers on the engine-network
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(engine-api|engine-worker-.*)"
+    action        = "keep"
+  }
+
+  // Extract service label from container name
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/engine-(.*)"
+    target_label  = "service"
+    replacement   = "$1"
+  }
+
+  // Normalize worker container names to "worker"
+  rule {
+    source_labels = ["service"]
+    regex         = "worker-.*"
+    target_label  = "service"
+    replacement   = "worker"
+  }
+
+  // Set environment label
+  rule {
+    replacement  = "development"
+    target_label = "environment"
+  }
+}
+
+loki.source.docker "engine_logs" {
+  host    = "unix:///var/run/docker.sock"
+  targets = discovery.relabel.engine_containers.output
+  forward_to = [loki.process.json_logs.receiver]
+}
+
+loki.process "json_logs" {
+  // Parse JSON structured logs to extract the level field as a label
+  stage.json {
+    expressions = { level = "level" }
+  }
+
+  stage.label_drop {
+    values = []
+  }
+
+  stage.labels {
+    values = { level = "" }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

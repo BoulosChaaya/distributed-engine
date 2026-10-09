@@ -3,7 +3,6 @@ import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { Pool } from 'pg';
 import {
-  log,
   AppError,
   TaskRepository,
   OutboxPublisher,
@@ -11,6 +10,7 @@ import {
   InvalidTransitionError,
   initTelemetry,
   tracing,
+  createLogger,
 } from '@repo/shared';
 import { Task, ApiResponse } from '@repo/shared';
 import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
@@ -20,6 +20,12 @@ import { config } from './config';
 
 initTelemetry({
   serviceName: 'distributed-engine-api',
+});
+
+const logger = createLogger({
+  service: 'api',
+  environment: config.nodeEnv,
+  level: config.logging.level,
 });
 
 const app = express();
@@ -33,7 +39,7 @@ const pgPool = new Pool({
   max: config.postgres.maxConnections,
 });
 
-pgPool.on('error', (err) => log('ERROR', 'PostgreSQL pool error', { error: err.message }));
+pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { errorType: err.name, reason: err.message }));
 
 const redisClient = new IORedis({
   host: config.redis.host,
@@ -43,8 +49,8 @@ const redisClient = new IORedis({
   lazyConnect: true,
 });
 
-redisClient.on('error', (err) => log('ERROR', 'Redis error', { error: err.message }));
-redisClient.on('connect', () => log('INFO', 'Redis connected'));
+redisClient.on('error', (err) => logger.error('Redis connection error', { errorType: err.name, reason: err.message }));
+redisClient.on('connect', () => logger.info('Redis connected'));
 
 const taskQueue = new Queue('tasks', {
   connection: redisClient,
@@ -70,7 +76,7 @@ const shutdownManager = new ShutdownManager(config.gracefulShutdown.timeoutMs);
 
 app.use(express.json({ limit: '10mb' }));
 
-app.use((req: Request, res: Response, next: NextFunction) => {
+app.use((_req: Request, res: Response, next: NextFunction) => {
   try {
     shutdownManager.incrementRequests();
   } catch {
@@ -82,7 +88,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   }
 
   metrics.recordRequest();
-  log('INFO', `${req.method} ${req.path}`, { ip: req.ip });
 
   res.on('finish', () => {
     shutdownManager.decrementRequests();
@@ -166,7 +171,7 @@ app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => 
         }
       }
     } catch {
-      log('WARN', 'Unable to retrieve worker status from Redis');
+      logger.warn('Unable to retrieve worker status from Redis');
     }
 
     res.json({
@@ -185,6 +190,8 @@ app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => 
 app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = SubmitTaskSchema.parse(req.body);
+
+    logger.info('Task creation requested', { taskName: validatedData.name, priority: validatedData.priority });
 
     const span = tracing.startTaskCreation('pending', validatedData.name, validatedData.priority);
 
@@ -208,7 +215,7 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
       tracing.endSpan(span);
     }
 
-    log('INFO', 'Task created', { taskId: task.id, name: task.name });
+    logger.info('Task created', { taskId: task.id, taskName: task.name, priority: task.priority });
 
     res.status(201).json({
       success: true,
@@ -217,8 +224,13 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
     } as ApiResponse<Task>);
   } catch (error) {
     if (error instanceof Error && error.name === 'ZodError') {
+      logger.warn('Task creation rejected: validation error', { errorType: 'ValidationError' });
       next(new ValidationError(error as any));
     } else {
+      logger.error('Task creation failed', {
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+        reason: error instanceof Error ? error.message : String(error),
+      });
       next(error);
     }
   }
@@ -267,10 +279,10 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunct
         await job.remove();
       }
     } catch (queueError) {
-      log('WARN', 'Failed to remove cancelled job from queue', { taskId: req.params.id });
+      logger.warn('Failed to remove cancelled job from queue', { taskId: req.params.id });
     }
 
-    log('INFO', 'Task cancelled', { taskId: task.id });
+    logger.info('Task cancelled', { taskId: task.id });
     res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
   } catch (error) {
     if (error instanceof InvalidTransitionError) {
@@ -303,7 +315,10 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     });
   }
 
-  log('ERROR', 'Unhandled error', { error: err });
+  logger.error('Unhandled error', {
+    errorType: err instanceof Error ? err.name : 'UnknownError',
+    reason: err instanceof Error ? err.message : String(err),
+  });
   res.status(500).json({
     success: false,
     error: 'Internal server error',
@@ -314,19 +329,21 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 async function start() {
   try {
     await redisClient.connect();
-    log('INFO', 'Redis connection established');
+    logger.info('Redis connection established');
   } catch (error) {
-    log('WARN', 'Redis not available at startup, outbox will retry', { error: String(error) });
+    logger.warn('Redis not available at startup, outbox will retry', {
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 
   await runMigrations(pgPool);
-  log('INFO', 'Database migrations complete');
+  logger.info('Database migrations complete');
 
   outboxPublisher.start();
-  log('INFO', 'Outbox publisher started');
+  logger.info('Outbox publisher started');
 
   const server = app.listen(config.port, () => {
-    log('INFO', `API server running on port ${config.port}`);
+    logger.info('API server started', { port: config.port });
   });
 
   shutdownManager.registerHandlers(server, {
@@ -338,8 +355,11 @@ async function start() {
 }
 
 start().catch((error) => {
-  log('ERROR', 'Failed to start API server', { error: String(error) });
+  logger.error('Failed to start API server', {
+    errorType: error instanceof Error ? error.name : 'UnknownError',
+    reason: error instanceof Error ? error.message : String(error),
+  });
   process.exit(1);
 });
 
-export { app, pgPool, taskRepo, outboxPublisher, shutdownManager };
+export { app, pgPool, taskRepo, outboxPublisher, shutdownManager, logger };
