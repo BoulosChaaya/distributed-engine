@@ -639,9 +639,9 @@ describe('Execution overlap policy (requires PostgreSQL)', () => {
   });
 });
 
-// --- Worker-side overlap enforcement (execution lease) ---
+// --- Execution lease primitives (PostgreSQL-backed) ---
 
-describe('Worker overlap enforcement via execution lease (requires PostgreSQL)', () => {
+describe('Execution lease primitives (requires PostgreSQL)', () => {
   it('1. ALLOW_OVERLAP: two occurrences may execute concurrently without lease', async () => {
     const schedule = await scheduleRepo.createSchedule({
       name: 'allow-overlap',
