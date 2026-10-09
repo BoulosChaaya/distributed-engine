@@ -149,32 +149,6 @@ export class SchedulerService {
           return;
         }
 
-        if (lockedSchedule.overlapPolicy === 'FORBID_OVERLAP') {
-          const hasActive = await this.scheduleRepo.hasActiveOccurrence(lockedSchedule.id);
-          if (hasActive) {
-            const leaseResult = await this.scheduleRepo.acquireExecutionLease(
-              lockedSchedule.id,
-              this.config.executionLeaseDurationMs,
-            );
-            if (!leaseResult.acquired) {
-              this.logger.info('Occurrence deferred due to overlap policy', {
-                scheduleId: lockedSchedule.id,
-                scheduleName: lockedSchedule.name,
-              });
-              return;
-            }
-            await this.scheduleRepo.releaseExecutionLease(
-              lockedSchedule.id,
-              leaseResult.leaseToken!,
-            );
-            this.logger.info('Occurrence deferred due to overlap policy', {
-              scheduleId: lockedSchedule.id,
-              scheduleName: lockedSchedule.name,
-            });
-            return;
-          }
-        }
-
         generated = await this.applyMisfirePolicy(lockedSchedule, dbNow, client);
       },
     );

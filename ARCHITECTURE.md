@@ -187,8 +187,16 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 - `CATCH_UP_ALL`: Generate all missed occurrences in bounded batches (configurable `catchUpBatchSize`). Remaining missed occurrences are processed on subsequent poll cycles. This provides backpressure without silently discarding missed work.
 
 **Overlap policies**:
-- `ALLOW_OVERLAP`: New occurrences generate regardless of in-flight ones
-- `FORBID_OVERLAP`: If any occurrence for this schedule is in QUEUED or PROCESSING state, defer the next occurrence until the active one completes
+- `ALLOW_OVERLAP`: New occurrences generate regardless of in-flight ones. No schedule-level execution lease is used.
+- `FORBID_OVERLAP`: The scheduler generates all occurrences regardless of overlap policy (including CATCH_UP_ALL missed occurrences). Overlap is enforced at the **worker execution boundary** via a schedule-level execution lease:
+  1. Before claiming a task (QUEUED→PROCESSING), the worker checks if the task belongs to a FORBID_OVERLAP schedule.
+  2. If so, the worker attempts to acquire the schedule's execution lease (`acquireExecutionLease`). The lease is a PostgreSQL-backed token with an expiration time, consistent with the existing task claim/token model.
+  3. If the lease is held by another occurrence, the worker defers the job using `moveToDelayed(expiresAt + margin)` + `DelayedError`. This does **not** consume a BullMQ retry attempt — the job re-activates after the lease holder finishes.
+  4. If the lease is acquired, the worker proceeds with the QUEUED→PROCESSING transition. The lease is renewed alongside the task claim in the same renewal timer.
+  5. On completion or failure, the worker releases the schedule execution lease. On crash, the lease expires and another occurrence can acquire it.
+  6. If lease renewal fails (token mismatch from crash recovery), the worker sets `ownershipLost` and stops treating itself as the valid execution owner.
+
+  This design ensures CATCH_UP_ALL + FORBID_OVERLAP generates all missed occurrences durably while executing them serially. No occurrences are silently discarded by the scheduler.
 
 **Multi-scheduler concurrency**: `fetchDueSchedules` selects due schedules, and `processScheduleWithLock` acquires a `FOR UPDATE SKIP LOCKED` row lock per schedule. Multiple scheduler instances can run concurrently — each processes different schedules without contention.
 

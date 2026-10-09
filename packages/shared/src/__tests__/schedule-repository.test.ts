@@ -639,6 +639,315 @@ describe('Execution overlap policy (requires PostgreSQL)', () => {
   });
 });
 
+// --- Worker-side overlap enforcement (execution lease) ---
+
+describe('Worker overlap enforcement via execution lease (requires PostgreSQL)', () => {
+  it('1. ALLOW_OVERLAP: two occurrences may execute concurrently without lease', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'allow-overlap',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date('2025-01-01T00:00:00Z'),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'ALLOW_OVERLAP',
+    });
+
+    const occ1 = await scheduleRepo.generateOccurrence(
+      schedule.id,
+      new Date('2025-01-01T00:00:00Z'),
+      new Date('2025-01-01T01:00:00Z'),
+    );
+    const occ2 = await scheduleRepo.generateOccurrence(
+      schedule.id,
+      new Date('2025-01-01T01:00:00Z'),
+      new Date('2025-01-01T02:00:00Z'),
+    );
+
+    const t1 = await taskRepo.transitionStatus(occ1.task.id, 1, 'PROCESSING', { startedAt: new Date() });
+    const t2 = await taskRepo.transitionStatus(occ2.task.id, 1, 'PROCESSING', { startedAt: new Date() });
+    expect(t1.status).toBe('PROCESSING');
+    expect(t2.status).toBe('PROCESSING');
+  });
+
+  it('2. FORBID_OVERLAP: occurrence A holds lease, B cannot acquire while valid', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'forbid-overlap-block',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date('2025-01-01T00:00:00Z'),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+    expect(leaseA.leaseToken).toBeDefined();
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(false);
+    expect(leaseB.expiresAt).toBeDefined();
+    expect(leaseB.expiresAt!.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('3. Deferral: failed acquisition returns expiresAt for worker deferral timing', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'deferral-timing',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+
+    const deferResult = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(deferResult.acquired).toBe(false);
+    expect(deferResult.expiresAt).toBeInstanceOf(Date);
+    const margin = 2000;
+    const deferUntil = deferResult.expiresAt!.getTime() + margin;
+    expect(deferUntil).toBeGreaterThan(Date.now());
+  });
+
+  it('4. Release: after A completes and releases, B can acquire', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'release-then-acquire',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+
+    await scheduleRepo.releaseExecutionLease(schedule.id, leaseA.leaseToken!);
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(true);
+    expect(leaseB.leaseToken).toBeDefined();
+    expect(leaseB.leaseToken).not.toBe(leaseA.leaseToken);
+  });
+
+  it('5. Worker failure/lease expiry: A crashes, lease expires, B can acquire', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'crash-recovery',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+
+    await pool.query(
+      `UPDATE recurring_schedules SET execution_lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [schedule.id],
+    );
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(true);
+    expect(leaseB.leaseToken).not.toBe(leaseA.leaseToken);
+  });
+
+  it('6. Renewal: active owner can renew, wrong token cannot', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'renewal-test',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const lease = await scheduleRepo.acquireExecutionLease(schedule.id, 5000);
+    expect(lease.acquired).toBe(true);
+
+    await expect(
+      scheduleRepo.renewExecutionLease(schedule.id, lease.leaseToken!, 60000),
+    ).resolves.toBeUndefined();
+
+    const afterRenew = await scheduleRepo.getSchedule(schedule.id);
+    expect(afterRenew!.executionLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 50000);
+
+    await expect(
+      scheduleRepo.renewExecutionLease(schedule.id, 'wrong-token', 60000),
+    ).rejects.toThrow('token mismatch');
+  });
+
+  it('7. Stale release: old token cannot release lease held by new owner', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'stale-release',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+
+    await pool.query(
+      `UPDATE recurring_schedules SET execution_lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [schedule.id],
+    );
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(true);
+
+    await expect(
+      scheduleRepo.releaseExecutionLease(schedule.id, leaseA.leaseToken!),
+    ).rejects.toThrow('token mismatch');
+
+    const current = await scheduleRepo.getSchedule(schedule.id);
+    expect(current!.executionLeaseToken).toBe(leaseB.leaseToken);
+  });
+
+  it('8. Ownership loss: renewal failure signals loss to worker', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'ownership-loss',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+
+    await pool.query(
+      `UPDATE recurring_schedules SET execution_lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+      [schedule.id],
+    );
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(true);
+
+    let ownershipLost = false;
+    try {
+      await scheduleRepo.renewExecutionLease(schedule.id, leaseA.leaseToken!, 60000);
+    } catch {
+      ownershipLost = true;
+    }
+    expect(ownershipLost).toBe(true);
+  });
+
+  it('9. CATCH_UP_ALL + FORBID_OVERLAP: all occurrences durable, execution serialized', async () => {
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'catchup-forbid',
+      taskName: 'task',
+      taskPriority: 'NORMAL',
+      taskPayload: {},
+      taskMaxRetries: 3,
+      cronExpression: '0 * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date('2025-01-01T00:00:00Z'),
+      misfirePolicy: 'CATCH_UP_ALL',
+      overlapPolicy: 'FORBID_OVERLAP',
+    });
+
+    const occ1 = await scheduleRepo.generateOccurrence(
+      schedule.id,
+      new Date('2025-01-01T00:00:00Z'),
+      new Date('2025-01-01T01:00:00Z'),
+    );
+    const occ2 = await scheduleRepo.generateOccurrence(
+      schedule.id,
+      new Date('2025-01-01T01:00:00Z'),
+      new Date('2025-01-01T02:00:00Z'),
+    );
+    const occ3 = await scheduleRepo.generateOccurrence(
+      schedule.id,
+      new Date('2025-01-01T02:00:00Z'),
+      new Date('2025-01-01T03:00:00Z'),
+    );
+
+    const tasks = await pool.query(
+      `SELECT * FROM tasks WHERE schedule_id = $1 ORDER BY scheduled_for ASC`,
+      [schedule.id],
+    );
+    expect(tasks.rows.length).toBe(3);
+    expect(tasks.rows[0].status).toBe('QUEUED');
+    expect(tasks.rows[1].status).toBe('QUEUED');
+    expect(tasks.rows[2].status).toBe('QUEUED');
+
+    const leaseA = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseA.acquired).toBe(true);
+
+    const leaseB = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseB.acquired).toBe(false);
+
+    await scheduleRepo.releaseExecutionLease(schedule.id, leaseA.leaseToken!);
+
+    const leaseC = await scheduleRepo.acquireExecutionLease(schedule.id, 60000);
+    expect(leaseC.acquired).toBe(true);
+  });
+
+  it('10. Existing worker/task lease behavior unaffected by schedule lease', async () => {
+    const { task } = await taskRepo.createTaskWithOutbox({
+      name: 'immediate-task',
+      priority: 'NORMAL',
+      payload: { test: true },
+      maxRetries: 3,
+    });
+
+    expect(task.status).toBe('QUEUED');
+    expect(task.scheduleId).toBeUndefined();
+
+    const processing = await taskRepo.transitionStatus(task.id, 1, 'PROCESSING', {
+      startedAt: new Date(),
+      claimedBy: 'worker-1',
+    });
+    expect(processing.status).toBe('PROCESSING');
+    expect(processing.claimToken).toBeDefined();
+
+    await taskRepo.renewClaim(task.id, processing.claimToken!);
+
+    const completed = await taskRepo.transitionStatus(task.id, processing.version, 'COMPLETED', {
+      completedAt: new Date(),
+      claimToken: processing.claimToken,
+    });
+    expect(completed.status).toBe('COMPLETED');
+  });
+});
+
 // --- Immediate tasks still work ---
 
 describe('Existing immediate task behavior preserved (requires PostgreSQL)', () => {

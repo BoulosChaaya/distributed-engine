@@ -161,39 +161,12 @@ describe('SchedulerService', () => {
   });
 
   describe('FORBID_OVERLAP policy', () => {
-    it('should defer occurrence when active occurrence exists', async () => {
+    it('should generate occurrences regardless of active occurrences (overlap enforced at worker)', async () => {
       const schedule = makeSchedule({
         overlapPolicy: 'FORBID_OVERLAP',
         nextRunAt: pastDate,
       });
       (service as any).scheduleRepo.fetchDueSchedules = jest.fn().mockResolvedValue([schedule]);
-      (service as any).scheduleRepo.hasActiveOccurrence = jest.fn().mockResolvedValue(true);
-      (service as any).scheduleRepo.acquireExecutionLease = jest.fn().mockResolvedValue({
-        acquired: false,
-      });
-      (service as any).scheduleRepo.processScheduleWithLock = jest.fn().mockImplementation(
-        async (_id: string, cb: Function) => {
-          await cb(schedule, {
-            query: jest.fn().mockResolvedValue({ rows: [{ db_now: now.toISOString() }] }),
-          });
-        },
-      );
-
-      const count = await service.processRecurringSchedules();
-      expect(count).toBe(0);
-      expect(logger.info).toHaveBeenCalledWith(
-        'Occurrence deferred due to overlap policy',
-        expect.objectContaining({ scheduleId: 'sched-1' }),
-      );
-    });
-
-    it('should proceed when no active occurrence exists with FORBID_OVERLAP', async () => {
-      const schedule = makeSchedule({
-        overlapPolicy: 'FORBID_OVERLAP',
-        nextRunAt: pastDate,
-      });
-      (service as any).scheduleRepo.fetchDueSchedules = jest.fn().mockResolvedValue([schedule]);
-      (service as any).scheduleRepo.hasActiveOccurrence = jest.fn().mockResolvedValue(false);
       (service as any).scheduleRepo.generateOccurrence = jest.fn().mockResolvedValue({
         task: { id: 't1' },
         outboxEvent: { id: 'o1' },
@@ -207,7 +180,33 @@ describe('SchedulerService', () => {
       );
 
       const count = await service.processRecurringSchedules();
-      expect(count).toBeGreaterThanOrEqual(0);
+      expect(count).toBe(1);
+      expect((service as any).scheduleRepo.generateOccurrence).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not check hasActiveOccurrence or acquireExecutionLease in scheduler', async () => {
+      const schedule = makeSchedule({
+        overlapPolicy: 'FORBID_OVERLAP',
+        nextRunAt: pastDate,
+      });
+      (service as any).scheduleRepo.fetchDueSchedules = jest.fn().mockResolvedValue([schedule]);
+      (service as any).scheduleRepo.hasActiveOccurrence = jest.fn();
+      (service as any).scheduleRepo.acquireExecutionLease = jest.fn();
+      (service as any).scheduleRepo.generateOccurrence = jest.fn().mockResolvedValue({
+        task: { id: 't1' },
+        outboxEvent: { id: 'o1' },
+      });
+      (service as any).scheduleRepo.processScheduleWithLock = jest.fn().mockImplementation(
+        async (_id: string, cb: Function) => {
+          await cb(schedule, {
+            query: jest.fn().mockResolvedValue({ rows: [{ db_now: now.toISOString() }] }),
+          });
+        },
+      );
+
+      await service.processRecurringSchedules();
+      expect((service as any).scheduleRepo.hasActiveOccurrence).not.toHaveBeenCalled();
+      expect((service as any).scheduleRepo.acquireExecutionLease).not.toHaveBeenCalled();
     });
   });
 

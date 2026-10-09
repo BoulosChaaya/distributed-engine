@@ -500,7 +500,7 @@ export class ScheduleRepository {
   async acquireExecutionLease(
     scheduleId: string,
     leaseDurationMs: number = 300000,
-  ): Promise<{ acquired: boolean; leaseToken?: string }> {
+  ): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date }> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -522,7 +522,7 @@ export class ScheduleRepository {
         schedule.executionLeaseExpiresAt > dbNow
       ) {
         await client.query('ROLLBACK');
-        return { acquired: false };
+        return { acquired: false, expiresAt: schedule.executionLeaseExpiresAt };
       }
 
       const leaseToken = generateId();
@@ -549,6 +549,21 @@ export class ScheduleRepository {
     );
     if (result.rowCount === 0) {
       throw new Error(`Cannot release execution lease: token mismatch or schedule ${scheduleId} not found`);
+    }
+  }
+
+  async renewExecutionLease(
+    scheduleId: string,
+    leaseToken: string,
+    leaseDurationMs: number = 300000,
+  ): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE recurring_schedules SET execution_lease_expires_at = NOW() + $3 * INTERVAL '1 millisecond', updated_at = NOW()
+       WHERE id = $1 AND execution_lease_token = $2`,
+      [scheduleId, leaseToken, leaseDurationMs],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Cannot renew execution lease: token mismatch or schedule ${scheduleId} not found`);
     }
   }
 

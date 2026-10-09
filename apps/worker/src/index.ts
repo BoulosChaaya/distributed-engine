@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import {
   TaskRepository,
   ClaimNotExpiredError,
+  ScheduleRepository,
   runMigrations,
   initTelemetry,
   shutdownTelemetry,
@@ -48,8 +49,10 @@ redisClient.on('error', (err) => logger.error('Redis connection error', { reason
 redisClient.on('connect', () => logger.info('Redis connected'));
 
 const taskRepo = new TaskRepository(pgPool);
+const scheduleRepo = new ScheduleRepository(pgPool);
 const RENEWAL_INTERVAL = Math.floor(taskRepo.claimTtl / 3);
 const LEASE_DEFERRAL_MARGIN_MS = 2000;
+const SCHEDULE_LEASE_DURATION_MS = parseInt(process.env.SCHEDULE_LEASE_DURATION_MS || '300000');
 
 const workerMetrics = {
   id: WORKER_ID,
@@ -124,6 +127,32 @@ async function processTask(
     let currentRetries = currentTask.retries;
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
     let ownershipLost = false;
+    let scheduleLeaseToken: string | undefined;
+
+    if (currentTask.scheduleId) {
+      const schedule = await scheduleRepo.getSchedule(currentTask.scheduleId);
+      if (schedule?.overlapPolicy === 'FORBID_OVERLAP') {
+        const leaseResult = await scheduleRepo.acquireExecutionLease(
+          schedule.id,
+          SCHEDULE_LEASE_DURATION_MS,
+        );
+        if (!leaseResult.acquired) {
+          const deferUntil = (leaseResult.expiresAt?.getTime() ?? Date.now()) + LEASE_DEFERRAL_MARGIN_MS;
+          logger.info('Schedule execution lease held, deferring', {
+            taskId,
+            scheduleId: schedule.id,
+            deferUntil: new Date(deferUntil).toISOString(),
+          });
+          await job.moveToDelayed(deferUntil, job.token);
+          throw new DelayedError();
+        }
+        scheduleLeaseToken = leaseResult.leaseToken;
+        logger.info('Schedule execution lease acquired', {
+          taskId,
+          scheduleId: schedule.id,
+        });
+      }
+    }
 
     if (currentTask.status === 'QUEUED') {
       const claimSpan = tracing.startTaskClaim(taskId, WORKER_ID, 'initial');
@@ -143,6 +172,9 @@ async function processTask(
           taskId,
           reason: String(error),
         });
+        if (scheduleLeaseToken && currentTask.scheduleId) {
+          await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+        }
         return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
       } finally {
         tracing.endSpan(claimSpan);
@@ -160,6 +192,10 @@ async function processTask(
         if (error instanceof ClaimNotExpiredError) {
           reclaimSpan.setAttribute('task.claim.deferred', true);
           tracing.endSpan(reclaimSpan);
+          if (scheduleLeaseToken && currentTask.scheduleId) {
+            await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+            scheduleLeaseToken = undefined;
+          }
           const deferUntil = error.expiresAt.getTime() + LEASE_DEFERRAL_MARGIN_MS;
           logger.info('Lease not expired, deferring job', {
             taskId,
@@ -174,6 +210,9 @@ async function processTask(
           taskId,
           reason: String(error),
         });
+        if (scheduleLeaseToken && currentTask.scheduleId) {
+          await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+        }
         return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
       } finally {
         tracing.endSpan(reclaimSpan);
@@ -185,6 +224,9 @@ async function processTask(
         if (!claimToken) return;
         try {
           await taskRepo.renewClaim(taskId, claimToken);
+          if (scheduleLeaseToken && currentTask.scheduleId) {
+            await scheduleRepo.renewExecutionLease(currentTask.scheduleId, scheduleLeaseToken, SCHEDULE_LEASE_DURATION_MS);
+          }
           logger.debug('Lease renewed', { taskId });
         } catch (renewError) {
           logger.warn('Lease renewal failed, ownership lost', { taskId, reason: String(renewError) });
@@ -235,6 +277,10 @@ async function processTask(
         tracing.endSpan(completeSpan);
       }
 
+      if (scheduleLeaseToken && currentTask.scheduleId) {
+        await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken);
+        scheduleLeaseToken = undefined;
+      }
       workerMetrics.jobsCompleted++;
       logger.info('Task durably completed', { taskId });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
@@ -286,6 +332,9 @@ async function processTask(
       if (renewalTimer) {
         clearInterval(renewalTimer);
         renewalTimer = undefined;
+      }
+      if (scheduleLeaseToken && currentTask.scheduleId) {
+        await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
       }
     }
 }
