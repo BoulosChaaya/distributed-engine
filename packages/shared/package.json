@@ -34,6 +34,7 @@
     "@opentelemetry/semantic-conventions": "1.43.0",
     "bullmq": "^5.81.5",
     "ioredis": "^5.11.1",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "pino": "^10.4.0"
   }
 }

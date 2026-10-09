@@ -1,8 +1,14 @@
 import { Queue } from 'bullmq';
 import { Pool } from 'pg';
-import { log, OutboxPublisher, shutdownTelemetry } from '@repo/shared';
+import { OutboxPublisher, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
 import IORedis from 'ioredis';
 import type { Server } from 'http';
+
+const logger: Logger = createLogger({
+  service: 'api',
+  environment: process.env.NODE_ENV ?? 'development',
+  level: process.env.LOG_LEVEL,
+});
 
 export class ShutdownManager {
   private isShuttingDown = false;
@@ -52,15 +58,15 @@ export class ShutdownManager {
     signal: string,
   ) {
     if (this.isShuttingDown) {
-      log('WARN', 'Shutdown already in progress, forcing exit', { signal });
+      logger.warn('Shutdown already in progress, forcing exit', { signal });
       process.exit(1);
     }
 
     this.isShuttingDown = true;
-    log('INFO', 'Graceful shutdown initiated', { signal, activeRequests: this.activeRequests });
+    logger.info('Graceful shutdown initiated', { signal, activeRequests: this.activeRequests });
 
     server.close(() => {
-      log('INFO', 'HTTP server closed');
+      logger.info('HTTP server closed');
     });
 
     await deps.outboxPublisher.stop();
@@ -72,7 +78,7 @@ export class ShutdownManager {
         if (this.activeRequests === 0 || Date.now() - drainStart > this.shutdownTimeout) {
           clearInterval(check);
           if (this.activeRequests > 0) {
-            log('WARN', 'Shutdown timeout, forcing close', { activeRequests: this.activeRequests });
+            logger.warn('Shutdown timeout, forcing close', { activeRequests: this.activeRequests });
             timedOut = true;
           }
           resolve();
@@ -90,29 +96,29 @@ export class ShutdownManager {
     redisClient: IORedis;
     pgPool: Pool;
   }) {
-    log('INFO', 'Closing connections');
+    logger.info('Closing connections');
 
     try {
       await deps.taskQueue.close();
-      log('INFO', 'Task queue closed');
+      logger.info('Task queue closed');
     } catch (error) {
-      log('WARN', 'Error closing task queue', { error: String(error) });
+      logger.warn('Error closing task queue', { reason: String(error) });
     }
 
     try {
       deps.redisClient.disconnect();
-      log('INFO', 'Redis connection closed');
+      logger.info('Redis connection closed');
     } catch (error) {
-      log('WARN', 'Error closing Redis', { error: String(error) });
+      logger.warn('Error closing Redis', { reason: String(error) });
     }
 
     try {
       await deps.pgPool.end();
-      log('INFO', 'PostgreSQL pool closed');
+      logger.info('PostgreSQL pool closed');
     } catch (error) {
-      log('WARN', 'Error closing PostgreSQL pool', { error: String(error) });
+      logger.warn('Error closing PostgreSQL pool', { reason: String(error) });
     }
 
-    log('INFO', 'Graceful shutdown complete');
+    logger.info('Graceful shutdown complete');
   }
 }

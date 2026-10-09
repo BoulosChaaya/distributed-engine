@@ -1,9 +1,10 @@
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
-import { log, generateId } from '../utils';
+import { generateId } from '../utils';
 import { OutboxEvent } from '../types';
 import { tracing } from '../telemetry/spans';
 import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
+import { createLogger, type Logger } from '../logger/index';
 
 const PRIORITY_MAP: Record<string, number> = {
   LOW: 10,
@@ -19,6 +20,7 @@ export class OutboxPublisher {
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private activePoll: Promise<number> | null = null;
   private readonly publisherId: string;
+  private readonly logger: Logger;
 
   private circuitState: CircuitState = 'CLOSED';
   private consecutiveFailures = 0;
@@ -40,6 +42,7 @@ export class OutboxPublisher {
       successThreshold?: number;
       resetTimeoutMs?: number;
       nowFn?: () => number;
+      logger?: Logger;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -47,12 +50,18 @@ export class OutboxPublisher {
     this.circuitSuccessThreshold = circuitOptions?.successThreshold ?? 2;
     this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
+    const baseLogger = circuitOptions?.logger ?? createLogger({
+      service: 'outbox-publisher',
+      environment: process.env.NODE_ENV ?? 'development',
+      level: process.env.LOG_LEVEL,
+    });
+    this.logger = baseLogger.child({ publisherId: this.publisherId });
   }
 
   start(): void {
     if (this.running) return;
     this.running = true;
-    log('INFO', 'Outbox publisher started', { publisherId: this.publisherId });
+    this.logger.info('Outbox publisher started');
     this.schedulePoll();
   }
 
@@ -70,7 +79,7 @@ export class OutboxPublisher {
       }
       this.activePoll = null;
     }
-    log('INFO', 'Outbox publisher stopped', { publisherId: this.publisherId });
+    this.logger.info('Outbox publisher stopped');
   }
 
   getCircuitState(): CircuitState {
@@ -91,7 +100,7 @@ export class OutboxPublisher {
       if (this.consecutiveSuccesses >= this.circuitSuccessThreshold) {
         this.circuitState = 'CLOSED';
         this.consecutiveSuccesses = 0;
-        log('INFO', 'Outbox circuit breaker CLOSED', { publisherId: this.publisherId });
+        this.logger.info('Circuit breaker closed');
       }
     }
   }
@@ -102,13 +111,13 @@ export class OutboxPublisher {
       this.circuitState = 'OPEN';
       this.consecutiveFailures = 0;
       this.consecutiveSuccesses = 0;
-      log('WARN', 'Outbox circuit breaker OPEN (half-open failure)', { publisherId: this.publisherId });
+      this.logger.warn('Circuit breaker opened (half-open probe failed)');
       return;
     }
     this.consecutiveFailures++;
     if (this.consecutiveFailures >= this.circuitFailureThreshold) {
       this.circuitState = 'OPEN';
-      log('WARN', 'Outbox circuit breaker OPEN', { publisherId: this.publisherId, failures: this.consecutiveFailures });
+      this.logger.warn('Circuit breaker opened', { consecutiveFailures: this.consecutiveFailures });
     }
   }
 
@@ -120,7 +129,7 @@ export class OutboxPublisher {
       try {
         await poll;
       } catch (error) {
-        log('ERROR', 'Outbox poll error', { error: String(error), publisherId: this.publisherId });
+        this.logger.error('Outbox poll error', { reason: String(error) });
       }
       this.activePoll = null;
       this.schedulePoll();
@@ -177,25 +186,16 @@ export class OutboxPublisher {
           traceContext: row.trace_context ?? undefined,
         };
 
+        let published: boolean;
         try {
-          const published = await this.publishEvent(event, client);
-
-          await client.query(
-            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
-            [event.id],
-          );
-
-          if (published) {
-            processed++;
-            log('INFO', 'Outbox event published', { eventId: event.id, taskId: event.taskId });
-          }
+          published = await this.publishEvent(event, client);
         } catch (error) {
           this.onBullMQFailure();
 
-          log('ERROR', 'Failed to publish outbox event', {
+          this.logger.error('Failed to publish outbox event to queue', {
             eventId: event.id,
             taskId: event.taskId,
-            error: String(error),
+            reason: String(error),
             attempt: event.attempts,
           });
 
@@ -204,7 +204,7 @@ export class OutboxPublisher {
               `UPDATE outbox_events SET status = 'FAILED', processed_at = NOW() WHERE id = $1`,
               [event.id],
             );
-            log('WARN', 'Outbox event exhausted retries', { eventId: event.id, taskId: event.taskId });
+            this.logger.warn('Outbox event exhausted retries', { eventId: event.id, taskId: event.taskId });
           } else {
             await client.query(
               `UPDATE outbox_events SET claimed_by = NULL, claimed_at = NULL WHERE id = $1`,
@@ -215,6 +215,25 @@ export class OutboxPublisher {
           if (this.getCircuitState() === 'OPEN') {
             break;
           }
+          continue;
+        }
+
+        try {
+          await client.query(
+            `UPDATE outbox_events SET status = 'DELIVERED', processed_at = NOW() WHERE id = $1`,
+            [event.id],
+          );
+        } catch (pgError) {
+          this.logger.error('Failed to mark outbox event as delivered after successful queue publication', {
+            eventId: event.id,
+            taskId: event.taskId,
+            reason: String(pgError),
+          });
+        }
+
+        if (published) {
+          processed++;
+          this.logger.info('Outbox event published', { eventId: event.id, taskId: event.taskId });
         }
       }
     } finally {
@@ -234,18 +253,13 @@ export class OutboxPublisher {
         const priority = PRIORITY_MAP[(payload.priority as string) || 'NORMAL'] ?? 5;
         const maxRetries = (payload.maxRetries as number) ?? 3;
 
-        // Best-effort cancellation check. This is NOT atomic with the BullMQ.add()
-        // below — a cancellation can commit between this read and the add. If that
-        // happens, BullMQ will hold a job for a cancelled task. The worker guards
-        // (status check before processing) ensure such a job is skipped harmlessly.
-        // PostgreSQL is the authoritative source of task state.
         const taskCheck = await client.query(
           `SELECT status FROM tasks WHERE id = $1`,
           [event.taskId],
         );
 
         if (taskCheck.rows.length > 0 && taskCheck.rows[0].status === 'CANCELLED') {
-          log('INFO', 'Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
+          this.logger.info('Skipped publishing cancelled task', { eventId: event.id, taskId: event.taskId });
           span.setAttribute('outbox.skipped', true);
           span.setAttribute('outbox.skip_reason', 'cancelled');
           tracing.setSpanOk(span);

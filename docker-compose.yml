@@ -49,7 +49,7 @@ services:
       POSTGRES_DB: distributed_engine
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      LOG_LEVEL: INFO
+      LOG_LEVEL: info
       QUEUE_CONCURRENCY: 5
     depends_on:
       redis:
@@ -77,18 +77,21 @@ services:
       POSTGRES_DB: distributed_engine
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      LOG_LEVEL: INFO
+      LOG_LEVEL: info
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
 
+  # --- Tracing infrastructure (profile: tracing) ---
+
   jaeger:
     image: jaegertracing/jaeger:2.1.0
     container_name: engine-jaeger
     profiles:
       - tracing
+      - observability
     ports:
       - "16686:16686" # Jaeger UI
     environment:
@@ -99,6 +102,7 @@ services:
     container_name: engine-otel-collector
     profiles:
       - tracing
+      - observability
     ports:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
@@ -107,9 +111,65 @@ services:
     depends_on:
       - jaeger
 
+  # --- Logging infrastructure (profile: logging) ---
+
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: engine-loki
+    profiles:
+      - logging
+      - observability
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --output-document=- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  alloy:
+    image: grafana/alloy:v1.2.1
+    container_name: engine-alloy
+    profiles:
+      - logging
+      - observability
+    volumes:
+      - ./alloy-config.alloy:/etc/alloy/config.alloy
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: run /etc/alloy/config.alloy
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: engine-grafana
+    profiles:
+      - logging
+      - observability
+    ports:
+      - "3001:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_healthy
+
 volumes:
   redis_data:
   postgres_data:
+  loki_data:
+  grafana_data:
 
 networks:
   default:
