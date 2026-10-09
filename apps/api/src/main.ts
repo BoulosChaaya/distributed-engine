@@ -6,14 +6,25 @@ import {
   AppError,
   TaskRepository,
   OutboxPublisher,
+  ScheduleRepository,
+  ScheduleStaleVersionError,
+  SchedulerService,
   runMigrations,
   InvalidTransitionError,
   initTelemetry,
   tracing,
   createLogger,
+  getNextOccurrence,
 } from '@repo/shared';
-import { Task, ApiResponse } from '@repo/shared';
-import { SubmitTaskSchema, PaginationSchema, ValidationError } from './validation';
+import { Task, RecurringSchedule, ApiResponse } from '@repo/shared';
+import {
+  SubmitTaskSchema,
+  PaginationSchema,
+  CreateScheduleSchema,
+  UpdateScheduleSchema,
+  SetScheduleStatusSchema,
+  ValidationError,
+} from './validation';
 import { MetricsCollector } from './metrics';
 import { ShutdownManager } from './shutdown';
 import { config } from './config';
@@ -61,6 +72,7 @@ const taskQueue = new Queue('tasks', {
 });
 
 const taskRepo = new TaskRepository(pgPool);
+const scheduleRepo = new ScheduleRepository(pgPool);
 
 const outboxPublisher = new OutboxPublisher(
   pgPool,
@@ -69,6 +81,14 @@ const outboxPublisher = new OutboxPublisher(
   config.outbox.batchSize,
   config.outbox.maxAttempts,
 );
+
+const schedulerService = new SchedulerService(pgPool, logger.child({ component: 'scheduler' }), {
+  pollIntervalMs: config.scheduler?.pollIntervalMs ?? 5000,
+  scheduledTaskBatchSize: config.scheduler?.batchSize ?? 50,
+  recurringBatchSize: config.scheduler?.batchSize ?? 20,
+  catchUpBatchSize: config.scheduler?.catchUpBatchSize ?? 10,
+  executionLeaseDurationMs: config.scheduler?.executionLeaseDurationMs ?? 300000,
+});
 
 const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher);
 
@@ -191,6 +211,36 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = SubmitTaskSchema.parse(req.body);
 
+    if (validatedData.scheduledFor) {
+      const scheduledFor = new Date(validatedData.scheduledFor);
+      logger.info('Scheduled task creation requested', {
+        taskName: validatedData.name,
+        priority: validatedData.priority,
+        scheduledFor: scheduledFor.toISOString(),
+      });
+
+      const { task } = await scheduleRepo.createScheduledTask({
+        name: validatedData.name,
+        priority: validatedData.priority,
+        payload: validatedData.payload,
+        maxRetries: validatedData.maxRetries,
+        scheduledFor,
+      });
+
+      logger.info('Scheduled task created', {
+        taskId: task.id,
+        taskName: task.name,
+        scheduledFor: scheduledFor.toISOString(),
+      });
+
+      res.status(201).json({
+        success: true,
+        data: task,
+        timestamp: new Date(),
+      } as ApiResponse<Task>);
+      return;
+    }
+
     logger.info('Task creation requested', { taskName: validatedData.name, priority: validatedData.priority });
 
     const span = tracing.startTaskCreation('pending', validatedData.name, validatedData.priority);
@@ -295,6 +345,159 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunct
   }
 });
 
+// --- Recurring Schedules ---
+
+app.post('/schedules', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validatedData = CreateScheduleSchema.parse(req.body);
+
+    const nextRunAt = getNextOccurrence(
+      validatedData.cronExpression,
+      validatedData.timezone,
+      new Date(),
+    );
+
+    const schedule = await scheduleRepo.createSchedule({
+      name: validatedData.name,
+      taskName: validatedData.taskName,
+      taskPriority: validatedData.taskPriority,
+      taskPayload: validatedData.taskPayload,
+      taskMaxRetries: validatedData.taskMaxRetries,
+      cronExpression: validatedData.cronExpression,
+      timezone: validatedData.timezone,
+      nextRunAt,
+      misfirePolicy: validatedData.misfirePolicy,
+      overlapPolicy: validatedData.overlapPolicy,
+    });
+
+    logger.info('Schedule created', {
+      scheduleId: schedule.id,
+      scheduleName: schedule.name,
+      cronExpression: schedule.cronExpression,
+      timezone: schedule.timezone,
+      nextRunAt: schedule.nextRunAt.toISOString(),
+    });
+
+    res.status(201).json({
+      success: true,
+      data: schedule,
+      timestamp: new Date(),
+    } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else {
+      logger.error('Schedule creation failed', {
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      next(error);
+    }
+  }
+});
+
+app.get('/schedules', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { page, pageSize } = PaginationSchema.parse(req.query);
+    const { items, total } = await scheduleRepo.listSchedules(page, pageSize);
+
+    res.json({
+      success: true,
+      data: {
+        items,
+        total,
+        page,
+        pageSize,
+        hasMore: (page - 1) * pageSize + items.length < total,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/schedules/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const schedule = await scheduleRepo.getSchedule(req.params.id);
+    if (!schedule) {
+      throw new AppError(404, `Schedule ${req.params.id} not found`);
+    }
+    res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/schedules/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validatedData = UpdateScheduleSchema.parse(req.body);
+    const { version, ...updateFields } = validatedData;
+
+    let nextRunAt: Date | undefined;
+    if (updateFields.cronExpression || updateFields.timezone) {
+      const schedule = await scheduleRepo.getSchedule(req.params.id);
+      if (!schedule) {
+        throw new AppError(404, `Schedule ${req.params.id} not found`);
+      }
+      nextRunAt = getNextOccurrence(
+        updateFields.cronExpression ?? schedule.cronExpression,
+        updateFields.timezone ?? schedule.timezone,
+        new Date(),
+      );
+    }
+
+    const schedule = await scheduleRepo.updateSchedule(req.params.id, version, {
+      ...updateFields,
+      nextRunAt,
+    });
+
+    logger.info('Schedule updated', { scheduleId: schedule.id, scheduleName: schedule.name });
+
+    res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else if (error instanceof ScheduleStaleVersionError) {
+      next(new AppError(409, error.message));
+    } else if (error instanceof Error && error.message.includes('not found')) {
+      next(new AppError(404, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
+app.put('/schedules/:id/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validatedData = SetScheduleStatusSchema.parse(req.body);
+
+    const schedule = await scheduleRepo.setScheduleStatus(
+      req.params.id,
+      validatedData.version,
+      validatedData.status,
+    );
+
+    logger.info('Schedule status changed', {
+      scheduleId: schedule.id,
+      scheduleName: schedule.name,
+      newStatus: schedule.status,
+    });
+
+    res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else if (error instanceof ScheduleStaleVersionError) {
+      next(new AppError(409, error.message));
+    } else if (error instanceof Error && error.message.includes('not found')) {
+      next(new AppError(404, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   metrics.recordError();
 
@@ -342,6 +545,9 @@ async function start() {
   outboxPublisher.start();
   logger.info('Outbox publisher started');
 
+  schedulerService.start();
+  logger.info('Scheduler service started');
+
   const server = app.listen(config.port, () => {
     logger.info('API server started', { port: config.port });
   });
@@ -351,6 +557,7 @@ async function start() {
     redisClient,
     pgPool,
     outboxPublisher,
+    schedulerService,
   });
 }
 
@@ -362,4 +569,4 @@ start().catch((error) => {
   process.exit(1);
 });
 
-export { app, pgPool, taskRepo, outboxPublisher, shutdownManager, logger };
+export { app, pgPool, taskRepo, scheduleRepo, schedulerService, outboxPublisher, shutdownManager, logger };

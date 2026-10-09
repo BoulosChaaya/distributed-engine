@@ -1,4 +1,4 @@
-export type TaskStatus = 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type TaskStatus = 'SCHEDULED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type TaskPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface Task {
@@ -15,10 +15,36 @@ export interface Task {
   updatedAt: Date;
   startedAt?: Date;
   completedAt?: Date;
+  scheduledFor?: Date;
+  scheduleId?: string;
   version: number;
   claimedBy?: string;
   claimToken?: string;
   claimExpiresAt?: Date;
+}
+
+export type ScheduleStatus = 'ACTIVE' | 'PAUSED' | 'DISABLED';
+export type MisfirePolicy = 'CATCH_UP_ALL' | 'SKIP_MISSED' | 'RUN_ONCE';
+export type OverlapPolicy = 'ALLOW_OVERLAP' | 'FORBID_OVERLAP';
+
+export interface RecurringSchedule {
+  id: string;
+  name: string;
+  taskName: string;
+  taskPriority: TaskPriority;
+  taskPayload: Record<string, unknown>;
+  taskMaxRetries: number;
+  cronExpression: string;
+  timezone: string;
+  nextRunAt: Date;
+  status: ScheduleStatus;
+  misfirePolicy: MisfirePolicy;
+  overlapPolicy: OverlapPolicy;
+  executionLeaseToken?: string;
+  executionLeaseExpiresAt?: Date;
+  version: number;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export type WorkerStatus = 'ONLINE' | 'OFFLINE' | 'BUSY';
@@ -55,10 +81,12 @@ export interface PaginatedResponse<T> {
   hasMore: boolean;
 }
 
+export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED';
+
 export interface OutboxEvent {
   id: string;
   taskId: string;
-  eventType: 'TASK_CREATED';
+  eventType: OutboxEventType;
   payload: Record<string, unknown>;
   status: 'PENDING' | 'DELIVERED' | 'FAILED';
   attempts: number;

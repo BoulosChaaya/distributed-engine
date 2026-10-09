@@ -92,6 +92,60 @@ const MIGRATIONS = [
       ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS trace_context JSONB;
     `,
   },
+  {
+    version: 8,
+    name: 'add_scheduled_status_and_task_scheduling_columns',
+    sql: `
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS valid_status;
+      ALTER TABLE tasks ADD CONSTRAINT valid_status CHECK (status IN ('SCHEDULED','QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED'));
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS schedule_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_for ON tasks(scheduled_for) WHERE status = 'SCHEDULED';
+    `,
+  },
+  {
+    version: 9,
+    name: 'create_recurring_schedules_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS recurring_schedules (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        task_name TEXT NOT NULL,
+        task_priority TEXT NOT NULL DEFAULT 'NORMAL',
+        task_payload JSONB NOT NULL DEFAULT '{}',
+        task_max_retries INTEGER NOT NULL DEFAULT 3,
+        cron_expression TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'UTC',
+        next_run_at TIMESTAMPTZ NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        misfire_policy TEXT NOT NULL DEFAULT 'SKIP_MISSED',
+        overlap_policy TEXT NOT NULL DEFAULT 'ALLOW_OVERLAP',
+        execution_lease_token TEXT,
+        execution_lease_expires_at TIMESTAMPTZ,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT valid_schedule_status CHECK (status IN ('ACTIVE','PAUSED','DISABLED')),
+        CONSTRAINT valid_misfire_policy CHECK (misfire_policy IN ('CATCH_UP_ALL','SKIP_MISSED','RUN_ONCE')),
+        CONSTRAINT valid_overlap_policy CHECK (overlap_policy IN ('ALLOW_OVERLAP','FORBID_OVERLAP')),
+        CONSTRAINT valid_task_priority_sched CHECK (task_priority IN ('LOW','NORMAL','HIGH','CRITICAL'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recurring_schedules_status_next_run
+        ON recurring_schedules(next_run_at) WHERE status = 'ACTIVE';
+
+      ALTER TABLE tasks ADD CONSTRAINT fk_tasks_schedule_id
+        FOREIGN KEY (schedule_id) REFERENCES recurring_schedules(id);
+    `,
+  },
+  {
+    version: 10,
+    name: 'add_occurrence_uniqueness_constraint',
+    sql: `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_occurrence
+        ON tasks(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL;
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

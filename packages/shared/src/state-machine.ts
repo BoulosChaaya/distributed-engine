@@ -1,6 +1,7 @@
 import { TaskStatus } from './types';
 
 const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+  SCHEDULED: ['QUEUED', 'CANCELLED'],
   QUEUED: ['PROCESSING', 'CANCELLED'],
   PROCESSING: ['COMPLETED', 'FAILED', 'QUEUED', 'CANCELLED'],
   COMPLETED: [],

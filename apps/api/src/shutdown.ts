@@ -1,6 +1,6 @@
 import { Queue } from 'bullmq';
 import { Pool } from 'pg';
-import { OutboxPublisher, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
+import { OutboxPublisher, SchedulerService, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
 import IORedis from 'ioredis';
 import type { Server } from 'http';
 
@@ -29,6 +29,7 @@ export class ShutdownManager {
       redisClient: IORedis;
       pgPool: Pool;
       outboxPublisher: OutboxPublisher;
+      schedulerService?: SchedulerService;
     },
   ) {
     const shutdown = (signal: string) => this.shutdown(server, deps, signal);
@@ -54,6 +55,7 @@ export class ShutdownManager {
       redisClient: IORedis;
       pgPool: Pool;
       outboxPublisher: OutboxPublisher;
+      schedulerService?: SchedulerService;
     },
     signal: string,
   ) {
@@ -68,6 +70,11 @@ export class ShutdownManager {
     server.close(() => {
       logger.info('HTTP server closed');
     });
+
+    if (deps.schedulerService) {
+      await deps.schedulerService.stop();
+      logger.info('Scheduler stopped');
+    }
 
     await deps.outboxPublisher.stop();
 

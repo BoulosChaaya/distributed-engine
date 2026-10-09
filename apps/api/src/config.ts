@@ -27,6 +27,13 @@ export interface AppConfig {
     maxAttempts: number;
   };
 
+  scheduler?: {
+    pollIntervalMs: number;
+    batchSize: number;
+    catchUpBatchSize: number;
+    executionLeaseDurationMs: number;
+  };
+
   logging: {
     level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
   };
@@ -68,6 +75,13 @@ export function loadConfig(): AppConfig {
       pollIntervalMs: parseNumber(process.env.OUTBOX_POLL_INTERVAL_MS, 1000),
       batchSize: parseNumber(process.env.OUTBOX_BATCH_SIZE, 10),
       maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
+    },
+
+    scheduler: {
+      pollIntervalMs: parseNumber(process.env.SCHEDULER_POLL_INTERVAL_MS, 5000),
+      batchSize: parseNumber(process.env.SCHEDULER_BATCH_SIZE, 50),
+      catchUpBatchSize: parseNumber(process.env.SCHEDULER_CATCH_UP_BATCH_SIZE, 10),
+      executionLeaseDurationMs: parseNumber(process.env.SCHEDULER_EXECUTION_LEASE_DURATION_MS, 300000),
     },
 
     logging: {

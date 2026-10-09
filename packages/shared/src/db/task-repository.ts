@@ -32,6 +32,8 @@ function rowToTask(row: Record<string, unknown>): Task {
     updatedAt: new Date(row.updated_at as string),
     startedAt: row.started_at ? new Date(row.started_at as string) : undefined,
     completedAt: row.completed_at ? new Date(row.completed_at as string) : undefined,
+    scheduledFor: row.scheduled_for ? new Date(row.scheduled_for as string) : undefined,
+    scheduleId: (row.schedule_id as string) || undefined,
     claimedBy: (row.claimed_by as string) || undefined,
     claimToken: (row.claim_token as string) || undefined,
     claimExpiresAt: row.claim_expires_at ? new Date(row.claim_expires_at as string) : undefined,

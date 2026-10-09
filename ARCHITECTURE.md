@@ -130,16 +130,84 @@ PROCESSING status alone is **not** sufficient evidence that a job stalled. A tas
 
 BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be reclaimed. After that limit, BullMQ marks the job as failed and the worker transitions the task to FAILED.
 
+### 6. One-Time Scheduled Tasks
+
+```
+Client                API                 PostgreSQL
+  │                    │                      │
+  │── POST /tasks ────▶│                      │
+  │   {scheduledFor}   │── BEGIN ─────────────▶│
+  │                    │── INSERT task ───────▶│  status='SCHEDULED', scheduled_for=<ts>
+  │                    │── COMMIT ───────────▶│
+  │◀── 201 Created ───│                      │
+  │                    │                      │
+  │       Scheduler Service (polls PG)        │
+  │                    │                      │
+  │          ┌─────────┴──────────┐           │
+  │          │ releaseDueScheduled│           │
+  │          │ Tasks(batchSize)   │           │
+  │          └─────────┬──────────┘           │
+  │                    │── FOR UPDATE ───────▶│
+  │                    │   SKIP LOCKED        │
+  │                    │── UPDATE status ────▶│  SCHEDULED → QUEUED
+  │                    │── INSERT outbox ────▶│  SCHEDULED_TASK_RELEASED
+  │                    │── COMMIT ──────────▶│
+```
+
+A one-time scheduled task starts in SCHEDULED state and remains there until its `scheduled_for` timestamp passes. The scheduler service polls for due SCHEDULED tasks and atomically transitions them to QUEUED with an outbox event, which the outbox publisher then delivers to BullMQ as with any other task.
+
+### 7. Recurring Schedules
+
+```
+Client                API                 PostgreSQL              Scheduler
+  │                    │                      │                      │
+  │── POST /schedules─▶│                      │                      │
+  │   {cron, tz, ...}  │── INSERT schedule ──▶│  status='ACTIVE',    │
+  │                    │                      │  next_run_at=<ts>    │
+  │◀── 201 Created ───│                      │                      │
+  │                    │                      │                      │
+  │                    │                      │◀── poll due ────────│
+  │                    │                      │   schedules          │
+  │                    │                      │                      │
+  │                    │                      │── FOR UPDATE ───────▶│
+  │                    │                      │   SKIP LOCKED        │
+  │                    │                      │                      │
+  │                    │                      │── INSERT task ──────▶│  QUEUED + outbox
+  │                    │                      │── advance next_run──▶│
+  │                    │                      │── COMMIT ──────────▶│
+```
+
+A recurring schedule is a separate durable object in `recurring_schedules` that generates task occurrences on its cron cadence. Each occurrence is a standard task (status QUEUED) with `schedule_id` and `scheduled_for` columns linking it back to the schedule. The scheduler never directly publishes to BullMQ — it creates PENDING outbox events that the outbox publisher handles.
+
+**Occurrence uniqueness**: A partial unique index `(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL` prevents duplicate task generation for the same schedule at the same time, even across concurrent schedulers.
+
+**Misfire policies** (when the scheduler was down and missed occurrences):
+- `SKIP_MISSED`: Generate one occurrence for the missed `nextRunAt`, advance to next future time
+- `RUN_ONCE`: Same as SKIP_MISSED — generate one catch-up occurrence
+- `CATCH_UP_ALL`: Generate all missed occurrences in bounded batches (configurable `catchUpBatchSize`). Remaining missed occurrences are processed on subsequent poll cycles. This provides backpressure without silently discarding missed work.
+
+**Overlap policies**:
+- `ALLOW_OVERLAP`: New occurrences generate regardless of in-flight ones
+- `FORBID_OVERLAP`: If any occurrence for this schedule is in QUEUED or PROCESSING state, defer the next occurrence until the active one completes
+
+**Multi-scheduler concurrency**: `fetchDueSchedules` selects due schedules, and `processScheduleWithLock` acquires a `FOR UPDATE SKIP LOCKED` row lock per schedule. Multiple scheduler instances can run concurrently — each processes different schedules without contention.
+
+**Schedule versioning**: Optimistic concurrency via a `version` column. Updates require the expected version; stale versions are rejected with `ScheduleStaleVersionError`. Status changes (ACTIVE/PAUSED/DISABLED) also bump the version.
+
+**Pause/resume/disable**: PAUSED schedules retain their `next_run_at` but the scheduler skips them. DISABLED schedules also stop generating occurrences. Neither status retroactively erases already-created occurrences.
+
 ## Component Details
 
 ### API Server (`apps/api/`)
 
 - Express HTTP server with Zod input validation
 - Creates tasks atomically with outbox events in a single PG transaction
-- Runs the outbox publisher as a background process
+- Supports one-time scheduled tasks via `scheduledFor` parameter on `POST /tasks`
+- CRUD for recurring schedules: `POST/GET/PUT /schedules`, `PUT /schedules/:id/status`
+- Runs the outbox publisher and scheduler service as background processes
 - Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
 - `/metrics` returns JSON with task status counts, queue depth, and outbox stats
-- Graceful shutdown: stops accepting connections, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
+- Graceful shutdown: stops accepting connections, stops scheduler, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
 
 ### Worker (`apps/worker/`)
 
@@ -154,11 +222,14 @@ BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be
 
 ### Shared Package (`packages/shared/`)
 
-- **State machine**: Defines valid task transitions (QUEUED, PROCESSING, COMPLETED, FAILED, CANCELLED) and enforces them at the repository layer
+- **State machine**: Defines valid task transitions (SCHEDULED, QUEUED, PROCESSING, COMPLETED, FAILED, CANCELLED) and enforces them at the repository layer. SCHEDULED tasks can only transition to QUEUED (when released by the scheduler) or CANCELLED.
 - **Task repository**: PG-backed CRUD with `SELECT FOR UPDATE` + version check + claim token verification for all transitions; includes `reclaimStalledTask` with lease expiry check for crash recovery and `renewClaim` for lease extension by the active owner. All lease timestamps use PG `NOW()` as the single authoritative clock.
-- **Outbox publisher**: Polls PG for pending events, publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
-- **Migrations**: Schema versioning with advisory lock for concurrent startup safety
-- **Types**: Task, OutboxEvent, WorkerStatus interfaces
+- **Schedule repository**: PG-backed CRUD for recurring schedules with optimistic concurrency (version column). Handles one-time scheduled task creation, batch release of due scheduled tasks, occurrence generation (atomic task + outbox + next_run_at advance), execution lease management for overlap prevention, and `FOR UPDATE SKIP LOCKED` multi-scheduler concurrency.
+- **Scheduler service**: Polls PG on a configurable interval. Each poll cycle: (1) releases due one-time scheduled tasks in batch, (2) fetches due recurring schedules and processes each with a `FOR UPDATE SKIP LOCKED` row lock, applying the schedule's misfire policy to generate occurrences. Supports graceful shutdown by draining in-progress polls.
+- **Cron utilities**: Wraps `cron-parser` for IANA-timezone-aware cron evaluation. `getNextOccurrence`, `getNextOccurrences`, and `getMissedOccurrences` (bounded) handle DST transitions.
+- **Outbox publisher**: Polls PG for pending events (including `SCHEDULED_TASK_RELEASED` events), publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
+- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index.
+- **Types**: Task, OutboxEvent, WorkerStatus, RecurringSchedule, ScheduleStatus, MisfirePolicy, OverlapPolicy interfaces
 
 ### Dashboard (`apps/web/`)
 
