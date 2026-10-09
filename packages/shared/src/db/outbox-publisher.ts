@@ -42,6 +42,7 @@ export class OutboxPublisher {
       successThreshold?: number;
       resetTimeoutMs?: number;
       nowFn?: () => number;
+      logger?: Logger;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -49,11 +50,12 @@ export class OutboxPublisher {
     this.circuitSuccessThreshold = circuitOptions?.successThreshold ?? 2;
     this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
-    this.logger = createLogger({
+    const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
       level: process.env.LOG_LEVEL,
-    }).child({ publisherId: this.publisherId });
+    });
+    this.logger = baseLogger.child({ publisherId: this.publisherId });
   }
 
   start(): void {

@@ -2,9 +2,27 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/glo
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
+import { Writable } from 'stream';
 import { TaskRepository } from '../db/task-repository';
 import { OutboxPublisher } from '../db/outbox-publisher';
 import { runMigrations } from '../db/migrations';
+import { createLogger } from '../logger/index';
+
+function createCaptureStream(): { stream: Writable; lines: string[] } {
+  const lines: string[] = [];
+  const stream = new Writable({
+    write(chunk, _encoding, callback) {
+      const str = chunk.toString().trim();
+      if (str) lines.push(str);
+      callback();
+    },
+  });
+  return { stream, lines };
+}
+
+function capturedMessages(lines: string[]): string[] {
+  return lines.map((l) => JSON.parse(l).msg as string);
+}
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 const TEST_REDIS_HOST = process.env.TEST_REDIS_HOST || 'localhost';
@@ -781,7 +799,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     }
   });
 
-  it('should log a distinct message when PG DELIVERED update fails after successful publication', async () => {
+  it('should emit post-publication persistence failure log (not queue failure log) when PG DELIVERED update fails', async () => {
     requireInfra();
 
     const testQueue2 = new Queue('tasks-test-partial-fail-2', {
@@ -789,7 +807,21 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
       defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
     });
 
-    const cbPublisher = new OutboxPublisher(pool, testQueue2, 60000, 10, 3);
+    const { stream, lines } = createCaptureStream();
+    const captureLogger = createLogger({
+      service: 'outbox-publisher',
+      environment: 'test',
+      level: 'debug',
+      destination: stream,
+    });
+
+    const cbPublisher = new OutboxPublisher(pool, testQueue2, 60000, 10, 3, {
+      failureThreshold: 2,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => Date.now(),
+      logger: captureLogger,
+    });
 
     await repo.createTaskWithOutbox({
       name: 'partial-fail-log-test',
@@ -818,11 +850,76 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     try {
       const processed = await cbPublisher.processOutbox();
       expect(processed).toBe(1);
+
+      const msgs = capturedMessages(lines);
+      expect(msgs).toContain(
+        'Failed to mark outbox event as delivered after successful queue publication',
+      );
+      expect(msgs).not.toContain('Failed to publish outbox event to queue');
+
+      expect(cbPublisher.getCircuitState()).toBe('CLOSED');
+      expect((cbPublisher as any).consecutiveFailures).toBe(0);
     } finally {
       pool.connect = realConnect;
       await pool.query(`UPDATE outbox_events SET status = 'DELIVERED' WHERE status = 'PENDING'`);
       try { await testQueue2.obliterate({ force: true }); } catch {}
       await testQueue2.close();
+    }
+  });
+
+  it('should emit queue failure log and increment circuit breaker on genuine BullMQ publication failure', async () => {
+    requireInfra();
+
+    const testQueue3 = new Queue('tasks-test-bullmq-fail', {
+      connection: redis,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+
+    const { stream, lines } = createCaptureStream();
+    const captureLogger = createLogger({
+      service: 'outbox-publisher',
+      environment: 'test',
+      level: 'debug',
+      destination: stream,
+    });
+
+    const cbPublisher = new OutboxPublisher(pool, testQueue3, 60000, 10, 3, {
+      failureThreshold: 3,
+      successThreshold: 2,
+      resetTimeoutMs: 500,
+      nowFn: () => Date.now(),
+      logger: captureLogger,
+    });
+
+    await repo.createTaskWithOutbox({
+      name: 'bullmq-fail-log-test',
+      priority: 'NORMAL',
+      payload: {},
+      maxRetries: 3,
+    });
+
+    const origAdd = testQueue3.add.bind(testQueue3);
+    (testQueue3 as any).add = async () => {
+      throw new Error('BullMQ connection refused');
+    };
+
+    try {
+      await cbPublisher.processOutbox();
+
+      const msgs = capturedMessages(lines);
+      expect(msgs).toContain('Failed to publish outbox event to queue');
+      expect(msgs).not.toContain(
+        'Failed to mark outbox event as delivered after successful queue publication',
+      );
+
+      expect((cbPublisher as any).consecutiveFailures).toBe(1);
+    } finally {
+      (testQueue3 as any).add = origAdd;
+      await pool.query(
+        `UPDATE outbox_events SET claimed_by = NULL, claimed_at = NULL WHERE status = 'PENDING'`,
+      );
+      try { await testQueue3.obliterate({ force: true }); } catch {}
+      await testQueue3.close();
     }
   });
 });
