@@ -26,6 +26,7 @@
     "typescript": "^5.2.0"
   },
   "dependencies": {
+    "cron-parser": "4.9.0",
     "ioredis": "^5.11.1",
     "pg": "^8.23.1",
     "pino": "^10.4.0"
