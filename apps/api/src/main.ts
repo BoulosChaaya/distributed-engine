@@ -20,6 +20,7 @@ import {
   tracing,
   createLogger,
   getNextOccurrence,
+  WeightedFairScheduler,
 } from '@repo/shared';
 import { Task, RecurringSchedule, ApiResponse } from '@repo/shared';
 import {
@@ -93,6 +94,7 @@ const outboxPublisher = new OutboxPublisher(
   config.outbox.pollIntervalMs,
   config.outbox.batchSize,
   config.outbox.maxAttempts,
+  { fairScheduler: new WeightedFairScheduler() },
 );
 
 const schedulerService = new SchedulerService(pgPool, logger.child({ component: 'scheduler' }), {

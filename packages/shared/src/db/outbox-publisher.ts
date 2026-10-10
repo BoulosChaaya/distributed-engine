@@ -5,6 +5,7 @@ import { OutboxEvent } from '../types';
 import { tracing } from '../telemetry/spans';
 import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
 import { createLogger, type Logger } from '../logger/index';
+import { WeightedFairScheduler, TenantWeightEntry } from '../fairness';
 
 const PRIORITY_MAP: Record<string, number> = {
   LOW: 10,
@@ -30,6 +31,7 @@ export class OutboxPublisher {
   private readonly circuitSuccessThreshold: number;
   private readonly circuitResetTimeoutMs: number;
   private readonly nowFn: () => number;
+  private readonly fairScheduler?: WeightedFairScheduler;
 
   constructor(
     private pool: Pool,
@@ -43,6 +45,7 @@ export class OutboxPublisher {
       resetTimeoutMs?: number;
       nowFn?: () => number;
       logger?: Logger;
+      fairScheduler?: WeightedFairScheduler;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -50,6 +53,7 @@ export class OutboxPublisher {
     this.circuitSuccessThreshold = circuitOptions?.successThreshold ?? 2;
     this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
+    this.fairScheduler = circuitOptions?.fairScheduler;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -168,11 +172,17 @@ export class OutboxPublisher {
            LIMIT $3
            FOR UPDATE SKIP LOCKED
          )
-         RETURNING *`,
+         RETURNING *,
+           (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
         [this.publisherId, this.maxAttempts, effectiveBatchSize],
       );
 
-      for (const row of claimResult.rows) {
+      let orderedRows = claimResult.rows;
+      if (this.fairScheduler && orderedRows.length > 1) {
+        orderedRows = await this.reorderByFairness(orderedRows, client);
+      }
+
+      for (const row of orderedRows) {
         const event: OutboxEvent = {
           id: row.id,
           taskId: row.task_id,
@@ -241,6 +251,60 @@ export class OutboxPublisher {
     }
 
     return processed;
+  }
+
+  private async reorderByFairness(
+    rows: Array<Record<string, unknown>>,
+    client: import('pg').PoolClient,
+  ): Promise<Array<Record<string, unknown>>> {
+    const tenantIds = [...new Set(
+      rows.map(r => r.task_tenant_id as string | null).filter((id): id is string => !!id),
+    )];
+    if (tenantIds.length <= 1) return rows;
+
+    const weightResult = await client.query(
+      `SELECT t.id as tenant_id, COALESCE(o.weight, p.weight) as weight
+       FROM tenants t
+       JOIN plans p ON t.plan_id = p.id
+       LEFT JOIN tenant_overrides o ON o.tenant_id = t.id
+       WHERE t.id = ANY($1)`,
+      [tenantIds],
+    );
+
+    const weightMap = new Map<string, number>();
+    for (const wr of weightResult.rows) {
+      weightMap.set(wr.tenant_id as string, wr.weight as number);
+    }
+
+    const byTenant = new Map<string, Array<Record<string, unknown>>>();
+    const noTenant: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const tid = row.task_tenant_id as string | null;
+      if (!tid) {
+        noTenant.push(row);
+        continue;
+      }
+      if (!byTenant.has(tid)) byTenant.set(tid, []);
+      byTenant.get(tid)!.push(row);
+    }
+
+    const entries: TenantWeightEntry[] = [];
+    for (const tid of byTenant.keys()) {
+      entries.push({ tenantId: tid, weight: weightMap.get(tid) ?? 1 });
+    }
+
+    const reordered: Array<Record<string, unknown>> = [...noTenant];
+    const remaining = rows.length - noTenant.length;
+    for (let i = 0; i < remaining; i++) {
+      const selected = this.fairScheduler!.selectNext(
+        entries.filter(e => (byTenant.get(e.tenantId)?.length ?? 0) > 0),
+      );
+      if (!selected) break;
+      reordered.push(byTenant.get(selected)!.shift()!);
+      if (byTenant.get(selected)!.length === 0) byTenant.delete(selected);
+    }
+
+    return reordered;
   }
 
   private async publishEvent(event: OutboxEvent, client: import('pg').PoolClient): Promise<boolean> {

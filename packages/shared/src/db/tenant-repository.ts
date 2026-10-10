@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { createHash } from 'crypto';
 import { Tenant, TenantStatus, Plan, TenantOverride, TenantUsage, EffectiveLimits, TenantConcurrencyLease } from '../types';
 import { generateId } from '../utils';
 
@@ -79,11 +80,34 @@ export function computeBillingPeriodStart(tenantCreatedAt: Date, billingPeriodDa
   return new Date(start.getTime() + periods * periodMs);
 }
 
-export function computeIdempotencyHash(name: string, priority: string, maxRetries: number, scheduledFor?: string, scheduleId?: string): string {
-  const parts = [name, priority, String(maxRetries)];
-  if (scheduledFor) parts.push(scheduledFor);
-  if (scheduleId) parts.push(scheduleId);
-  return parts.join('|');
+function canonicalize(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(canonicalize);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    sorted[key] = canonicalize((value as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
+
+export function computeIdempotencyHash(
+  name: string,
+  priority: string,
+  maxRetries: number,
+  payload: Record<string, unknown>,
+  scheduledFor?: string,
+  scheduleId?: string,
+): string {
+  const material: Record<string, unknown> = {
+    name,
+    priority,
+    maxRetries,
+    payload: canonicalize(payload),
+  };
+  if (scheduledFor !== undefined) material.scheduledFor = scheduledFor;
+  if (scheduleId !== undefined) material.scheduleId = scheduleId;
+  return createHash('sha256').update(JSON.stringify(canonicalize(material))).digest('hex');
 }
 
 export class IdempotencyConflictError extends Error {
@@ -248,7 +272,13 @@ export class TenantRepository {
       await client.query('BEGIN');
 
       await client.query(
-        `DELETE FROM tenant_concurrency_leases WHERE expires_at < NOW()`,
+        'SELECT id FROM tenants WHERE id = $1 FOR UPDATE',
+        [tenantId],
+      );
+
+      await client.query(
+        `DELETE FROM tenant_concurrency_leases WHERE tenant_id = $1 AND expires_at < NOW()`,
+        [tenantId],
       );
 
       const countResult = await client.query(

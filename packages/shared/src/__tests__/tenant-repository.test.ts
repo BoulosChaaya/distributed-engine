@@ -102,9 +102,19 @@ describe('TenantRepository (requires PostgreSQL)', () => {
   });
 
   describe('concurrency leases', () => {
+    async function createTaskForTenant(tenantId: string, name: string): Promise<string> {
+      const result = await pool.query(
+        `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version, created_at, updated_at)
+         VALUES ($1, $2, $3, 'QUEUED', 'NORMAL', '{}', 3, 0, 1, NOW(), NOW()) RETURNING id`,
+        [`task-${Date.now()}-${Math.random().toString(36).slice(2)}`, tenantId, name],
+      );
+      return result.rows[0].id;
+    }
+
     it('should acquire and release concurrency lease', async () => {
       const tenant = await createTestTenant();
-      const result = await tenantRepo.acquireConcurrencyLease(tenant.id, 'task-1', 'worker-1', 5, 30000);
+      const taskId = await createTaskForTenant(tenant.id, 'lease-test-1');
+      const result = await tenantRepo.acquireConcurrencyLease(tenant.id, taskId, 'worker-1', 5, 30000);
 
       expect(result.acquired).toBe(true);
       expect(result.lease).toBeDefined();
@@ -120,19 +130,24 @@ describe('TenantRepository (requires PostgreSQL)', () => {
 
     it('should enforce concurrency limit', async () => {
       const tenant = await createTestTenant();
-      const r1 = await tenantRepo.acquireConcurrencyLease(tenant.id, 'task-1', 'w-1', 2, 30000);
+      const t1 = await createTaskForTenant(tenant.id, 'limit-1');
+      const t2 = await createTaskForTenant(tenant.id, 'limit-2');
+      const t3 = await createTaskForTenant(tenant.id, 'limit-3');
+
+      const r1 = await tenantRepo.acquireConcurrencyLease(tenant.id, t1, 'w-1', 2, 30000);
       expect(r1.acquired).toBe(true);
 
-      const r2 = await tenantRepo.acquireConcurrencyLease(tenant.id, 'task-2', 'w-2', 2, 30000);
+      const r2 = await tenantRepo.acquireConcurrencyLease(tenant.id, t2, 'w-2', 2, 30000);
       expect(r2.acquired).toBe(true);
 
-      const r3 = await tenantRepo.acquireConcurrencyLease(tenant.id, 'task-3', 'w-3', 2, 30000);
+      const r3 = await tenantRepo.acquireConcurrencyLease(tenant.id, t3, 'w-3', 2, 30000);
       expect(r3.acquired).toBe(false);
     });
 
     it('should renew concurrency lease', async () => {
       const tenant = await createTestTenant();
-      const result = await tenantRepo.acquireConcurrencyLease(tenant.id, 'task-1', 'w-1', 5, 30000);
+      const taskId = await createTaskForTenant(tenant.id, 'renew-test');
+      const result = await tenantRepo.acquireConcurrencyLease(tenant.id, taskId, 'w-1', 5, 30000);
       expect(result.acquired).toBe(true);
 
       await expect(
@@ -182,7 +197,7 @@ describe('TenantRepository (requires PostgreSQL)', () => {
         tenantId: tenant.id,
         name: 'idempotent-task',
         priority: 'HIGH',
-        payload: { different: true },
+        payload: {},
         maxRetries: 2,
         idempotencyKey: 'idem-1',
         billingPeriodStart,
@@ -317,20 +332,211 @@ describe('computeBillingPeriodStart', () => {
 
 describe('computeIdempotencyHash', () => {
   it('should produce same hash for same material', () => {
-    const h1 = computeIdempotencyHash('name', 'HIGH', 3);
-    const h2 = computeIdempotencyHash('name', 'HIGH', 3);
+    const h1 = computeIdempotencyHash('name', 'HIGH', 3, { key: 'value' });
+    const h2 = computeIdempotencyHash('name', 'HIGH', 3, { key: 'value' });
     expect(h1).toBe(h2);
   });
 
   it('should produce different hash for different material', () => {
-    const h1 = computeIdempotencyHash('name', 'HIGH', 3);
-    const h2 = computeIdempotencyHash('name', 'LOW', 3);
+    const h1 = computeIdempotencyHash('name', 'HIGH', 3, {});
+    const h2 = computeIdempotencyHash('name', 'LOW', 3, {});
     expect(h1).not.toBe(h2);
   });
 
   it('should include scheduling info in hash', () => {
-    const h1 = computeIdempotencyHash('name', 'HIGH', 3);
-    const h2 = computeIdempotencyHash('name', 'HIGH', 3, '2024-01-01T00:00:00Z');
+    const h1 = computeIdempotencyHash('name', 'HIGH', 3, {});
+    const h2 = computeIdempotencyHash('name', 'HIGH', 3, {}, '2024-01-01T00:00:00Z');
     expect(h1).not.toBe(h2);
+  });
+
+  it('A: identical payload deduplicates', () => {
+    const h1 = computeIdempotencyHash('task', 'NORMAL', 3, { a: 1, b: 'two' });
+    const h2 = computeIdempotencyHash('task', 'NORMAL', 3, { a: 1, b: 'two' });
+    expect(h1).toBe(h2);
+  });
+
+  it('B: key-order equivalence (canonical serialization)', () => {
+    const h1 = computeIdempotencyHash('task', 'NORMAL', 3, { z: 1, a: 2 });
+    const h2 = computeIdempotencyHash('task', 'NORMAL', 3, { a: 2, z: 1 });
+    expect(h1).toBe(h2);
+  });
+
+  it('C: different payload produces different hash', () => {
+    const h1 = computeIdempotencyHash('task', 'NORMAL', 3, { url: '/a' });
+    const h2 = computeIdempotencyHash('task', 'NORMAL', 3, { url: '/b' });
+    expect(h1).not.toBe(h2);
+  });
+
+  it('D: different name/priority/retries produces different hash', () => {
+    const payload = { data: 'same' };
+    const h1 = computeIdempotencyHash('taskA', 'NORMAL', 3, payload);
+    const h2 = computeIdempotencyHash('taskB', 'NORMAL', 3, payload);
+    expect(h1).not.toBe(h2);
+  });
+
+  it('E: cross-tenant independence (same material, different key scope)', () => {
+    const h1 = computeIdempotencyHash('task', 'NORMAL', 3, { x: 1 });
+    const h2 = computeIdempotencyHash('task', 'NORMAL', 3, { x: 1 });
+    expect(h1).toBe(h2);
+  });
+
+  it('F: hash is a 64-char hex SHA-256', () => {
+    const h = computeIdempotencyHash('task', 'NORMAL', 3, { key: 'val' });
+    expect(h).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('should include nested objects in canonical order', () => {
+    const h1 = computeIdempotencyHash('t', 'NORMAL', 1, { outer: { b: 2, a: 1 } });
+    const h2 = computeIdempotencyHash('t', 'NORMAL', 1, { outer: { a: 1, b: 2 } });
+    expect(h1).toBe(h2);
+  });
+});
+
+describe('Concurrent concurrency lease race (requires PostgreSQL)', () => {
+  it('should serialize concurrent acquisitions — exactly one wins the final slot', async () => {
+    const plans = await tenantRepo.listPlans();
+    const plan = plans[0];
+    const tenant = await tenantRepo.createTenant('race-tenant', plan.id, `race-hash-${Date.now()}`);
+
+    const t1 = await pool.query(
+      `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version, created_at, updated_at)
+       VALUES ($1, $2, 'race-task-1', 'QUEUED', 'NORMAL', '{}', 3, 0, 1, NOW(), NOW()) RETURNING id`,
+      [`race-t1-${Date.now()}`, tenant.id],
+    );
+    const t2 = await pool.query(
+      `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version, created_at, updated_at)
+       VALUES ($1, $2, 'race-task-2', 'QUEUED', 'NORMAL', '{}', 3, 0, 1, NOW(), NOW()) RETURNING id`,
+      [`race-t2-${Date.now()}`, tenant.id],
+    );
+
+    const pool2 = new Pool({ connectionString: TEST_PG_URL });
+    const tenantRepo2 = new TenantRepository(pool2);
+
+    try {
+      const [r1, r2] = await Promise.all([
+        tenantRepo.acquireConcurrencyLease(tenant.id, t1.rows[0].id, 'w-1', 1, 30000),
+        tenantRepo2.acquireConcurrencyLease(tenant.id, t2.rows[0].id, 'w-2', 1, 30000),
+      ]);
+
+      const acquired = [r1.acquired, r2.acquired];
+      expect(acquired.filter(Boolean).length).toBe(1);
+      expect(acquired.filter(v => !v).length).toBe(1);
+    } finally {
+      await pool.query(`DELETE FROM tenant_concurrency_leases WHERE tenant_id = $1`, [tenant.id]);
+      await pool2.end();
+    }
+  });
+});
+
+describe('Concurrent idempotency (requires PostgreSQL)', () => {
+  it('F: concurrent same-key submissions both resolve without duplicates', async () => {
+    const tenant = await (async () => {
+      const plans = await tenantRepo.listPlans();
+      const plan = plans[0];
+      const hash = `idem-race-${Date.now()}`;
+      return tenantRepo.createTenant('idem-race-tenant', plan.id, hash);
+    })();
+
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const bp = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
+
+    const pool2 = new Pool({ connectionString: TEST_PG_URL });
+    const taskRepo2 = new TaskRepository(pool2);
+    const idemKey = `concurrent-idem-${Date.now()}`;
+
+    try {
+      const input = {
+        tenantId: tenant.id,
+        name: 'concurrent-idem-task',
+        priority: 'NORMAL' as const,
+        payload: { action: 'test' },
+        maxRetries: 2,
+        idempotencyKey: idemKey,
+        billingPeriodStart: bp,
+        maxJobsPerPeriod: limits.maxJobsPerPeriod,
+      };
+
+      const results = await Promise.allSettled([
+        taskRepo.acceptTask(input),
+        taskRepo2.acceptTask(input),
+      ]);
+
+      const fulfilled = results.filter(r => r.status === 'fulfilled');
+      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+
+      if (fulfilled.length === 2) {
+        const ids = fulfilled.map(r => (r as PromiseFulfilledResult<any>).value.task.id);
+        expect(ids[0]).toBe(ids[1]);
+      }
+
+      const allTasks = await pool.query(
+        `SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2`,
+        [tenant.id, idemKey],
+      );
+      expect(allTasks.rows.length).toBe(1);
+    } finally {
+      await pool2.end();
+    }
+  });
+});
+
+describe('Concurrent quota race (requires PostgreSQL)', () => {
+  it('should allow exactly one submission when quota remaining is 1', async () => {
+    const tenant = await (async () => {
+      const plans = await tenantRepo.listPlans();
+      const plan = plans[0];
+      const hash = `quota-race-${Date.now()}`;
+      return tenantRepo.createTenant('quota-race-tenant', plan.id, hash);
+    })();
+
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const bp = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
+
+    for (let i = 0; i < limits.maxJobsPerPeriod - 1; i++) {
+      await taskRepo.acceptTask({
+        tenantId: tenant.id,
+        name: `quota-fill-${i}`,
+        priority: 'NORMAL',
+        payload: {},
+        maxRetries: 1,
+        billingPeriodStart: bp,
+        maxJobsPerPeriod: limits.maxJobsPerPeriod,
+      });
+    }
+
+    const pool2 = new Pool({ connectionString: TEST_PG_URL });
+    const taskRepo2 = new TaskRepository(pool2);
+
+    try {
+      const results = await Promise.allSettled([
+        taskRepo.acceptTask({
+          tenantId: tenant.id,
+          name: 'quota-race-a',
+          priority: 'NORMAL',
+          payload: {},
+          maxRetries: 1,
+          billingPeriodStart: bp,
+          maxJobsPerPeriod: limits.maxJobsPerPeriod,
+        }),
+        taskRepo2.acceptTask({
+          tenantId: tenant.id,
+          name: 'quota-race-b',
+          priority: 'NORMAL',
+          payload: {},
+          maxRetries: 1,
+          billingPeriodStart: bp,
+          maxJobsPerPeriod: limits.maxJobsPerPeriod,
+        }),
+      ]);
+
+      const fulfilled = results.filter(r => r.status === 'fulfilled');
+      const rejected = results.filter(r => r.status === 'rejected');
+
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(QuotaExceededError);
+    } finally {
+      await pool2.end();
+    }
   });
 });

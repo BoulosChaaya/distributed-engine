@@ -413,7 +413,7 @@ export class TaskRepository {
           [input.tenantId, input.idempotencyKey],
         );
         if (existing.rows.length > 0) {
-          const hash = computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.scheduledFor, input.scheduleId);
+          const hash = computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.payload, input.scheduledFor, input.scheduleId);
           if (existing.rows[0].idempotency_hash !== hash) {
             await client.query('ROLLBACK');
             throw new IdempotencyConflictError(input.tenantId, input.idempotencyKey);
@@ -448,7 +448,7 @@ export class TaskRepository {
       const traceCtx = injectTraceContext();
       const hasTraceContext = Object.keys(traceCtx).length > 0;
       const idempotencyHash = input.idempotencyKey
-        ? computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.scheduledFor, input.scheduleId)
+        ? computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.payload, input.scheduledFor, input.scheduleId)
         : null;
 
       const taskResult = await client.query(
