@@ -1026,8 +1026,91 @@ describe('Outbox claim concurrency (requires PostgreSQL + Redis)', () => {
   });
 });
 
-describe('Fairness integration: OutboxPublisher with WeightedFairScheduler (requires PostgreSQL + Redis)', () => {
-  it('should interleave events from tenants with different weights', async () => {
+describe('Fairness: starvation prevention via processOutbox (requires PostgreSQL + Redis)', () => {
+  it('should serve a newer tenant within bounded polls despite an older continuous backlog', async () => {
+    requireInfra();
+
+    const tenantRepo = new TenantRepository(pool);
+    const plans = await tenantRepo.listPlans();
+    const plan = plans[0];
+
+    const tenantA = await tenantRepo.createTenant(
+      'starve-a', plan.id, `starve-a-${Date.now()}`,
+    );
+    const tenantB = await tenantRepo.createTenant(
+      'starve-b', plan.id, `starve-b-${Date.now()}`,
+    );
+
+    const limitsA = await tenantRepo.getEffectiveLimits(tenantA.id);
+    const limitsB = await tenantRepo.getEffectiveLimits(tenantB.id);
+    const bpA = computeBillingPeriodStart(tenantA.createdAt, limitsA.billingPeriodDays, new Date());
+    const bpB = computeBillingPeriodStart(tenantB.createdAt, limitsB.billingPeriodDays, new Date());
+
+    for (let i = 0; i < 20; i++) {
+      await repo.acceptTask({
+        tenantId: tenantA.id,
+        name: `backlog-${i}`,
+        priority: 'NORMAL',
+        payload: {},
+        maxRetries: 1,
+        billingPeriodStart: bpA,
+        maxJobsPerPeriod: limitsA.maxJobsPerPeriod,
+      });
+    }
+    for (let i = 0; i < 5; i++) {
+      await repo.acceptTask({
+        tenantId: tenantB.id,
+        name: `newer-${i}`,
+        priority: 'NORMAL',
+        payload: {},
+        maxRetries: 1,
+        billingPeriodStart: bpB,
+        maxJobsPerPeriod: limitsB.maxJobsPerPeriod,
+      });
+    }
+
+    const fairQueue = new Queue(`tasks-starve-${Date.now()}`, {
+      connection: redis,
+      defaultJobOptions: { removeOnComplete: false, removeOnFail: false },
+    });
+
+    const scheduler = new WeightedFairScheduler();
+    const fairPublisher = new OutboxPublisher(pool, fairQueue, 60000, 4, 3, {
+      fairScheduler: scheduler,
+    });
+
+    try {
+      let bServed = 0;
+      for (let poll = 0; poll < 3; poll++) {
+        await fairPublisher.processOutbox();
+        const bDelivered = await pool.query(
+          `SELECT COUNT(*)::int as c FROM outbox_events oe
+           JOIN tasks t ON t.id = oe.task_id
+           WHERE oe.status = 'DELIVERED' AND t.tenant_id = $1`,
+          [tenantB.id],
+        );
+        bServed = bDelivered.rows[0].c;
+        if (bServed >= 5) break;
+      }
+
+      expect(bServed).toBeGreaterThanOrEqual(3);
+
+      const aDelivered = await pool.query(
+        `SELECT COUNT(*)::int as c FROM outbox_events oe
+         JOIN tasks t ON t.id = oe.task_id
+         WHERE oe.status = 'DELIVERED' AND t.tenant_id = $1`,
+        [tenantA.id],
+      );
+      expect(aDelivered.rows[0].c).toBeGreaterThan(0);
+    } finally {
+      try { await fairQueue.obliterate({ force: true }); } catch {}
+      await fairQueue.close();
+    }
+  });
+});
+
+describe('Fairness: weighted distribution via processOutbox (requires PostgreSQL + Redis)', () => {
+  it('should allocate publications proportional to tenant weights across polls', async () => {
     requireInfra();
 
     const tenantRepo = new TenantRepository(pool);
@@ -1035,10 +1118,10 @@ describe('Fairness integration: OutboxPublisher with WeightedFairScheduler (requ
     const plan = plans[0];
 
     const heavyTenant = await tenantRepo.createTenant(
-      'heavy-fair', plan.id, `fair-heavy-${Date.now()}`,
+      'heavy-w', plan.id, `heavy-w-${Date.now()}`,
     );
     const lightTenant = await tenantRepo.createTenant(
-      'light-fair', plan.id, `fair-light-${Date.now()}`,
+      'light-w', plan.id, `light-w-${Date.now()}`,
     );
 
     await tenantRepo.setOverrides(heavyTenant.id, { weight: 3 });
@@ -1049,10 +1132,10 @@ describe('Fairness integration: OutboxPublisher with WeightedFairScheduler (requ
     const heavyBp = computeBillingPeriodStart(heavyTenant.createdAt, heavyLimits.billingPeriodDays, new Date());
     const lightBp = computeBillingPeriodStart(lightTenant.createdAt, lightLimits.billingPeriodDays, new Date());
 
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 24; i++) {
       await repo.acceptTask({
         tenantId: heavyTenant.id,
-        name: `heavy-task-${i}`,
+        name: `heavy-w-${i}`,
         priority: 'NORMAL',
         payload: {},
         maxRetries: 1,
@@ -1060,10 +1143,10 @@ describe('Fairness integration: OutboxPublisher with WeightedFairScheduler (requ
         maxJobsPerPeriod: heavyLimits.maxJobsPerPeriod,
       });
     }
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 24; i++) {
       await repo.acceptTask({
         tenantId: lightTenant.id,
-        name: `light-task-${i}`,
+        name: `light-w-${i}`,
         priority: 'NORMAL',
         payload: {},
         maxRetries: 1,
@@ -1072,42 +1155,43 @@ describe('Fairness integration: OutboxPublisher with WeightedFairScheduler (requ
       });
     }
 
-    const fairQueue = new Queue('tasks-test-fairness', {
+    const fairQueue = new Queue(`tasks-weighted-${Date.now()}`, {
       connection: redis,
       defaultJobOptions: { removeOnComplete: false, removeOnFail: false },
     });
 
     const scheduler = new WeightedFairScheduler();
-    const fairPublisher = new OutboxPublisher(pool, fairQueue, 60000, 20, 3, {
+    const fairPublisher = new OutboxPublisher(pool, fairQueue, 60000, 8, 3, {
       fairScheduler: scheduler,
     });
 
     try {
-      const processed = await fairPublisher.processOutbox();
-      expect(processed).toBe(12);
-
-      const pending = await fairPublisher.getPendingCount();
-      expect(pending).toBe(0);
-
-      const heavyTasks = await pool.query(
-        `SELECT id FROM tasks WHERE tenant_id = $1`, [heavyTenant.id],
-      );
-      const heavyTaskIds = new Set(heavyTasks.rows.map((r: any) => r.id));
-
-      const deliveredEvents = await pool.query(
-        `SELECT task_id FROM outbox_events WHERE status = 'DELIVERED'`,
-      );
-      expect(deliveredEvents.rows.length).toBe(12);
-
-      let heavyCount = 0;
-      let lightCount = 0;
-      for (const row of deliveredEvents.rows) {
-        if (heavyTaskIds.has(row.task_id)) heavyCount++;
-        else lightCount++;
+      for (let poll = 0; poll < 4; poll++) {
+        await fairPublisher.processOutbox();
       }
 
-      expect(heavyCount).toBe(6);
-      expect(lightCount).toBe(6);
+      const heavyDelivered = await pool.query(
+        `SELECT COUNT(*)::int as c FROM outbox_events oe
+         JOIN tasks t ON t.id = oe.task_id
+         WHERE oe.status = 'DELIVERED' AND t.tenant_id = $1`,
+        [heavyTenant.id],
+      );
+      const lightDelivered = await pool.query(
+        `SELECT COUNT(*)::int as c FROM outbox_events oe
+         JOIN tasks t ON t.id = oe.task_id
+         WHERE oe.status = 'DELIVERED' AND t.tenant_id = $1`,
+        [lightTenant.id],
+      );
+
+      const heavy = heavyDelivered.rows[0].c as number;
+      const light = lightDelivered.rows[0].c as number;
+      const total = heavy + light;
+
+      expect(total).toBe(32);
+
+      const ratio = heavy / light;
+      expect(ratio).toBeGreaterThanOrEqual(2.5);
+      expect(ratio).toBeLessThanOrEqual(3.5);
     } finally {
       try { await fairQueue.obliterate({ force: true }); } catch {}
       await fairQueue.close();

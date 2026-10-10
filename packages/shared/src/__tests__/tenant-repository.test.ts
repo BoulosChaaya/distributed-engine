@@ -429,7 +429,7 @@ describe('Concurrent concurrency lease race (requires PostgreSQL)', () => {
 });
 
 describe('Concurrent idempotency (requires PostgreSQL)', () => {
-  it('F: concurrent same-key submissions both resolve without duplicates', async () => {
+  it('F: concurrent same-key same-fingerprint submissions both succeed with same task ID', async () => {
     const tenant = await (async () => {
       const plans = await tenantRepo.listPlans();
       const plan = plans[0];
@@ -462,18 +462,84 @@ describe('Concurrent idempotency (requires PostgreSQL)', () => {
       ]);
 
       const fulfilled = results.filter(r => r.status === 'fulfilled');
-      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+      expect(fulfilled.length).toBe(2);
 
-      if (fulfilled.length === 2) {
-        const ids = fulfilled.map(r => (r as PromiseFulfilledResult<any>).value.task.id);
-        expect(ids[0]).toBe(ids[1]);
-      }
+      const ids = fulfilled.map(r => (r as PromiseFulfilledResult<any>).value.task.id);
+      expect(ids[0]).toBe(ids[1]);
+
+      const idempotentFlags = fulfilled.map(r => (r as PromiseFulfilledResult<any>).value.idempotent);
+      expect(idempotentFlags.filter(Boolean).length).toBeGreaterThanOrEqual(1);
 
       const allTasks = await pool.query(
         `SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2`,
         [tenant.id, idemKey],
       );
       expect(allTasks.rows.length).toBe(1);
+
+      const outboxEvents = await pool.query(
+        `SELECT * FROM outbox_events WHERE task_id = $1`,
+        [ids[0]],
+      );
+      expect(outboxEvents.rows.length).toBe(1);
+
+      const usage = await pool.query(
+        `SELECT accepted_jobs FROM tenant_usage WHERE tenant_id = $1 AND billing_period_start = $2`,
+        [tenant.id, bp],
+      );
+      expect(usage.rows[0].accepted_jobs).toBe(1);
+    } finally {
+      await pool2.end();
+    }
+  });
+
+  it('concurrent same-key different-fingerprint: one succeeds, one gets IdempotencyConflictError', async () => {
+    const tenant = await (async () => {
+      const plans = await tenantRepo.listPlans();
+      const plan = plans[0];
+      const hash = `idem-conflict-${Date.now()}`;
+      return tenantRepo.createTenant('idem-conflict-tenant', plan.id, hash);
+    })();
+
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const bp = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
+
+    const pool2 = new Pool({ connectionString: TEST_PG_URL });
+    const taskRepo2 = new TaskRepository(pool2);
+    const idemKey = `concurrent-conflict-${Date.now()}`;
+
+    try {
+      const base = {
+        tenantId: tenant.id,
+        priority: 'NORMAL' as const,
+        maxRetries: 2,
+        idempotencyKey: idemKey,
+        billingPeriodStart: bp,
+        maxJobsPerPeriod: limits.maxJobsPerPeriod,
+      };
+
+      const results = await Promise.allSettled([
+        taskRepo.acceptTask({ ...base, name: 'task-a', payload: { variant: 'a' } }),
+        taskRepo2.acceptTask({ ...base, name: 'task-b', payload: { variant: 'b' } }),
+      ]);
+
+      const fulfilled = results.filter(r => r.status === 'fulfilled');
+      const rejected = results.filter(r => r.status === 'rejected');
+
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(IdempotencyConflictError);
+
+      const allTasks = await pool.query(
+        `SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2`,
+        [tenant.id, idemKey],
+      );
+      expect(allTasks.rows.length).toBe(1);
+
+      const usage = await pool.query(
+        `SELECT accepted_jobs FROM tenant_usage WHERE tenant_id = $1 AND billing_period_start = $2`,
+        [tenant.id, bp],
+      );
+      expect(usage.rows[0].accepted_jobs).toBe(1);
     } finally {
       await pool2.end();
     }

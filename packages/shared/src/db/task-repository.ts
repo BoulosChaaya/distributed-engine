@@ -477,8 +477,24 @@ export class TaskRepository {
 
       await client.query('COMMIT');
       return { task: rowToTask(taskResult.rows[0]), idempotent: false, outboxEventId: outboxId };
-    } catch (error) {
+    } catch (error: unknown) {
       await client.query('ROLLBACK').catch(() => {});
+
+      const pgError = error as { code?: string };
+      if (pgError.code === '23505' && input.idempotencyKey) {
+        const winner = await client.query(
+          'SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2',
+          [input.tenantId, input.idempotencyKey],
+        );
+        if (winner.rows.length > 0) {
+          const hash = computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.payload, input.scheduledFor, input.scheduleId);
+          if (winner.rows[0].idempotency_hash === hash) {
+            return { task: rowToTask(winner.rows[0]), idempotent: true };
+          }
+          throw new IdempotencyConflictError(input.tenantId, input.idempotencyKey);
+        }
+      }
+
       throw error;
     } finally {
       client.release();
