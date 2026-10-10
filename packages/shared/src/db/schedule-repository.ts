@@ -13,6 +13,7 @@ import { generateId } from '../utils';
 import { injectTraceContext } from '../telemetry/propagation';
 
 export interface CreateScheduleInput {
+  tenantId?: string;
   name: string;
   taskName: string;
   taskPriority: TaskPriority;
@@ -39,6 +40,7 @@ export interface UpdateScheduleInput {
 }
 
 export interface CreateScheduledTaskInput {
+  tenantId?: string;
   name: string;
   priority: TaskPriority;
   payload: Record<string, unknown>;
@@ -59,6 +61,7 @@ export interface OccurrenceResult {
 function rowToSchedule(row: Record<string, unknown>): RecurringSchedule {
   return {
     id: row.id as string,
+    tenantId: (row.tenant_id as string) || '',
     name: row.name as string,
     taskName: row.task_name as string,
     taskPriority: row.task_priority as TaskPriority,
@@ -83,6 +86,7 @@ function rowToSchedule(row: Record<string, unknown>): RecurringSchedule {
 function rowToTask(row: Record<string, unknown>): Task {
   return {
     id: row.id as string,
+    tenantId: (row.tenant_id as string) || '',
     name: row.name as string,
     status: row.status as TaskStatus,
     priority: row.priority as TaskPriority,
@@ -131,12 +135,12 @@ export class ScheduleRepository {
   async createSchedule(input: CreateScheduleInput): Promise<RecurringSchedule> {
     const id = generateId();
     const result = await this.pool.query(
-      `INSERT INTO recurring_schedules (id, name, task_name, task_priority, task_payload, task_max_retries,
+      `INSERT INTO recurring_schedules (id, tenant_id, name, task_name, task_priority, task_payload, task_max_retries,
          cron_expression, timezone, next_run_at, status, misfire_policy, overlap_policy, version, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE', $10, $11, 1, NOW(), NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ACTIVE', $11, $12, 1, NOW(), NOW())
        RETURNING *`,
       [
-        id, input.name, input.taskName, input.taskPriority,
+        id, input.tenantId ?? null, input.name, input.taskName, input.taskPriority,
         JSON.stringify(input.taskPayload), input.taskMaxRetries,
         input.cronExpression, input.timezone, input.nextRunAt,
         input.misfirePolicy, input.overlapPolicy,
@@ -277,10 +281,10 @@ export class ScheduleRepository {
     try {
       await client.query('BEGIN');
       const taskResult = await client.query(
-        `INSERT INTO tasks (id, name, status, priority, payload, max_retries, retries, version, scheduled_for, created_at, updated_at)
+        `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version, scheduled_for, created_at, updated_at)
          VALUES ($1, $2, 'SCHEDULED', $3, $4, $5, 0, 1, $6, NOW(), NOW())
          RETURNING *`,
-        [taskId, input.name, input.priority, JSON.stringify(input.payload), input.maxRetries, input.scheduledFor],
+        [taskId, input.tenantId ?? null, input.name, input.priority, JSON.stringify(input.payload), input.maxRetries, input.scheduledFor],
       );
       await client.query('COMMIT');
       // Scheduled task has no outbox event yet — it gets one when released
@@ -409,12 +413,12 @@ export class ScheduleRepository {
       let taskResult;
       try {
         taskResult = await c.query(
-          `INSERT INTO tasks (id, name, status, priority, payload, max_retries, retries, version,
+          `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version,
              scheduled_for, schedule_id, created_at, updated_at)
            VALUES ($1, $2, 'QUEUED', $3, $4, $5, 0, 1, $6, $7, NOW(), NOW())
            RETURNING *`,
           [
-            taskId, schedule.taskName, schedule.taskPriority,
+            taskId, schedule.tenantId || null, schedule.taskName, schedule.taskPriority,
             JSON.stringify(schedule.taskPayload), schedule.taskMaxRetries,
             scheduledFor, scheduleId,
           ],
@@ -575,5 +579,29 @@ export class ScheduleRepository {
       [scheduleId],
     );
     return result.rows.length > 0;
+  }
+
+  async getScheduleForTenant(scheduleId: string, tenantId: string): Promise<RecurringSchedule | null> {
+    const result = await this.pool.query(
+      'SELECT * FROM recurring_schedules WHERE id = $1 AND tenant_id = $2',
+      [scheduleId, tenantId],
+    );
+    if (result.rows.length === 0) return null;
+    return rowToSchedule(result.rows[0]);
+  }
+
+  async listSchedulesForTenant(tenantId: string, page: number, pageSize: number): Promise<{ items: RecurringSchedule[]; total: number }> {
+    const offset = (page - 1) * pageSize;
+    const [itemsResult, countResult] = await Promise.all([
+      this.pool.query(
+        'SELECT * FROM recurring_schedules WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
+        [tenantId, pageSize, offset],
+      ),
+      this.pool.query('SELECT COUNT(*)::int as count FROM recurring_schedules WHERE tenant_id = $1', [tenantId]),
+    ]);
+    return {
+      items: itemsResult.rows.map(rowToSchedule),
+      total: countResult.rows[0].count,
+    };
   }
 }

@@ -5,6 +5,7 @@ import { OutboxEvent } from '../types';
 import { tracing } from '../telemetry/spans';
 import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
 import { createLogger, type Logger } from '../logger/index';
+import { WeightedFairScheduler, TenantWeightEntry } from '../fairness';
 
 const PRIORITY_MAP: Record<string, number> = {
   LOW: 10,
@@ -30,6 +31,7 @@ export class OutboxPublisher {
   private readonly circuitSuccessThreshold: number;
   private readonly circuitResetTimeoutMs: number;
   private readonly nowFn: () => number;
+  private readonly fairScheduler?: WeightedFairScheduler;
 
   constructor(
     private pool: Pool,
@@ -43,6 +45,7 @@ export class OutboxPublisher {
       resetTimeoutMs?: number;
       nowFn?: () => number;
       logger?: Logger;
+      fairScheduler?: WeightedFairScheduler;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -50,6 +53,7 @@ export class OutboxPublisher {
     this.circuitSuccessThreshold = circuitOptions?.successThreshold ?? 2;
     this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
+    this.fairScheduler = circuitOptions?.fairScheduler;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -156,23 +160,11 @@ export class OutboxPublisher {
 
       const effectiveBatchSize = isHalfOpen ? 1 : this.batchSize;
 
-      const claimResult = await client.query(
-        `UPDATE outbox_events
-         SET claimed_by = $1, claimed_at = NOW(), attempts = attempts + 1
-         WHERE id IN (
-           SELECT id FROM outbox_events
-           WHERE status = 'PENDING'
-             AND (claimed_by IS NULL OR claimed_at < NOW() - INTERVAL '30 seconds')
-             AND attempts < $2
-           ORDER BY created_at ASC
-           LIMIT $3
-           FOR UPDATE SKIP LOCKED
-         )
-         RETURNING *`,
-        [this.publisherId, this.maxAttempts, effectiveBatchSize],
-      );
+      const orderedRows = this.fairScheduler && effectiveBatchSize > 1
+        ? await this.claimFairly(client, effectiveBatchSize)
+        : await this.claimGlobalFifo(client, effectiveBatchSize);
 
-      for (const row of claimResult.rows) {
+      for (const row of orderedRows) {
         const event: OutboxEvent = {
           id: row.id,
           taskId: row.task_id,
@@ -241,6 +233,138 @@ export class OutboxPublisher {
     }
 
     return processed;
+  }
+
+  private async claimGlobalFifo(
+    client: import('pg').PoolClient,
+    batchSize: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    const result = await client.query(
+      `UPDATE outbox_events
+       SET claimed_by = $1, claimed_at = NOW(), attempts = attempts + 1
+       WHERE id IN (
+         SELECT id FROM outbox_events
+         WHERE status = 'PENDING'
+           AND (claimed_by IS NULL OR claimed_at < NOW() - INTERVAL '30 seconds')
+           AND attempts < $2
+         ORDER BY created_at ASC
+         LIMIT $3
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING *,
+         (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
+      [this.publisherId, this.maxAttempts, batchSize],
+    );
+    return result.rows;
+  }
+
+  private async claimFairly(
+    client: import('pg').PoolClient,
+    batchSize: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    const tenantResult = await client.query(
+      `SELECT t.tenant_id,
+         COALESCE(ovr.weight, p.weight, 1)::int as weight,
+         COUNT(*)::int as pending_count
+       FROM outbox_events oe
+       JOIN tasks t ON t.id = oe.task_id
+       JOIN tenants tn ON tn.id = t.tenant_id
+       JOIN plans p ON tn.plan_id = p.id
+       LEFT JOIN tenant_overrides ovr ON ovr.tenant_id = t.tenant_id
+       WHERE oe.status = 'PENDING'
+         AND (oe.claimed_by IS NULL OR oe.claimed_at < NOW() - INTERVAL '30 seconds')
+         AND oe.attempts < $1
+       GROUP BY t.tenant_id, COALESCE(ovr.weight, p.weight, 1)`,
+      [this.maxAttempts],
+    );
+
+    if (tenantResult.rows.length <= 1) {
+      return this.claimGlobalFifo(client, batchSize);
+    }
+
+    const entries: TenantWeightEntry[] = tenantResult.rows.map((r: Record<string, unknown>) => ({
+      tenantId: r.tenant_id as string,
+      weight: r.weight as number,
+    }));
+    const pendingMap = new Map<string, number>(
+      tenantResult.rows.map((r: Record<string, unknown>) => [r.tenant_id as string, r.pending_count as number]),
+    );
+
+    const selectionOrder: string[] = [];
+    for (let i = 0; i < batchSize; i++) {
+      const active = entries.filter(e => {
+        const count = selectionOrder.filter(id => id === e.tenantId).length;
+        return count < (pendingMap.get(e.tenantId) ?? 0);
+      });
+      if (active.length === 0) break;
+      const selected = this.fairScheduler!.selectNext(active);
+      if (!selected) break;
+      selectionOrder.push(selected);
+    }
+
+    const allocation = new Map<string, number>();
+    for (const tid of selectionOrder) {
+      allocation.set(tid, (allocation.get(tid) ?? 0) + 1);
+    }
+
+    const perTenantRows = new Map<string, Array<Record<string, unknown>>>();
+    for (const [tenantId, slots] of allocation) {
+      const result = await client.query(
+        `UPDATE outbox_events
+         SET claimed_by = $1, claimed_at = NOW(), attempts = attempts + 1
+         WHERE id IN (
+           SELECT oe.id FROM outbox_events oe
+           JOIN tasks t ON t.id = oe.task_id
+           WHERE oe.status = 'PENDING'
+             AND (oe.claimed_by IS NULL OR oe.claimed_at < NOW() - INTERVAL '30 seconds')
+             AND oe.attempts < $2
+             AND t.tenant_id = $3
+           ORDER BY oe.created_at ASC
+           LIMIT $4
+           FOR UPDATE OF oe SKIP LOCKED
+         )
+         RETURNING *,
+           (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
+        [this.publisherId, this.maxAttempts, tenantId, slots],
+      );
+      perTenantRows.set(tenantId, result.rows);
+    }
+
+    const result: Array<Record<string, unknown>> = [];
+    const tenantCursors = new Map<string, number>();
+    for (const tid of selectionOrder) {
+      const cursor = tenantCursors.get(tid) ?? 0;
+      const rows = perTenantRows.get(tid);
+      if (rows && cursor < rows.length) {
+        result.push(rows[cursor]);
+        tenantCursors.set(tid, cursor + 1);
+      }
+    }
+
+    const remaining = batchSize - result.length;
+    if (remaining > 0) {
+      const backfill = await client.query(
+        `UPDATE outbox_events
+         SET claimed_by = $1, claimed_at = NOW(), attempts = attempts + 1
+         WHERE id IN (
+           SELECT oe.id FROM outbox_events oe
+           LEFT JOIN tasks t ON t.id = oe.task_id
+           WHERE oe.status = 'PENDING'
+             AND (oe.claimed_by IS NULL OR oe.claimed_at < NOW() - INTERVAL '30 seconds')
+             AND oe.attempts < $2
+             AND (t.id IS NULL OR t.tenant_id IS NULL)
+           ORDER BY oe.created_at ASC
+           LIMIT $3
+           FOR UPDATE OF oe SKIP LOCKED
+         )
+         RETURNING *,
+           (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
+        [this.publisherId, this.maxAttempts, remaining],
+      );
+      result.push(...backfill.rows);
+    }
+
+    return result;
   }
 
   private async publishEvent(event: OutboxEvent, client: import('pg').PoolClient): Promise<boolean> {

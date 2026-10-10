@@ -8,13 +8,19 @@ import {
   OutboxPublisher,
   ScheduleRepository,
   ScheduleStaleVersionError,
+  TenantRepository,
+  IdempotencyConflictError,
+  QuotaExceededError,
+  computeBillingPeriodStart,
   SchedulerService,
+  RedisRateLimiter,
   runMigrations,
   InvalidTransitionError,
   initTelemetry,
   tracing,
   createLogger,
   getNextOccurrence,
+  WeightedFairScheduler,
 } from '@repo/shared';
 import { Task, RecurringSchedule, ApiResponse } from '@repo/shared';
 import {
@@ -23,8 +29,11 @@ import {
   CreateScheduleSchema,
   UpdateScheduleSchema,
   SetScheduleStatusSchema,
+  TenantSubmitTaskSchema,
+  TenantCreateScheduleSchema,
   ValidationError,
 } from './validation';
+import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware';
 import { MetricsCollector } from './metrics';
 import { ShutdownManager } from './shutdown';
 import { config } from './config';
@@ -73,6 +82,11 @@ const taskQueue = new Queue('tasks', {
 
 const taskRepo = new TaskRepository(pgPool);
 const scheduleRepo = new ScheduleRepository(pgPool);
+const tenantRepo = new TenantRepository(pgPool);
+const rateLimiter = new RedisRateLimiter(redisClient);
+
+const tenantAuth = createTenantAuth(tenantRepo);
+const rateLimitMiddleware = createRateLimitMiddleware(rateLimiter, tenantRepo);
 
 const outboxPublisher = new OutboxPublisher(
   pgPool,
@@ -80,6 +94,7 @@ const outboxPublisher = new OutboxPublisher(
   config.outbox.pollIntervalMs,
   config.outbox.batchSize,
   config.outbox.maxAttempts,
+  { fairScheduler: new WeightedFairScheduler() },
 );
 
 const schedulerService = new SchedulerService(pgPool, logger.child({ component: 'scheduler' }), {
@@ -498,6 +513,210 @@ app.put('/schedules/:id/status', async (req: Request, res: Response, next: NextF
   }
 });
 
+// --- Tenant-scoped API ---
+
+app.post('/tenant/tasks', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const validatedData = TenantSubmitTaskSchema.parse(req.body);
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const billingPeriodStart = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
+
+    const result = await taskRepo.acceptTask({
+      tenantId: tenant.id,
+      name: validatedData.name,
+      priority: validatedData.priority,
+      payload: validatedData.payload,
+      maxRetries: validatedData.maxRetries,
+      idempotencyKey: validatedData.idempotencyKey,
+      billingPeriodStart,
+      maxJobsPerPeriod: limits.maxJobsPerPeriod,
+      scheduledFor: validatedData.scheduledFor,
+    });
+
+    const status = result.idempotent ? 200 : 201;
+    logger.info(result.idempotent ? 'Idempotent task returned' : 'Tenant task created', {
+      taskId: result.task.id,
+      tenantId: tenant.id,
+    });
+
+    res.status(status).json({
+      success: true,
+      data: result.task,
+      idempotent: result.idempotent,
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else if (error instanceof IdempotencyConflictError) {
+      next(new AppError(409, error.message));
+    } else if (error instanceof QuotaExceededError) {
+      next(new AppError(429, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
+app.get('/tenant/tasks', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const { page, pageSize } = PaginationSchema.parse(req.query);
+    const { items, total } = await taskRepo.listTasksForTenant(tenant.id, page, pageSize);
+
+    res.json({
+      success: true,
+      data: {
+        items,
+        total,
+        page,
+        pageSize,
+        hasMore: (page - 1) * pageSize + items.length < total,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/tenant/tasks/:id', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const task = await taskRepo.getTaskForTenant(req.params.id, tenant.id);
+    if (!task) {
+      throw new AppError(404, `Task ${req.params.id} not found`);
+    }
+    res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/tenant/tasks/:id/cancel', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const task = await taskRepo.cancelTaskForTenant(req.params.id, tenant.id);
+    logger.info('Tenant task cancelled', { taskId: task.id, tenantId: tenant.id });
+    res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
+  } catch (error) {
+    if (error instanceof InvalidTransitionError) {
+      next(new AppError(400, error.message));
+    } else if (error instanceof Error && error.message.includes('not found')) {
+      next(new AppError(404, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
+app.post('/tenant/schedules', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const validatedData = TenantCreateScheduleSchema.parse(req.body);
+
+    const nextRunAt = getNextOccurrence(
+      validatedData.cronExpression,
+      validatedData.timezone,
+      new Date(),
+    );
+
+    const schedule = await scheduleRepo.createSchedule({
+      tenantId: tenant.id,
+      name: validatedData.name,
+      taskName: validatedData.taskName,
+      taskPriority: validatedData.taskPriority,
+      taskPayload: validatedData.taskPayload,
+      taskMaxRetries: validatedData.taskMaxRetries,
+      cronExpression: validatedData.cronExpression,
+      timezone: validatedData.timezone,
+      nextRunAt,
+      misfirePolicy: validatedData.misfirePolicy,
+      overlapPolicy: validatedData.overlapPolicy,
+    });
+
+    logger.info('Tenant schedule created', {
+      scheduleId: schedule.id,
+      tenantId: tenant.id,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: schedule,
+      timestamp: new Date(),
+    } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'ZodError') {
+      next(new ValidationError(error as any));
+    } else {
+      next(error);
+    }
+  }
+});
+
+app.get('/tenant/schedules', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const { page, pageSize } = PaginationSchema.parse(req.query);
+    const { items, total } = await scheduleRepo.listSchedulesForTenant(tenant.id, page, pageSize);
+
+    res.json({
+      success: true,
+      data: {
+        items,
+        total,
+        page,
+        pageSize,
+        hasMore: (page - 1) * pageSize + items.length < total,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/tenant/schedules/:id', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const schedule = await scheduleRepo.getScheduleForTenant(req.params.id, tenant.id);
+    if (!schedule) {
+      throw new AppError(404, `Schedule ${req.params.id} not found`);
+    }
+    res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/tenant/usage', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const billingPeriodStart = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
+    const usage = await tenantRepo.getUsage(tenant.id, billingPeriodStart);
+    const activeConcurrency = await tenantRepo.getActiveConcurrencyCount(tenant.id);
+
+    res.json({
+      success: true,
+      data: {
+        limits,
+        usage: usage ? {
+          acceptedJobs: usage.acceptedJobs,
+          computeUnits: usage.computeUnits,
+          storageMb: usage.storageMb,
+          billingPeriodStart: usage.billingPeriodStart,
+        } : { acceptedJobs: 0, computeUnits: 0, storageMb: 0, billingPeriodStart },
+        activeConcurrency,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   metrics.recordError();
 
@@ -569,4 +788,4 @@ start().catch((error) => {
   process.exit(1);
 });
 
-export { app, pgPool, taskRepo, scheduleRepo, schedulerService, outboxPublisher, shutdownManager, logger };
+export { app, pgPool, taskRepo, scheduleRepo, tenantRepo, schedulerService, outboxPublisher, shutdownManager, logger };

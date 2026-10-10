@@ -5,6 +5,7 @@ import {
   TaskRepository,
   ClaimNotExpiredError,
   ScheduleRepository,
+  TenantRepository,
   runMigrations,
   initTelemetry,
   shutdownTelemetry,
@@ -51,6 +52,7 @@ redisClient.on('connect', () => logger.info('Redis connected'));
 
 const taskRepo = new TaskRepository(pgPool);
 const scheduleRepo = new ScheduleRepository(pgPool);
+const tenantRepo = new TenantRepository(pgPool);
 const LEASE_DEFERRAL_MARGIN_MS = 2000;
 const SCHEDULE_LEASE_DURATION_MS = parseInt(process.env.SCHEDULE_LEASE_DURATION_MS || '300000');
 
@@ -98,6 +100,7 @@ async function updateWorkerStatus() {
 const processTask = createProcessTask({
   taskRepo,
   scheduleRepo,
+  tenantRepo,
   tracing,
   logger,
   workerId: WORKER_ID,

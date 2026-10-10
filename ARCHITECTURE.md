@@ -212,6 +212,8 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 - Creates tasks atomically with outbox events in a single PG transaction
 - Supports one-time scheduled tasks via `scheduledFor` parameter on `POST /tasks`
 - CRUD for recurring schedules: `POST/GET/PUT /schedules`, `PUT /schedules/:id/status`
+- **Tenant-scoped endpoints** (`/tenant/*`): 7 routes behind Bearer token authentication middleware. Tenant identity is derived from the API key hash — never from a client-supplied tenant_id in the request body. Includes task submission with atomic quota + idempotency enforcement, task listing/retrieval/cancellation, schedule creation/listing/retrieval, and usage reporting.
+- **Rate limiting middleware**: Per-tenant sliding-window rate limiting with `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` response headers. Fail-open on Redis errors.
 - Runs the outbox publisher and scheduler service as background processes
 - Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
 - `/metrics` returns JSON with task status counts, queue depth, and outbox stats
@@ -225,6 +227,7 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 - Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash, but only after the previous execution claim has expired (`claim_expires_at < NOW()`). Reclaim generates a new `claim_token` and sets a new expiry.
 - When BullMQ redelivers a stalled job before the PG lease expires, the worker defers the job via `job.moveToDelayed()` until approximately the PG claim expiry. This does not consume an execution retry attempt. When the deferred time elapses, BullMQ re-activates the job and the worker can reclaim the task.
 - Renews execution lease at ~TTL/3 intervals while actively processing. Renewal requires the matching `claim_token`. If renewal fails (ownership lost, task cancelled), the timer is cleared and an execution-local `ownershipLost` flag is set. The worker checks this flag before attempting to complete or transition the task and cooperatively aborts if ownership was lost. The claim-token-protected transition remains the final guard against stale mutations — even if the flag check is bypassed, the DB rejects the stale token.
+- **Tenant concurrency enforcement**: Before claiming a task, the worker checks the task's tenant status (skips if SUSPENDED) and acquires a per-tenant concurrency lease. The lease TTL is `min(taskClaimTtl, scheduleLeaseDuration)` so the unified renewal interval (min/3) covers all three lease types (task claim + schedule execution + tenant concurrency). If the concurrency limit is reached, the worker defers the job via `moveToDelayed` + `DelayedError` — this does not consume a retry attempt. The concurrency lease is renewed in the same renewal timer alongside other leases, and released in a `finally` block on completion, failure, or any error path.
 - Uses optimistic concurrency (version check) and execution ownership (claim token verification) on all state transitions out of PROCESSING
 - Graceful shutdown: stops consuming new jobs, waits for in-flight jobs to complete (30s timeout), removes heartbeat key, closes connections
 
@@ -236,8 +239,11 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 - **Scheduler service**: Polls PG on a configurable interval. Each poll cycle: (1) releases due one-time scheduled tasks in batch, (2) fetches due recurring schedules and processes each with a `FOR UPDATE SKIP LOCKED` row lock, applying the schedule's misfire policy to generate occurrences. Supports graceful shutdown by draining in-progress polls.
 - **Cron utilities**: Wraps `cron-parser` for IANA-timezone-aware cron evaluation. `getNextOccurrence`, `getNextOccurrences`, and `getMissedOccurrences` (bounded) handle DST transitions.
 - **Outbox publisher**: Polls PG for pending events (including `SCHEDULED_TASK_RELEASED` events), publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
-- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index.
-- **Types**: Task, OutboxEvent, WorkerStatus, RecurringSchedule, ScheduleStatus, MisfirePolicy, OverlapPolicy interfaces
+- **Tenant repository**: PG-backed tenant CRUD, plan management, effective limits (plan defaults + tenant overrides via `COALESCE`), concurrency lease management (acquire/renew/release with expiry), billing period computation, and idempotency hash generation.
+- **Rate limiter**: Redis sliding-window sorted set rate limiter with fail-open semantics. On any Redis error, requests are allowed through with full remaining count.
+- **Fair scheduler**: Deficit-based weighted round-robin scheduler. Each tenant accumulates a deficit proportional to the inverse of its weight; the tenant with the lowest deficit is selected next. Guarantees bounded gap between selections for any eligible tenant, preventing starvation.
+- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index. Migrations 11–16 add multi-tenancy: plans (with seed data), tenants, tenant_overrides, tenant_usage, tenant_concurrency_leases, and tenant_id columns on tasks/schedules.
+- **Types**: Task, OutboxEvent, WorkerStatus, RecurringSchedule, ScheduleStatus, MisfirePolicy, OverlapPolicy, Plan, Tenant, TenantOverride, TenantUsage, TenantConcurrencyLease, EffectiveLimits interfaces
 
 ### Dashboard (`apps/web/`)
 
@@ -269,6 +275,115 @@ The system guarantees at-least-once delivery, not exactly-once. Duplicate proces
 - BullMQ retries a job that was already processed
 
 Task handlers should be idempotent to handle these cases safely.
+
+## Multi-Tenancy
+
+### Tenant Model
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────────┐
+│  plans   │◀────│   tenants    │────▶│ tenant_overrides  │
+│          │     │              │     │ (per-tenant limit │
+│ starter  │     │ api_key_hash │     │  overrides)       │
+│ profess. │     │ status       │     └──────────────────┘
+│ enterpr. │     │ plan_id FK   │
+└──────────┘     └──────┬───────┘
+                        │
+           ┌────────────┼────────────┐
+           ▼            ▼            ▼
+    ┌────────────┐ ┌──────────┐ ┌───────────────────────┐
+    │tenant_usage│ │  tasks   │ │tenant_concurrency_    │
+    │(per-period │ │(tenant_id│ │leases (PG-backed      │
+    │ quotas)    │ │ FK)      │ │ with expiry)          │
+    └────────────┘ └──────────┘ └───────────────────────┘
+```
+
+Plans define default limits (rate_limit, max_concurrent_executions, max_jobs_per_period, weight, billing_period_days). Tenant overrides layer on top via `COALESCE` — only overridden fields replace plan defaults. Three seed plans are created by migration 11: starter, professional, enterprise.
+
+### Authentication
+
+```
+Client                    API                          PostgreSQL
+  │                        │                               │
+  │── Authorization: ─────▶│                               │
+  │   Bearer <api-key>     │── SHA-256(api-key) ──────────▶│
+  │                        │   SELECT * FROM tenants       │
+  │                        │   WHERE api_key_hash = $1     │
+  │                        │◀── tenant row ───────────────│
+  │                        │                               │
+  │                        │── check status ──────────────▶│
+  │                        │   (reject SUSPENDED w/ 403)   │
+```
+
+Tenant identity is **never** supplied in the request body. The API key header is the sole source of tenant identity, preventing cross-tenant impersonation.
+
+### Task Acceptance (Atomic Transaction)
+
+```
+BEGIN
+  ├── Check idempotency_key exists for this tenant
+  │     ├── EXISTS + same material hash → return existing task (dedup)
+  │     └── EXISTS + different material hash → IdempotencyConflictError
+  │
+  ├── UPSERT tenant_usage for current billing period
+  │     └── Check accepted_jobs < max_jobs_per_period → QuotaExceededError
+  │
+  ├── INCREMENT accepted_jobs
+  ├── INSERT task (with tenant_id, idempotency_key, idempotency_hash)
+  ├── INSERT outbox_event
+COMMIT
+```
+
+The entire acceptance is a single PG transaction, making it race-safe under concurrent API servers. The idempotency hash covers `(name, priority, maxRetries, scheduledFor, scheduleId)` — material request properties, not payload content.
+
+### Billing Period
+
+Billing periods are computed relative to each tenant's `created_at` date, not calendar months. `computeBillingPeriodStart(tenantCreatedAt, billingPeriodDays, now)` determines the start of the current period by advancing from the tenant's creation date in `billingPeriodDays` increments.
+
+### Concurrency Leases
+
+Per-tenant concurrency limits are enforced at the worker via PG-backed leases:
+
+```
+Worker                     PostgreSQL
+  │                            │
+  │── acquireConcurrencyLease ▶│  COUNT active leases for tenant
+  │   (tenantId, taskId,       │  IF count < maxConcurrent:
+  │    workerId, maxConc, ttl) │    INSERT lease → acquired=true
+  │                            │  ELSE:
+  │◀── {acquired, lease} ─────│    → acquired=false
+  │                            │
+  │── renewConcurrencyLease ──▶│  UPDATE expires_at WHERE token=$1
+  │── releaseConcurrencyLease ▶│  DELETE WHERE lease_token=$1
+```
+
+Concurrency leases compose with existing task claim leases and schedule execution leases. All three are renewed in the same timer. The concurrency lease TTL is `min(taskClaimTtl, scheduleLeaseDuration)` so the unified renewal interval (computed as min/3) covers all lease types. Crashed workers' leases expire and are automatically reclaimed.
+
+When the concurrency limit is reached, the worker defers the job via `moveToDelayed` + `DelayedError`. This does **not** consume a BullMQ retry attempt — the same mechanism used for schedule lease deferral.
+
+### Rate Limiting
+
+Redis sliding-window sorted set rate limiter per tenant. Each request adds a timestamped entry; entries outside the window are pruned; the count of remaining entries determines whether the request is allowed.
+
+**Fail-open**: Any Redis error (connection failure, timeout, pipeline error) returns `{allowed: true, remaining: limit}`. Rate limiting is a best-effort throttle, not a security boundary.
+
+Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+
+### Weighted Fair Scheduling
+
+Deficit-based round-robin ensures proportional CPU time across tenants with different plan weights:
+
+1. Each tenant starts with deficit = 0
+2. On each selection, pick the tenant with the lowest deficit
+3. Increment the selected tenant's deficit by `1 / weight`
+
+Higher-weight tenants accumulate deficit more slowly, so they are selected more frequently. The deficit model guarantees a bounded maximum gap between consecutive selections for any tenant — a continuously backlogged high-weight tenant cannot permanently starve a lower-weight tenant.
+
+### Tenant Suspension
+
+- **API**: SUSPENDED tenants receive HTTP 403 on all tenant-scoped endpoints
+- **Worker**: Tasks belonging to SUSPENDED tenants are skipped (returned as `{status: 'SKIPPED', reason: 'tenant_suspended'}`) without consuming retries or leases
+- **In-flight**: Tasks already in PROCESSING continue to completion — suspension does not kill active work
 
 ## Scaling Considerations
 

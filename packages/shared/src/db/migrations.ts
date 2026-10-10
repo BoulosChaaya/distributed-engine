@@ -146,6 +146,119 @@ const MIGRATIONS = [
         ON tasks(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL;
     `,
   },
+  {
+    version: 11,
+    name: 'create_plans_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS plans (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        rate_limit INTEGER NOT NULL DEFAULT 50,
+        max_concurrent_executions INTEGER NOT NULL DEFAULT 5,
+        max_jobs_per_period INTEGER NOT NULL DEFAULT 1000,
+        billing_period_days INTEGER NOT NULL DEFAULT 30,
+        max_compute_units_per_period INTEGER NOT NULL DEFAULT 10000,
+        max_storage_mb INTEGER NOT NULL DEFAULT 5120,
+        weight INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      INSERT INTO plans (id, name, rate_limit, max_concurrent_executions, max_jobs_per_period, billing_period_days, max_compute_units_per_period, max_storage_mb, weight)
+      VALUES
+        ('plan_starter', 'starter', 50, 5, 1000, 30, 10000, 5120, 1),
+        ('plan_professional', 'professional', 200, 20, 10000, 30, 100000, 51200, 3),
+        ('plan_enterprise', 'enterprise', 1000, 100, 100000, 30, 1000000, 512000, 10)
+      ON CONFLICT (id) DO NOTHING;
+    `,
+  },
+  {
+    version: 12,
+    name: 'create_tenants_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS tenants (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        plan_id TEXT NOT NULL REFERENCES plans(id),
+        api_key_hash TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT valid_tenant_status CHECK (status IN ('ACTIVE','SUSPENDED'))
+      );
+    `,
+  },
+  {
+    version: 13,
+    name: 'create_tenant_overrides_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS tenant_overrides (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id),
+        rate_limit INTEGER,
+        max_concurrent_executions INTEGER,
+        max_jobs_per_period INTEGER,
+        billing_period_days INTEGER,
+        max_compute_units_per_period INTEGER,
+        max_storage_mb INTEGER,
+        weight INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `,
+  },
+  {
+    version: 14,
+    name: 'create_tenant_usage_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS tenant_usage (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL REFERENCES tenants(id),
+        billing_period_start TIMESTAMPTZ NOT NULL,
+        accepted_jobs INTEGER NOT NULL DEFAULT 0,
+        compute_units INTEGER NOT NULL DEFAULT 0,
+        storage_mb INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT unique_tenant_billing_period UNIQUE (tenant_id, billing_period_start)
+      );
+    `,
+  },
+  {
+    version: 15,
+    name: 'create_tenant_concurrency_leases_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS tenant_concurrency_leases (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL REFERENCES tenants(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        worker_id TEXT NOT NULL,
+        lease_token TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tenant_concurrency_leases_tenant
+        ON tenant_concurrency_leases(tenant_id);
+      CREATE INDEX IF NOT EXISTS idx_tenant_concurrency_leases_expires
+        ON tenant_concurrency_leases(expires_at);
+    `,
+  },
+  {
+    version: 16,
+    name: 'add_tenant_id_to_tasks_and_schedules',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id);
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS idempotency_hash TEXT;
+      CREATE INDEX IF NOT EXISTS idx_tasks_tenant_id ON tasks(tenant_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
+        ON tasks(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+      ALTER TABLE recurring_schedules ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id);
+      CREATE INDEX IF NOT EXISTS idx_recurring_schedules_tenant_id ON recurring_schedules(tenant_id);
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

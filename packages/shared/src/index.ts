@@ -5,3 +5,5 @@ export * from './db/index';
 export * from './telemetry/index';
 export * from './logger/index';
 export * from './scheduler/index';
+export * from './rate-limiter';
+export * from './fairness';

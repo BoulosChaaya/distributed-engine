@@ -37,9 +37,18 @@ export interface WorkerMetrics {
   jobsFailed: number;
 }
 
+export interface TenantRepoLike {
+  getTenant(tenantId: string): Promise<any>;
+  getEffectiveLimits(tenantId: string): Promise<any>;
+  acquireConcurrencyLease(tenantId: string, taskId: string, workerId: string, maxConcurrent: number, leaseDurationMs: number): Promise<{ acquired: boolean; lease?: any }>;
+  renewConcurrencyLease(leaseToken: string, leaseDurationMs: number): Promise<void>;
+  releaseConcurrencyLease(leaseToken: string): Promise<void>;
+}
+
 export interface ProcessTaskDeps {
   taskRepo: TaskRepoLike;
   scheduleRepo: ScheduleRepoLike;
+  tenantRepo?: TenantRepoLike;
   tracing: TracingLike;
   logger: LoggerLike;
   workerId: string;
@@ -72,6 +81,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
   const {
     taskRepo,
     scheduleRepo,
+    tenantRepo,
     tracing,
     logger,
     workerId,
@@ -117,12 +127,23 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       return { status: 'SKIPPED', taskId, reason: 'already_failed' };
     }
 
+    if (tenantRepo && currentTask.tenantId) {
+      const tenant = await tenantRepo.getTenant(currentTask.tenantId);
+      if (tenant?.status === 'SUSPENDED') {
+        logger.info('Tenant suspended, skipping task', { taskId, tenantId: currentTask.tenantId });
+        parentSpan.setAttribute('task.skipped', true);
+        parentSpan.setAttribute('task.skip_reason', 'tenant_suspended');
+        return { status: 'SKIPPED', taskId, reason: 'tenant_suspended' };
+      }
+    }
+
     let taskVersion = currentTask.version;
     let claimToken: string | undefined;
     let currentRetries = currentTask.retries;
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
     let ownershipLost = false;
     let scheduleLeaseToken: string | undefined;
+    let concurrencyLeaseToken: string | undefined;
 
     if (currentTask.scheduleId) {
       const schedule = await scheduleRepo.getSchedule(currentTask.scheduleId);
@@ -149,6 +170,33 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       }
     }
 
+    if (tenantRepo && currentTask.tenantId) {
+      const limits = await tenantRepo.getEffectiveLimits(currentTask.tenantId);
+      const concurrencyLeaseDurationMs = Math.min(taskRepo.claimTtl, scheduleLeaseDurationMs);
+      const leaseResult = await tenantRepo.acquireConcurrencyLease(
+        currentTask.tenantId,
+        taskId,
+        workerId,
+        limits.maxConcurrentExecutions,
+        concurrencyLeaseDurationMs,
+      );
+      if (!leaseResult.acquired) {
+        const deferUntil = Date.now() + leaseDeferralMarginMs;
+        logger.info('Tenant concurrency limit reached, deferring', {
+          taskId,
+          tenantId: currentTask.tenantId,
+          maxConcurrent: limits.maxConcurrentExecutions,
+        });
+        if (scheduleLeaseToken && currentTask.scheduleId) {
+          await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+        }
+        await job.moveToDelayed(deferUntil, job.token);
+        throw new DelayedError();
+      }
+      concurrencyLeaseToken = leaseResult.lease?.leaseToken;
+      logger.info('Tenant concurrency lease acquired', { taskId, tenantId: currentTask.tenantId });
+    }
+
     if (currentTask.status === 'QUEUED') {
       const claimSpan = tracing.startTaskClaim(taskId, workerId, 'initial');
       try {
@@ -169,6 +217,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         });
         if (scheduleLeaseToken && currentTask.scheduleId) {
           await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+        }
+        if (concurrencyLeaseToken && tenantRepo) {
+          await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
         }
         return { status: 'SKIPPED', taskId, reason: 'transition_failed' };
       } finally {
@@ -191,6 +242,10 @@ export function createProcessTask(deps: ProcessTaskDeps) {
             await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
             scheduleLeaseToken = undefined;
           }
+          if (concurrencyLeaseToken && tenantRepo) {
+            await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
+            concurrencyLeaseToken = undefined;
+          }
           const deferUntil = (error as any).expiresAt.getTime() + leaseDeferralMarginMs;
           logger.info('Lease not expired, deferring job', {
             taskId,
@@ -208,6 +263,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         if (scheduleLeaseToken && currentTask.scheduleId) {
           await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
         }
+        if (concurrencyLeaseToken && tenantRepo) {
+          await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
+        }
         return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
       } finally {
         tracing.endSpan(reclaimSpan);
@@ -221,6 +279,10 @@ export function createProcessTask(deps: ProcessTaskDeps) {
           await taskRepo.renewClaim(taskId, claimToken);
           if (scheduleLeaseToken && currentTask.scheduleId) {
             await scheduleRepo.renewExecutionLease(currentTask.scheduleId, scheduleLeaseToken, scheduleLeaseDurationMs);
+          }
+          if (concurrencyLeaseToken && tenantRepo) {
+            const concurrencyLeaseDurationMs = Math.min(taskRepo.claimTtl, scheduleLeaseDurationMs);
+            await tenantRepo.renewConcurrencyLease(concurrencyLeaseToken, concurrencyLeaseDurationMs);
           }
           logger.debug('Lease renewed', { taskId });
         } catch (renewError) {
@@ -276,6 +338,10 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken);
         scheduleLeaseToken = undefined;
       }
+      if (concurrencyLeaseToken && tenantRepo) {
+        await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken);
+        concurrencyLeaseToken = undefined;
+      }
       workerMetrics.jobsCompleted++;
       logger.info('Task durably completed', { taskId });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
@@ -330,6 +396,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       }
       if (scheduleLeaseToken && currentTask.scheduleId) {
         await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
+      }
+      if (concurrencyLeaseToken && tenantRepo) {
+        await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
       }
     }
   };
