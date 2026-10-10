@@ -3,6 +3,7 @@ import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types';
 import { assertValidTransition } from '../state-machine';
 import { generateId } from '../utils';
 import { injectTraceContext } from '../telemetry/propagation';
+import { computeIdempotencyHash, IdempotencyConflictError, QuotaExceededError } from './tenant-repository';
 
 export interface CreateTaskInput {
   name: string;
@@ -11,14 +12,34 @@ export interface CreateTaskInput {
   maxRetries: number;
 }
 
+export interface AcceptTaskInput {
+  tenantId: string;
+  name: string;
+  priority: TaskPriority;
+  payload: Record<string, unknown>;
+  maxRetries: number;
+  idempotencyKey?: string;
+  billingPeriodStart: Date;
+  maxJobsPerPeriod: number;
+  scheduledFor?: string;
+  scheduleId?: string;
+}
+
+export interface AcceptTaskResult {
+  task: Task;
+  idempotent: boolean;
+  outboxEventId?: string;
+}
+
 export interface TaskWithOutbox {
   task: Task;
   outboxEvent: OutboxEvent;
 }
 
-function rowToTask(row: Record<string, unknown>): Task {
+export function rowToTask(row: Record<string, unknown>): Task {
   return {
     id: row.id as string,
+    tenantId: (row.tenant_id as string) || '',
     name: row.name as string,
     status: row.status as TaskStatus,
     priority: row.priority as TaskPriority,
@@ -37,6 +58,8 @@ function rowToTask(row: Record<string, unknown>): Task {
     claimedBy: (row.claimed_by as string) || undefined,
     claimToken: (row.claim_token as string) || undefined,
     claimExpiresAt: row.claim_expires_at ? new Date(row.claim_expires_at as string) : undefined,
+    idempotencyKey: (row.idempotency_key as string) || undefined,
+    idempotencyHash: (row.idempotency_hash as string) || undefined,
   };
 }
 
@@ -377,6 +400,148 @@ export class TaskRepository {
   async getTaskCount(): Promise<number> {
     const result = await this.pool.query('SELECT COUNT(*)::int as count FROM tasks');
     return result.rows[0].count;
+  }
+
+  async acceptTask(input: AcceptTaskInput): Promise<AcceptTaskResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      if (input.idempotencyKey) {
+        const existing = await client.query(
+          `SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2`,
+          [input.tenantId, input.idempotencyKey],
+        );
+        if (existing.rows.length > 0) {
+          const hash = computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.scheduledFor, input.scheduleId);
+          if (existing.rows[0].idempotency_hash !== hash) {
+            await client.query('ROLLBACK');
+            throw new IdempotencyConflictError(input.tenantId, input.idempotencyKey);
+          }
+          await client.query('COMMIT');
+          return { task: rowToTask(existing.rows[0]), idempotent: true };
+        }
+      }
+
+      const usageResult = await client.query(
+        `INSERT INTO tenant_usage (id, tenant_id, billing_period_start, accepted_jobs, compute_units, storage_mb, created_at, updated_at)
+         VALUES ($1, $2, $3, 0, 0, 0, NOW(), NOW())
+         ON CONFLICT (tenant_id, billing_period_start) DO UPDATE SET updated_at = NOW()
+         RETURNING accepted_jobs`,
+        [generateId(), input.tenantId, input.billingPeriodStart],
+      );
+
+      const currentJobs = usageResult.rows[0].accepted_jobs as number;
+      if (currentJobs >= input.maxJobsPerPeriod) {
+        await client.query('ROLLBACK');
+        throw new QuotaExceededError(input.tenantId, input.maxJobsPerPeriod, currentJobs);
+      }
+
+      await client.query(
+        `UPDATE tenant_usage SET accepted_jobs = accepted_jobs + 1, updated_at = NOW()
+         WHERE tenant_id = $1 AND billing_period_start = $2`,
+        [input.tenantId, input.billingPeriodStart],
+      );
+
+      const taskId = generateId();
+      const outboxId = generateId();
+      const traceCtx = injectTraceContext();
+      const hasTraceContext = Object.keys(traceCtx).length > 0;
+      const idempotencyHash = input.idempotencyKey
+        ? computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.scheduledFor, input.scheduleId)
+        : null;
+
+      const taskResult = await client.query(
+        `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version,
+           idempotency_key, idempotency_hash, created_at, updated_at)
+         VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, 0, 1, $7, $8, NOW(), NOW())
+         RETURNING *`,
+        [taskId, input.tenantId, input.name, input.priority,
+         JSON.stringify(input.payload), input.maxRetries,
+         input.idempotencyKey ?? null, idempotencyHash],
+      );
+
+      const outboxPayload = {
+        taskId,
+        taskName: input.name,
+        priority: input.priority,
+        payload: input.payload,
+        maxRetries: input.maxRetries,
+      };
+
+      await client.query(
+        `INSERT INTO outbox_events (id, task_id, event_type, payload, status, attempts, created_at, trace_context)
+         VALUES ($1, $2, 'TASK_CREATED', $3, 'PENDING', 0, NOW(), $4)`,
+        [outboxId, taskId, JSON.stringify(outboxPayload), hasTraceContext ? JSON.stringify(traceCtx) : null],
+      );
+
+      await client.query('COMMIT');
+      return { task: rowToTask(taskResult.rows[0]), idempotent: false, outboxEventId: outboxId };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getTaskForTenant(taskId: string, tenantId: string): Promise<Task | null> {
+    const result = await this.pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND tenant_id = $2',
+      [taskId, tenantId],
+    );
+    if (result.rows.length === 0) return null;
+    return rowToTask(result.rows[0]);
+  }
+
+  async listTasksForTenant(tenantId: string, page: number, pageSize: number): Promise<{ items: Task[]; total: number }> {
+    const offset = (page - 1) * pageSize;
+    const [itemsResult, countResult] = await Promise.all([
+      this.pool.query(
+        'SELECT * FROM tasks WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
+        [tenantId, pageSize, offset],
+      ),
+      this.pool.query('SELECT COUNT(*)::int as count FROM tasks WHERE tenant_id = $1', [tenantId]),
+    ]);
+    return {
+      items: itemsResult.rows.map(rowToTask),
+      total: countResult.rows[0].count,
+    };
+  }
+
+  async cancelTaskForTenant(taskId: string, tenantId: string): Promise<Task> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const lockResult = await client.query(
+        'SELECT * FROM tasks WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+        [taskId, tenantId],
+      );
+
+      if (lockResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Task ${taskId} not found for tenant ${tenantId}`);
+      }
+
+      const current = rowToTask(lockResult.rows[0]);
+      assertValidTransition(current.status, 'CANCELLED');
+
+      const updateResult = await client.query(
+        `UPDATE tasks SET status = 'CANCELLED', version = version + 1, updated_at = NOW(),
+           claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
+         WHERE id = $1 RETURNING *`,
+        [taskId],
+      );
+
+      await client.query('COMMIT');
+      return rowToTask(updateResult.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
 

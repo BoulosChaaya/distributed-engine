@@ -3,6 +3,7 @@ export type TaskPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface Task {
   id: string;
+  tenantId: string;
   name: string;
   status: TaskStatus;
   priority: TaskPriority;
@@ -21,6 +22,8 @@ export interface Task {
   claimedBy?: string;
   claimToken?: string;
   claimExpiresAt?: Date;
+  idempotencyKey?: string;
+  idempotencyHash?: string;
 }
 
 export type ScheduleStatus = 'ACTIVE' | 'PAUSED' | 'DISABLED';
@@ -29,6 +32,7 @@ export type OverlapPolicy = 'ALLOW_OVERLAP' | 'FORBID_OVERLAP';
 
 export interface RecurringSchedule {
   id: string;
+  tenantId: string;
   name: string;
   taskName: string;
   taskPriority: TaskPriority;
@@ -79,6 +83,76 @@ export interface PaginatedResponse<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+}
+
+export type TenantStatus = 'ACTIVE' | 'SUSPENDED';
+
+export interface Plan {
+  id: string;
+  name: string;
+  rateLimit: number;
+  maxConcurrentExecutions: number;
+  maxJobsPerPeriod: number;
+  billingPeriodDays: number;
+  maxComputeUnitsPerPeriod: number;
+  maxStorageMb: number;
+  weight: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Tenant {
+  id: string;
+  name: string;
+  status: TenantStatus;
+  planId: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface TenantOverride {
+  id: string;
+  tenantId: string;
+  rateLimit?: number;
+  maxConcurrentExecutions?: number;
+  maxJobsPerPeriod?: number;
+  billingPeriodDays?: number;
+  maxComputeUnitsPerPeriod?: number;
+  maxStorageMb?: number;
+  weight?: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface TenantUsage {
+  id: string;
+  tenantId: string;
+  billingPeriodStart: Date;
+  acceptedJobs: number;
+  computeUnits: number;
+  storageMb: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface TenantConcurrencyLease {
+  id: string;
+  tenantId: string;
+  taskId: string;
+  workerId: string;
+  leaseToken: string;
+  expiresAt: Date;
+  createdAt: Date;
+}
+
+export interface EffectiveLimits {
+  rateLimit: number;
+  maxConcurrentExecutions: number;
+  maxJobsPerPeriod: number;
+  billingPeriodDays: number;
+  maxComputeUnitsPerPeriod: number;
+  maxStorageMb: number;
+  weight: number;
 }
 
 export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED';

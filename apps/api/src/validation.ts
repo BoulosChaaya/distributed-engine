@@ -53,6 +53,31 @@ export const SetScheduleStatusSchema = z.object({
 
 export type SetScheduleStatusInput = z.infer<typeof SetScheduleStatusSchema>;
 
+export const TenantSubmitTaskSchema = z.object({
+  name: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
+  payload: z.record(z.unknown()).optional().default({}),
+  priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
+  maxRetries: z.number().int().min(0).max(10).optional().default(3),
+  idempotencyKey: z.string().max(255).optional(),
+  scheduledFor: z.string().datetime().optional(),
+});
+
+export type TenantSubmitTaskInput = z.infer<typeof TenantSubmitTaskSchema>;
+
+export const TenantCreateScheduleSchema = z.object({
+  name: z.string().min(1, 'Schedule name is required').max(255, 'Schedule name too long'),
+  taskName: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
+  taskPriority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
+  taskPayload: z.record(z.unknown()).optional().default({}),
+  taskMaxRetries: z.number().int().min(0).max(10).optional().default(3),
+  cronExpression: z.string().min(1, 'Cron expression is required'),
+  timezone: z.string().min(1, 'Timezone is required').default('UTC'),
+  misfirePolicy: z.enum(['CATCH_UP_ALL', 'SKIP_MISSED', 'RUN_ONCE']).optional().default('SKIP_MISSED'),
+  overlapPolicy: z.enum(['ALLOW_OVERLAP', 'FORBID_OVERLAP']).optional().default('ALLOW_OVERLAP'),
+});
+
+export type TenantCreateScheduleInput = z.infer<typeof TenantCreateScheduleSchema>;
+
 export class ValidationError extends Error {
   constructor(public errors: z.ZodError) {
     super('Validation error');
