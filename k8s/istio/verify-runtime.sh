@@ -53,9 +53,9 @@ skip() { echo "  SKIP: $1"; ((SKIP++)); }
 critical_skip() { echo "  SKIP (CRITICAL): $1"; ((SKIP++)); ((CRITICAL_SKIP++)); }
 header() { echo ""; echo "=== $1 ==="; }
 
-# Resolve Gateway address (IP or hostname) from the Gateway-created Service.
+# Discover Gateway address (IP or hostname) from the Gateway-created Service.
 # Tries both current and legacy Istio labels for Service discovery.
-# Sets GW_ADDR or leaves it empty.
+# Returns the discovered address or empty string.
 resolve_gateway_addr() {
   local gw_addr=""
   # Try current label first
@@ -75,6 +75,18 @@ resolve_gateway_addr() {
       -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
   fi
   echo "$gw_addr"
+}
+
+# Resolve effective Gateway address for tests that route through the Gateway.
+# Priority: GW_ADDR env var (explicit override) > auto-discovered address.
+# GW_ADDR must point at the Gateway proxy (e.g., via port-forward to the
+# Gateway Service), never directly at the API Service or pod.
+effective_gateway_addr() {
+  if [ -n "${GW_ADDR:-}" ]; then
+    echo "$GW_ADDR"
+    return
+  fi
+  resolve_gateway_addr
 }
 
 # Discover Gateway pod SA. Tries both label conventions.
@@ -289,10 +301,13 @@ verify_authz_positive() {
 
   # Gateway → API authorized path (requires Gateway address)
   local gw_addr
-  gw_addr=$(resolve_gateway_addr)
+  gw_addr=$(effective_gateway_addr)
   if [ -n "$gw_addr" ]; then
     echo ""
     echo "  Gateway authorization positive test (Gateway → API via mesh):"
+    if [ -n "${GW_ADDR:-}" ]; then
+      echo "    Using GW_ADDR override: $gw_addr"
+    fi
     local gw_live
     gw_live=$(wget -qO- --timeout=5 "http://${gw_addr}/live" 2>/dev/null || true)
     if echo "$gw_live" | grep -q '"success":true'; then
@@ -312,7 +327,7 @@ verify_authz_positive() {
       fi
     fi
   else
-    critical_skip "Gateway → API positive authorization test (no Gateway address available)"
+    critical_skip "Gateway → API positive authorization test (no Gateway address available; set GW_ADDR to override)"
   fi
 }
 
@@ -406,7 +421,7 @@ EOF
   # Positive control: verify API is reachable through the authorized Gateway path
   local api_reachable="unknown"
   local gw_addr
-  gw_addr=$(resolve_gateway_addr)
+  gw_addr=$(effective_gateway_addr)
   if [ -n "$gw_addr" ]; then
     local gw_live
     gw_live=$(wget -qO- --timeout=5 "http://${gw_addr}/live" 2>/dev/null || true)
@@ -454,18 +469,23 @@ verify_e2e() {
   echo "  This test submits and polls a task through the Gateway ingress."
   echo "  Tested flow: Client → Gateway → API → PG/Outbox → Redis/BullMQ → Worker → PG → API via Gateway"
 
-  # Resolve Gateway address
+  # Resolve Gateway address: GW_ADDR override takes priority over auto-discovery
   local gw_addr
-  gw_addr=$(resolve_gateway_addr)
+  gw_addr=$(effective_gateway_addr)
 
   if [ -z "$gw_addr" ]; then
-    critical_skip "Gateway E2E test: no Gateway address available (pending LoadBalancer or no Gateway Service)"
+    critical_skip "Gateway E2E test: no Gateway address available (no LoadBalancer IP/hostname and GW_ADDR not set)"
     echo "  The Gateway E2E test requires a reachable Gateway address."
     echo "  This test cannot fall back to API localhost — that would bypass the Gateway."
+    echo "  Set GW_ADDR to a port-forwarded Gateway Service address (see README)."
     return
   fi
 
-  echo "  Gateway address: $gw_addr"
+  if [ -n "${GW_ADDR:-}" ]; then
+    echo "  Gateway address: $gw_addr (from GW_ADDR override)"
+  else
+    echo "  Gateway address: $gw_addr (auto-discovered from Gateway Service)"
+  fi
 
   # Determine how to reach the Gateway.
   # Prefer direct access from the verification runner; fall back to in-cluster
@@ -495,10 +515,6 @@ verify_e2e() {
       return
     fi
   fi
-
-  # Allow overriding the Gateway address via environment variable
-  # (e.g., when using port-forward: GW_ADDR=localhost:8080 ./verify-runtime.sh e2e)
-  gw_addr="${GW_ADDR:-$gw_addr}"
 
   # Create task through the Gateway
   # Schema from apps/api/src/validation.ts — SubmitTaskSchema:
