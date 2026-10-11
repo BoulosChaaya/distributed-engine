@@ -1,40 +1,6 @@
+import { parseStrictInt, parseStrictIntInRange } from '../config';
+
 describe('parseStrictInt', () => {
-  let parseStrictInt: (value: string | undefined, defaultValue: number, name: string) => number;
-  let parseStrictIntInRange: (
-    value: string | undefined,
-    defaultValue: number,
-    name: string,
-    min: number,
-    max: number,
-  ) => number;
-
-  beforeAll(async () => {
-    // Import the functions by extracting from the module
-    // Since these are not exported from index.ts, we re-implement them here for testing
-    // This matches the exact implementation in index.ts
-    parseStrictInt = (value, defaultValue, name) => {
-      if (value === undefined || value === '') {
-        return defaultValue;
-      }
-      if (!/^-?\d+$/.test(value)) {
-        throw new Error(`Invalid integer for ${name}: "${value}"`);
-      }
-      const parsed = Number(value);
-      if (!Number.isSafeInteger(parsed)) {
-        throw new Error(`Value out of safe integer range for ${name}: "${value}"`);
-      }
-      return parsed;
-    };
-
-    parseStrictIntInRange = (value, defaultValue, name, min, max) => {
-      const parsed = parseStrictInt(value, defaultValue, name);
-      if (parsed < min || parsed > max) {
-        throw new Error(`${name} must be between ${min} and ${max}, got ${parsed}`);
-      }
-      return parsed;
-    };
-  });
-
   describe('valid inputs', () => {
     it('returns default when value is undefined', () => {
       expect(parseStrictInt(undefined, 5432, 'POSTGRES_PORT')).toBe(5432);

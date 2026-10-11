@@ -17,34 +17,7 @@ import {
 } from '@repo/shared';
 import { randomUUID } from 'crypto';
 import { createProcessTask, computeRenewalInterval, validateScheduleLeaseDuration } from './process-task';
-
-function parseStrictInt(value: string | undefined, defaultValue: number, name: string): number {
-  if (value === undefined || value === '') {
-    return defaultValue;
-  }
-  if (!/^-?\d+$/.test(value)) {
-    throw new Error(`Invalid integer for ${name}: "${value}"`);
-  }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`Value out of safe integer range for ${name}: "${value}"`);
-  }
-  return parsed;
-}
-
-function parseStrictIntInRange(
-  value: string | undefined,
-  defaultValue: number,
-  name: string,
-  min: number,
-  max: number,
-): number {
-  const parsed = parseStrictInt(value, defaultValue, name);
-  if (parsed < min || parsed > max) {
-    throw new Error(`${name} must be between ${min} and ${max}, got ${parsed}`);
-  }
-  return parsed;
-}
+import { parseStrictIntInRange } from './config';
 
 initTelemetry({
   serviceName: 'distributed-engine-worker',
@@ -69,88 +42,8 @@ const SCHEDULE_LEASE_DURATION_MS = parseStrictIntInRange(
 );
 const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5, 'QUEUE_CONCURRENCY', 1, 100);
 
-const pgPool = new Pool({
-  host: process.env.POSTGRES_HOST || 'localhost',
-  port: POSTGRES_PORT,
-  database: process.env.POSTGRES_DB || 'distributed_engine',
-  user: process.env.POSTGRES_USER || 'postgres',
-  password: process.env.POSTGRES_PASSWORD,
-  max: 10,
-});
-
-pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { reason: err.message }));
-
-const redisClient = new IORedis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: REDIS_PORT,
-  password: process.env.REDIS_PASSWORD,
-  maxRetriesPerRequest: null,
-});
-
-redisClient.on('error', (err) => logger.error('Redis connection error', { reason: err.message }));
-redisClient.on('connect', () => logger.info('Redis connected'));
-
-const taskRepo = new TaskRepository(pgPool);
-const scheduleRepo = new ScheduleRepository(pgPool);
-const tenantRepo = new TenantRepository(pgPool);
-const LEASE_DEFERRAL_MARGIN_MS = 2000;
-
-validateScheduleLeaseDuration(SCHEDULE_LEASE_DURATION_MS);
-
-const RENEWAL_INTERVAL = computeRenewalInterval(taskRepo.claimTtl, SCHEDULE_LEASE_DURATION_MS);
-
-logger.info('Renewal interval computed', {
-  taskClaimTtlMs: taskRepo.claimTtl,
-  scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
-  renewalIntervalMs: RENEWAL_INTERVAL,
-});
-
-const workerMetrics = {
-  id: WORKER_ID,
-  startTime: Date.now(),
-  jobsProcessed: 0,
-  jobsFailed: 0,
-  jobsCompleted: 0,
-};
-
-async function updateWorkerStatus() {
-  try {
-    const uptime = Math.floor((Date.now() - workerMetrics.startTime) / 1000);
-    const status = {
-      id: workerMetrics.id,
-      uptime,
-      jobsProcessed: workerMetrics.jobsProcessed,
-      jobsCompleted: workerMetrics.jobsCompleted,
-      jobsFailed: workerMetrics.jobsFailed,
-      status: 'healthy',
-      lastHeartbeat: new Date().toISOString(),
-    };
-
-    await redisClient.setex(
-      `worker:${workerMetrics.id}`,
-      30,
-      JSON.stringify(status),
-    );
-  } catch (error) {
-    logger.warn('Failed to update worker status', { reason: String(error) });
-  }
-}
-
-const processTask = createProcessTask({
-  taskRepo,
-  scheduleRepo,
-  tenantRepo,
-  tracing,
-  logger,
-  workerId: WORKER_ID,
-  scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
-  leaseDeferralMarginMs: LEASE_DEFERRAL_MARGIN_MS,
-  renewalIntervalMs: RENEWAL_INTERVAL,
-  workerMetrics,
-  ClaimNotExpiredError,
-  DelayedError,
-});
-
+let pgPool: Pool | null = null;
+let redisClient: IORedis | null = null;
 let worker: Worker | undefined;
 let healthServer: http.Server | undefined;
 let heartbeatInterval: NodeJS.Timeout | undefined;
@@ -169,10 +62,12 @@ async function gracefulShutdown(signal: string) {
     clearInterval(heartbeatInterval);
   }
 
-  try {
-    await redisClient.del(`worker:${WORKER_ID}`);
-  } catch (error) {
-    logger.warn('Failed to remove worker status', { reason: String(error) });
+  if (redisClient) {
+    try {
+      await redisClient.del(`worker:${WORKER_ID}`);
+    } catch (error) {
+      logger.warn('Failed to remove worker status', { reason: String(error) });
+    }
   }
 
   const shutdownTimeout = setTimeout(() => {
@@ -193,18 +88,22 @@ async function gracefulShutdown(signal: string) {
     logger.warn('Error closing worker', { reason: String(error) });
   }
 
-  try {
-    redisClient.disconnect();
-    logger.info('Redis disconnected');
-  } catch (error) {
-    logger.warn('Error disconnecting Redis', { reason: String(error) });
+  if (redisClient) {
+    try {
+      redisClient.disconnect();
+      logger.info('Redis disconnected');
+    } catch (error) {
+      logger.warn('Error disconnecting Redis', { reason: String(error) });
+    }
   }
 
-  try {
-    await pgPool.end();
-    logger.info('PostgreSQL pool closed');
-  } catch (error) {
-    logger.warn('Error closing PostgreSQL pool', { reason: String(error) });
+  if (pgPool) {
+    try {
+      await pgPool.end();
+      logger.info('PostgreSQL pool closed');
+    } catch (error) {
+      logger.warn('Error closing PostgreSQL pool', { reason: String(error) });
+    }
   }
 
   await shutdownTelemetry();
@@ -218,6 +117,90 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 (async () => {
+  pgPool = new Pool({
+    host: process.env.POSTGRES_HOST || 'localhost',
+    port: POSTGRES_PORT,
+    database: process.env.POSTGRES_DB || 'distributed_engine',
+    user: process.env.POSTGRES_USER || 'postgres',
+    password: process.env.POSTGRES_PASSWORD,
+    max: 10,
+  });
+
+  pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { reason: err.message }));
+
+  redisClient = new IORedis({
+    host: process.env.REDIS_HOST || 'localhost',
+    port: REDIS_PORT,
+    password: process.env.REDIS_PASSWORD,
+    maxRetriesPerRequest: null,
+  });
+
+  redisClient.on('error', (err) => logger.error('Redis connection error', { reason: err.message }));
+  redisClient.on('connect', () => logger.info('Redis connected'));
+
+  const taskRepo = new TaskRepository(pgPool);
+  const scheduleRepo = new ScheduleRepository(pgPool);
+  const tenantRepo = new TenantRepository(pgPool);
+  const LEASE_DEFERRAL_MARGIN_MS = 2000;
+
+  validateScheduleLeaseDuration(SCHEDULE_LEASE_DURATION_MS);
+
+  const RENEWAL_INTERVAL = computeRenewalInterval(taskRepo.claimTtl, SCHEDULE_LEASE_DURATION_MS);
+
+  logger.info('Renewal interval computed', {
+    taskClaimTtlMs: taskRepo.claimTtl,
+    scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
+    renewalIntervalMs: RENEWAL_INTERVAL,
+  });
+
+  const workerMetrics = {
+    id: WORKER_ID,
+    startTime: Date.now(),
+    jobsProcessed: 0,
+    jobsFailed: 0,
+    jobsCompleted: 0,
+  };
+
+  const localRedisClient = redisClient;
+
+  async function updateWorkerStatus() {
+    try {
+      const uptime = Math.floor((Date.now() - workerMetrics.startTime) / 1000);
+      const status = {
+        id: workerMetrics.id,
+        uptime,
+        jobsProcessed: workerMetrics.jobsProcessed,
+        jobsCompleted: workerMetrics.jobsCompleted,
+        jobsFailed: workerMetrics.jobsFailed,
+        status: 'healthy',
+        lastHeartbeat: new Date().toISOString(),
+      };
+
+      await localRedisClient.setex(
+        `worker:${workerMetrics.id}`,
+        30,
+        JSON.stringify(status),
+      );
+    } catch (error) {
+      logger.warn('Failed to update worker status', { reason: String(error) });
+    }
+  }
+
+  const processTask = createProcessTask({
+    taskRepo,
+    scheduleRepo,
+    tenantRepo,
+    tracing,
+    logger,
+    workerId: WORKER_ID,
+    scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
+    leaseDeferralMarginMs: LEASE_DEFERRAL_MARGIN_MS,
+    renewalIntervalMs: RENEWAL_INTERVAL,
+    workerMetrics,
+    ClaimNotExpiredError,
+    DelayedError,
+  });
+
   await runMigrations(pgPool);
   logger.info('Database migrations complete');
 
@@ -279,7 +262,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
       });
     },
     {
-      connection: redisClient,
+      connection: localRedisClient,
       concurrency: QUEUE_CONCURRENCY,
       maxStalledCount: 2,
       stalledInterval: 5000,
@@ -323,16 +306,20 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     process.exit(1);
   }, 10000);
 
-  try {
-    redisClient.disconnect();
-  } catch (cleanupErr) {
-    logger.warn('Fatal cleanup: error disconnecting Redis', { reason: String(cleanupErr) });
+  if (redisClient) {
+    try {
+      redisClient.disconnect();
+    } catch (cleanupErr) {
+      logger.warn('Fatal cleanup: error disconnecting Redis', { reason: String(cleanupErr) });
+    }
   }
 
-  try {
-    await pgPool.end();
-  } catch (cleanupErr) {
-    logger.warn('Fatal cleanup: error closing PostgreSQL pool', { reason: String(cleanupErr) });
+  if (pgPool) {
+    try {
+      await pgPool.end();
+    } catch (cleanupErr) {
+      logger.warn('Fatal cleanup: error closing PostgreSQL pool', { reason: String(cleanupErr) });
+    }
   }
 
   clearTimeout(fatalCleanupTimeout);
