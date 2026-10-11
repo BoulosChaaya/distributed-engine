@@ -25,7 +25,7 @@ Prometheus/Grafana in K8s, enterprise secret management, public HTTPS.
 |---|---|---|
 | 1 | Redis auth | `--requirepass $(REDISCLI_AUTH)` with Secret. `/proc/1/cmdline` exposure documented. |
 | 2 | Redis memory | `--maxmemory 400mb --maxmemory-policy noeviction` |
-| 3 | PG SecurityContext | Allow root start (gosu). Drop `NET_RAW`. No `runAsNonRoot`. No `readOnlyRootFilesystem`. |
+| 3 | PG SecurityContext | Root start (gosu drops to postgres). `allowPrivilegeEscalation: false` (proposed — requires live acceptance gate). Drop `NET_RAW`. No `runAsNonRoot`. No `readOnlyRootFilesystem`. |
 | 4 | API/Worker SecurityContext | `runAsNonRoot: true`, uid 1001, `readOnlyRootFilesystem: true`, drop ALL, emptyDir `/tmp`. |
 | 5 | Redis SecurityContext | `runAsNonRoot: true`, uid 999, `readOnlyRootFilesystem: true`, drop ALL. |
 | 6 | Worker startup order | Config → clients → migrations → health server → BullMQ Worker → handlers → heartbeat. |
@@ -34,9 +34,9 @@ Prometheus/Grafana in K8s, enterprise secret management, public HTTPS.
 | 9 | Config validation | Strict: regex integer parse, range check, throw on malformed. Unset → default. |
 | 10 | PG connections | `max_connections=150`. Pools: API=20, Worker=10. |
 | 11 | Recovery runbook | Guarded manual reset with inline duplicate-execution danger notice. |
-| 12 | CI (PR) | `pnpm install --frozen-lockfile` → `pnpm run build` → `pnpm test` (PG+Redis services) → Docker build verify. |
+| 12 | CI (PR) | `pnpm install --frozen-lockfile` → `pnpm run build` → configure Redis auth → `pnpm test` (PG+Redis services, `REDIS_PASSWORD` set) → Docker build verify. |
 | 13 | CI (main) | Same as PR + GHCR publish with Git SHA tag. |
-| 14 | Image identity | `ghcr.io/bouloschaaya/distributed-engine-{api,worker}:<full-git-sha>`. No `latest`. |
+| 14 | Image identity | `ghcr.io/bouloschaaya/distributed-engine-{api,worker}:<full-git-sha>` (commit-addressed tag, mutable). Deployment verified by pod `imageID` (OCI digest, immutable). No `latest`. |
 | 15 | Deployment | Manual operator: edit manifest image → `kubectl apply` → verify. |
 | 16 | Backup | `pg_dump` custom format → restore drill to temp DB → verify representative invariants. |
 | 17 | Topic 16 gate | `verify-runtime.sh all` exit 0 required before LoadBalancer → ClusterIP. |
@@ -177,7 +177,30 @@ a crashed process all fail this check.
 ### 4.4 postgres.yaml
 
 - Add command: `["postgres", "-c", "max_connections=150"]`
-- Add securityContext: `allowPrivilegeEscalation: true` (required for gosu), drop `NET_RAW` capability
+- Add securityContext: `allowPrivilegeEscalation: false` (proposed), drop `NET_RAW` capability
+
+**`allowPrivilegeEscalation: false` rationale:** This sets the Linux `no_new_privs` bit
+(via `prctl PR_SET_NO_NEW_PRIVS`). `no_new_privs` only constrains what `execve()` can
+grant — it prevents setuid/setgid bits on binaries from elevating privileges during exec.
+It does NOT block direct `setuid(2)`/`setgid(2)` syscalls from a process already running
+as root. `gosu` works by calling `setuid()`/`setgid()` to DROP from root to the postgres
+user (UID 999), then calling `execve()` to replace itself with the target process. Since
+the privilege change is a voluntary drop via syscall (not a setuid-binary escalation),
+`no_new_privs` does not intercept it. The subsequent exec runs as the already-switched
+UID 999 and cannot re-escalate — which is the desired security outcome.
+
+**Evidence:** Linux kernel `no_new_privs` documentation states "it does not prevent
+privilege changes that do not involve execve(). An appropriately privileged task can
+still call setuid(2)." `gosu` source confirms it uses `syscall.Setgroups`/`Setgid`/`Setuid`
+then `syscall.Exec`, and explicitly rejects running with the setuid bit set on its own binary.
+
+**Classification:** Strong inference from kernel documentation and gosu source analysis.
+Not yet verified in live Kubernetes runtime.
+
+**Live acceptance gate (required before freeze):** Deploy `postgres:16-alpine` pod with
+`allowPrivilegeEscalation: false`, `drop: [NET_RAW]`, no `runAsNonRoot`, fresh PVC.
+Verify: postgres starts, accepts connections, `initdb` completes on fresh volume.
+If the gate fails, fall back to `allowPrivilegeEscalation: true` and document why.
 
 ### 4.5 New: k8s/redis-secret.yaml
 
@@ -213,20 +236,46 @@ same as PR
 
 ### 5.2 CI environment
 
-Service containers match test defaults exactly:
+Service containers:
 
 | Service | Image | Credentials | Env vars |
 |---|---|---|---|
 | PostgreSQL | `postgres:16-alpine` | user `postgres`, password `postgres`, db `distributed_engine_test` | Match `TEST_POSTGRES_URL` default |
-| Redis | `redis:7-alpine` | No auth | Match test default (no `TEST_REDIS_PASSWORD` used anywhere) |
+| Redis | `redis:7-alpine` | Password set via `CONFIG SET requirepass` after startup | `REDIS_PASSWORD=testpassword123` |
 
 Tests connect via `TEST_POSTGRES_URL` (default `postgresql://postgres:postgres@localhost:5432/distributed_engine_test`) and
-`TEST_REDIS_HOST`/`TEST_REDIS_PORT` (default `localhost:6379`). No test uses `REDIS_PASSWORD`.
+`TEST_REDIS_HOST`/`TEST_REDIS_PORT` (default `localhost:6379`).
 
-CI Redis intentionally runs without auth. The `REDIS_PASSWORD` application wiring
-(worker/API connecting with a password) is NOT exercised in the integration test suite.
-This is acceptable: the wiring is a single IORedis constructor option, and
-Kubernetes live verification tests authenticated Redis connectivity.
+### 5.2.1 CI Redis authentication
+
+CI Redis is configured with a password to exercise the authenticated connection path:
+
+1. Redis service starts without auth (GitHub Actions `services` does not support `command:`)
+2. A CI step runs `docker exec ${{ job.services.redis.id }} redis-cli CONFIG SET requirepass testpassword123`
+3. `REDIS_PASSWORD=testpassword123` is set as an environment variable for subsequent steps
+4. `pnpm test` runs with `REDIS_PASSWORD` available to the application code
+
+**Existing test IORedis constructors** (in `outbox-publisher.test.ts`, `bullmq-integration.test.ts`,
+`telemetry.test.ts`) currently create connections without a `password` option. These must be
+updated during implementation to read the password from the environment:
+
+```typescript
+const TEST_REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+// in IORedis constructor:
+redis = new IORedis({
+  host: TEST_REDIS_HOST,
+  port: TEST_REDIS_PORT,
+  password: TEST_REDIS_PASSWORD,   // undefined when unset (local dev without auth)
+  maxRetriesPerRequest: null,
+});
+```
+
+IORedis accepts `password: undefined` and skips AUTH — so the same constructor works
+both with CI Redis auth and local development without auth.
+
+This ensures CI exercises the same `REDIS_PASSWORD` → IORedis `password` path that
+production Kubernetes uses. The wiring gap is closed without test-specific Redis
+configuration diverging from the application path.
 
 ### 5.3 Node/pnpm versions
 
@@ -404,15 +453,19 @@ Restore: `pg_restore` to temporary database `distributed_engine_restore_test`
 
 ### 9.2 Verification queries
 
-Against the restored database:
+Record source values BEFORE backup, then compare against the restored database:
 
-1. `schema_migrations` row count matches source
-2. `tasks` table has data, status distribution checked
-3. `outbox_events` table has data
-4. CHECK constraints (`valid_status`, `valid_priority`) exist
-5. Indexes (`idx_tasks_status`, `idx_tasks_created_at`) exist
-6. Foreign key constraints intact
-7. `tenants`, `recurring_schedules` checked if populated
+| Invariant | Source query (before backup) | Restored query | Pass condition |
+|---|---|---|---|
+| Schema migration count | `SELECT count(*) FROM schema_migrations` | Same query on restored DB | Exact match |
+| Task count | `SELECT count(*) FROM tasks` | Same query on restored DB | Exact match |
+| Task status distribution | `SELECT status, count(*) FROM tasks GROUP BY status` | Same query on restored DB | Exact match per status |
+| Outbox event count | `SELECT count(*) FROM outbox_events` | Same query on restored DB | Exact match |
+| Tenant count (if populated) | `SELECT count(*) FROM tenants` | Same query on restored DB | Exact match |
+| Schedule count (if populated) | `SELECT count(*) FROM recurring_schedules` | Same query on restored DB | Exact match |
+| CHECK constraints | `SELECT conname FROM pg_constraint WHERE contype='c' AND conrelid='tasks'::regclass` | Same query on restored DB | Same constraint names |
+| Indexes | `SELECT indexname FROM pg_indexes WHERE tablename='tasks'` | Same query on restored DB | Same index names |
+| Foreign keys | `SELECT conname FROM pg_constraint WHERE contype='f'` | Same query on restored DB | Same constraint names |
 
 ### 9.3 What the drill demonstrates
 
@@ -452,7 +505,8 @@ in our live cluster, until that script passes.
 
 - `pnpm install --frozen-lockfile` succeeds
 - `pnpm run build` succeeds (TypeScript compilation)
-- `pnpm test` passes with PG+Redis service containers
+- Redis `CONFIG SET requirepass` step succeeds
+- `pnpm test` passes with PG+Redis (authenticated) service containers
 - `docker build -f Dockerfile.api .` succeeds
 - `docker build -f Dockerfile.worker .` succeeds
 
@@ -467,8 +521,9 @@ in our live cluster, until that script passes.
 - Redis reject unauth: `kubectl exec redis-0 -- env -u REDISCLI_AUTH redis-cli ping` → NOAUTH
 - Redis uid: `kubectl exec redis-0 -- id` → uid=999 (verify Alpine tag)
 - PG max_connections: `psql -c "SHOW max_connections;"` → 150
+- PG securityContext: fresh-PVC startup succeeds with `allowPrivilegeEscalation: false` (if gate fails, revert to `true` and update §4.4)
 - Worker pods: all pass startupProbe, livenessProbe active
-- Worker liveness (event-loop hang): `kubectl exec <pod> -- kill -STOP 2` → container restarts within ~30s (see §11.1)
+- Worker liveness (event-loop hang): `kubectl exec <pod> -- kill -STOP 2` → liveness probe fails within ~30s, container restarts within ~70s (see §11.1)
 - Worker crash recovery: `kubectl exec <pod> -- kill -9 2` → container restarts, startupProbe passes
 - API securityContext: verify non-root, read-only filesystem
 - Image identity: pod status `imageID` digest matches GHCR published digest for deployed SHA
@@ -527,10 +582,19 @@ This tests crash recovery, not liveness probe detection.
 
 ### GHCR / Deployment Identity
 
-- After GHCR push: record Git SHA tag + image digest
+Four distinct identifiers:
+
+| Identifier | Type | Example | Mutable? |
+|---|---|---|---|
+| Git SHA | Source commit identity | `a2c3085...` | No (git object) |
+| GHCR tag | Commit-addressed registry tag | `ghcr.io/.../worker:a2c3085...` | Yes (registry pointer) |
+| OCI digest | Content-addressed image identity | `sha256:abc123...` | No (content hash) |
+| Pod `imageID` | Runtime evidence of pulled image | `ghcr.io/...@sha256:abc123...` | No (kubelet-reported) |
+
+- After GHCR push: record both the Git SHA tag and the OCI digest from the push output
 - After deployment: `kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].imageID}'`
-- Verify pod imageID corresponds to the GHCR-published digest for the deployed SHA
-- Git SHA tag is a commit-addressed image tag (mutable registry reference). The digest is the immutable content-addressed identity.
+- Verify: the pod `imageID` digest matches the OCI digest published to GHCR for the deployed Git SHA
+- The Git SHA tag is a mutable registry pointer — it can be overwritten. The OCI digest is the immutable content-addressed identity. Deployment verification must compare digests, not tags.
 
 ### Rollback
 
@@ -548,7 +612,7 @@ This tests crash recovery, not liveness probe detection.
 1. No exactly-once execution — at-least-once delivery by design
 2. No PostgreSQL high availability — single StatefulSet replica
 3. No Redis high availability — single StatefulSet replica
-4. No automatic Redis-loss reconciliation — manual diagnostic procedure only
+4. No automatic Redis-loss reconciliation — recovery is a guarded manual operator procedure with explicit duplicate-execution and duplicate-side-effect risk
 5. No proven HPA-max capacity — requires capacity review before scaling
 6. No cross-region or multi-zone disaster recovery
 7. No public HTTPS — no domain/certificate supplied
@@ -558,7 +622,7 @@ This tests crash recovery, not liveness probe detection.
 11. No monitoring dashboards or alerting — OTel traces only, no Prometheus in K8s
 12. No SLA/SLO/SLI commitments
 13. Redis password visible in `/proc/1/cmdline` inside Redis container
-14. CI does not exercise `REDIS_PASSWORD` wiring — verified at K8s live deployment
+14. CI Redis uses `CONFIG SET requirepass` (not `--requirepass` startup flag) — exercises the application auth path but not the Redis server's startup-time authentication configuration
 
 **Accurate characterization:** Production-oriented deployment architecture
 demonstrating transactional outbox with at-least-once delivery, authenticated
@@ -580,6 +644,7 @@ documented single-replica, recovery, and capacity limitations.
 6. Add HTTP health server (port 9000, `/healthz`)
 7. Add health server close to shutdown sequence
 8. Write `apps/worker/src/__tests__/config.test.ts`
+9. Update test IORedis constructors to pass `password: process.env.REDIS_PASSWORD` (undefined-safe)
 
 ### Phase 2: Kubernetes manifests
 
@@ -587,7 +652,7 @@ documented single-replica, recovery, and capacity limitations.
 2. Update `k8s/redis.yaml` (auth, maxmemory, securityContext)
 3. Update `k8s/worker.yaml` (REDIS_PASSWORD, probes, securityContext, remove preStop, emptyDir)
 4. Update `k8s/api.yaml` (REDIS_PASSWORD, securityContext, emptyDir)
-5. Update `k8s/postgres.yaml` (max_connections, securityContext)
+5. Update `k8s/postgres.yaml` (max_connections, securityContext with `allowPrivilegeEscalation: false`)
 
 ### Phase 3: CI
 
