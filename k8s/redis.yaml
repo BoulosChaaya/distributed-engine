@@ -22,6 +22,12 @@ spec:
         ports:
         - containerPort: 6379
           name: redis
+        env:
+        - name: REDISCLI_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         resources:
           requests:
             memory: "256Mi"
@@ -38,6 +44,21 @@ spec:
           - "yes"
           - "--appendfsync"
           - "everysec"
+          - "--requirepass"
+          - "$(REDISCLI_AUTH)"
+          - "--maxmemory"
+          - "400mb"
+          - "--maxmemory-policy"
+          - "noeviction"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 999
+          runAsGroup: 1000
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
         livenessProbe:
           exec:
             command:

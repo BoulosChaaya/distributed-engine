@@ -21,6 +21,7 @@ spec:
         ports:
         - containerPort: 5432
           name: postgres
+        command: ["postgres", "-c", "max_connections=150"]
         env:
         - name: POSTGRES_DB
           value: "distributed_engine"
@@ -38,6 +39,11 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - NET_RAW
         volumeMounts:
         - name: postgres-data
           mountPath: /var/lib/postgresql/data

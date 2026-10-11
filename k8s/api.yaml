@@ -34,6 +34,10 @@ spec:
                   - api
               topologyKey: kubernetes.io/hostname
 
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
       containers:
       - name: api
         image: distributed-engine-api:0.1.0
@@ -51,6 +55,11 @@ spec:
           value: "redis.distributed-engine.svc.cluster.local"
         - name: REDIS_PORT
           value: "6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         - name: LOG_LEVEL
           value: "INFO"
         - name: GRACEFUL_SHUTDOWN_TIMEOUT_MS
@@ -76,6 +85,20 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
 
         livenessProbe:
           httpGet:

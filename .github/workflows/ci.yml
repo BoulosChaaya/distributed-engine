@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: distributed_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Configure Redis authentication
+        run: docker exec ${{ job.services.redis.id }} redis-cli CONFIG SET requirepass testpassword123
+
+      - name: Test
+        run: pnpm test
+        env:
+          TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/distributed_engine_test
+          TEST_REDIS_HOST: localhost
+          TEST_REDIS_PORT: 6379
+          REDIS_PASSWORD: testpassword123
+
+      - name: Build Docker images
+        run: |
+          docker build -f Dockerfile.api -t distributed-engine-api:ci .
+          docker build -f Dockerfile.worker -t distributed-engine-worker:ci .
+
+  publish-images:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        run: |
+          docker build -f Dockerfile.api \
+            -t ghcr.io/${{ github.repository_owner }}/distributed-engine-api:${{ github.sha }} \
+            .
+          docker push ghcr.io/${{ github.repository_owner }}/distributed-engine-api:${{ github.sha }}
+
+      - name: Build and push Worker image
+        run: |
+          docker build -f Dockerfile.worker \
+            -t ghcr.io/${{ github.repository_owner }}/distributed-engine-worker:${{ github.sha }} \
+            .
+          docker push ghcr.io/${{ github.repository_owner }}/distributed-engine-worker:${{ github.sha }}
+
+      - name: Output image references
+        run: |
+          echo "API image: ghcr.io/${{ github.repository_owner }}/distributed-engine-api:${{ github.sha }}"
+          echo "Worker image: ghcr.io/${{ github.repository_owner }}/distributed-engine-worker:${{ github.sha }}"
+          echo ""
+          echo "Inspect digests:"
+          docker inspect --format='{{index .RepoDigests 0}}' \
+            ghcr.io/${{ github.repository_owner }}/distributed-engine-api:${{ github.sha }} || true
+          docker inspect --format='{{index .RepoDigests 0}}' \
+            ghcr.io/${{ github.repository_owner }}/distributed-engine-worker:${{ github.sha }} || true
