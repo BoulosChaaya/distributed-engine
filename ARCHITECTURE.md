@@ -455,7 +455,9 @@ Workers have no inbound AuthorizationPolicy — they consume from Redis (outboun
 
 ### Gateway Ingress
 
-The Kubernetes Gateway API (`gatewayClassName: istio`) creates a mesh-aware ingress point. An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`. The Gateway runs in its own pod with the `engine-gateway-istio` ServiceAccount.
+The Kubernetes Gateway API (`gatewayClassName: istio`) creates a mesh-aware ingress point. Istio's controller generates a Deployment, Service, and ServiceAccount for the Gateway, named `<gateway-name>-<gateway-class-name>` (i.e., `engine-gateway-istio`). An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`.
+
+The `engine-gateway-istio` ServiceAccount is pre-created in `service-accounts.yaml`. Whether Istio adopts a pre-existing SA or always creates its own is not explicitly guaranteed by Istio's documentation — the supported mechanism for controlling Gateway infrastructure is `spec.infrastructure.parametersRef`. The runtime verification script (`verify-runtime.sh gateway-identity`) confirms at runtime that the actual Gateway pod uses the expected ServiceAccount before any authorization policy references it. Static YAML alone does not guarantee the runtime identity.
 
 During initial rollout, the existing API `type: LoadBalancer` service is preserved to avoid disrupting external access. The transition to Gateway-only ingress is a controlled step after verification.
 

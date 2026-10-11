@@ -7,7 +7,7 @@ Staged rollout of Istio Ambient mode for the distributed task execution engine.
 - **mTLS everywhere**: ztunnel encrypts all pod-to-pod traffic with mutual TLS. No sidecar injection required.
 - **Workload identity**: Each ServiceAccount gets a SPIFFE identity (`cluster.local/ns/<ns>/sa/<sa-name>`) issued by Istio CA.
 - **L4 authorization**: AuthorizationPolicies restrict which identities can reach which ports.
-- **Gateway ingress**: Kubernetes Gateway API replaces direct LoadBalancer access to internal services.
+- **Gateway ingress**: Kubernetes Gateway API provides mesh-aware ingress alongside the existing LoadBalancer.
 
 ## What This Does NOT Add
 
@@ -22,7 +22,7 @@ Staged rollout of Istio Ambient mode for the distributed task execution engine.
 - Kubernetes cluster (v1.28+ recommended for Gateway API support)
 - Istio installed in ambient mode (`istioctl install --set profile=ambient`)
 - Kubernetes Gateway API CRDs installed (`kubectl get crd gateways.gateway.networking.k8s.io`)
-- `istioctl` on PATH (for verification)
+- `istioctl` on PATH (for mTLS and ztunnel diagnostics)
 - Existing engine deployment operational (PostgreSQL, Redis, API, Worker all healthy)
 
 ## Manifest Inventory
@@ -102,14 +102,17 @@ kubectl get statefulset redis -n distributed-engine -o jsonpath='{.spec.template
 # ztunnel enrollment (requires istioctl)
 istioctl ztunnel-config workloads | grep distributed-engine
 
-# Functional check: API health
+# mTLS identity verification (requires istioctl)
+istioctl ztunnel-config certificates | grep distributed-engine
+
+# Component diagnostic: API health (API-local, not Gateway path)
 kubectl exec -n distributed-engine deploy/api -- wget -qO- http://localhost:3000/health
 # Expected: postgres=up, redis=up
 ```
 
 **Rollback**: Revert `serviceAccountName` lines from the four workload manifests and re-apply.
 
-**GO/NO-GO**: All pods are Running and Ready. API reports postgres=up and redis=up. ztunnel shows enrolled workloads.
+**GO/NO-GO**: All pods are Running and Ready. API-local health reports postgres=up and redis=up. ztunnel shows enrolled workloads and active certificates.
 
 Run automated enrollment verification:
 ```bash
@@ -127,7 +130,7 @@ Run automated enrollment verification:
 kubectl apply -f k8s/istio/gateway.yaml
 ```
 
-**Expected behavior**: Istio creates a Gateway pod using ServiceAccount `engine-gateway-istio`. An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`.
+**Expected behavior**: Istio creates a Gateway Deployment and Service. The generated resources are named `engine-gateway-istio` (convention: `<gateway-name>-<gateway-class-name>`). The Gateway pod uses the `engine-gateway-istio` ServiceAccount. An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`.
 
 **Positive verification**:
 ```bash
@@ -136,14 +139,29 @@ kubectl get gateway engine-gateway -n distributed-engine
 # STATUS column should show "Programmed"
 
 # Gateway pod identity (CRITICAL CHECK)
-kubectl get pods -n distributed-engine -l istio.io/gateway-name=engine-gateway \
+# Current Istio (1.22+) uses the standard Gateway API label:
+kubectl get pods -n distributed-engine \
+  -l gateway.networking.k8s.io/gateway-name=engine-gateway \
+  -o jsonpath='{.items[0].spec.serviceAccountName}'
+# If no pods found, try the legacy label:
+kubectl get pods -n distributed-engine \
+  -l istio.io/gateway-name=engine-gateway \
   -o jsonpath='{.items[0].spec.serviceAccountName}'
 # MUST be: engine-gateway-istio
-# If different, update authz-api.yaml before proceeding to Stage 5.
+# If the SA does not match, DO NOT proceed to Stage 5.
+# See "Gateway ServiceAccount" below for resolution.
 
-# Gateway external access
-kubectl get svc -n distributed-engine -l istio.io/gateway-name=engine-gateway
-# Note the EXTERNAL-IP
+# To see all labels on Gateway pods:
+kubectl get pods -n distributed-engine --show-labels | grep gateway
+
+# Gateway Service external access
+# Current label:
+kubectl get svc -n distributed-engine \
+  -l gateway.networking.k8s.io/gateway-name=engine-gateway
+# Legacy label:
+kubectl get svc -n distributed-engine \
+  -l istio.io/gateway-name=engine-gateway
+# Note the EXTERNAL-IP or HOSTNAME
 ```
 
 **Negative verification**: N/A — Gateway has no authorization policy yet.
@@ -153,7 +171,7 @@ kubectl get svc -n distributed-engine -l istio.io/gateway-name=engine-gateway
 kubectl delete -f k8s/istio/gateway.yaml
 ```
 
-**GO/NO-GO**: Gateway pod uses `engine-gateway-istio` ServiceAccount. Gateway is Programmed. External IP is assigned. The existing API LoadBalancer continues to work in parallel.
+**GO/NO-GO**: Gateway pod uses `engine-gateway-istio` ServiceAccount. Gateway is Programmed. External address is assigned. The existing API LoadBalancer continues to work in parallel.
 
 Run automated identity verification:
 ```bash
@@ -174,39 +192,52 @@ kubectl apply -f k8s/istio/authz-redis.yaml
 
 **Expected behavior**: PostgreSQL accepts connections only from api-sa and worker-sa on port 5432. Redis accepts connections only from api-sa and worker-sa on port 6379. All other identities are denied by ALLOW policy semantics (once an ALLOW policy applies, non-matching requests are implicitly denied).
 
-**Positive verification**:
+**Positive verification** (component diagnostics — API-local health):
 ```bash
-# API health (proves api-sa reaches both data stores)
+# API-local health check (proves api-sa reaches both data stores)
 kubectl exec -n distributed-engine deploy/api -- wget -qO- http://localhost:3000/health
-# postgres=up, redis=up
+# Expected: postgres=up, redis=up
 
-# Worker connectivity (prove workers process tasks)
+# Submit a task to verify Worker → PG and Worker → Redis paths
+# (Schema: name is required; payload, priority, maxRetries are optional)
 kubectl exec -n distributed-engine deploy/api -- \
-  wget -qO- --post-data='{"name":"authz-test","priority":"NORMAL"}' \
+  wget -qO- --post-data='{"name":"authz-verify"}' \
   --header='Content-Type: application/json' http://localhost:3000/tasks
 # Task should reach COMPLETED status
 ```
 
 **Negative verification**:
+
+First, create the test ServiceAccount used by negative tests:
 ```bash
-# Unauthorized identity should be denied access to PostgreSQL
+kubectl create sa test-unauthorized -n distributed-engine
+```
+
+Then run the unauthorized access tests:
+```bash
+# Unauthorized identity → PostgreSQL (should be denied)
 kubectl run pg-test -n distributed-engine \
   --image=postgres:16-alpine \
   --overrides='{"spec":{"serviceAccountName":"test-unauthorized"}}' \
-  --rm -i --restart=Never \
+  --rm -i --restart=Never --timeout=20s \
   -- sh -c "timeout 5 pg_isready -h postgres -U postgres; echo EXIT_CODE:\$?"
-# Expected: non-zero exit code (connection refused/timeout)
+# Expected: non-zero EXIT_CODE (connection refused/timeout)
 
-# Unauthorized identity should be denied access to Redis
+# Unauthorized identity → Redis (should be denied)
 kubectl run redis-test -n distributed-engine \
   --image=redis:7-alpine \
   --overrides='{"spec":{"serviceAccountName":"test-unauthorized"}}' \
-  --rm -i --restart=Never \
+  --rm -i --restart=Never --timeout=20s \
   -- sh -c "timeout 5 redis-cli -h redis ping; echo EXIT_CODE:\$?"
-# Expected: non-zero exit code (connection refused/timeout)
+# Expected: non-zero EXIT_CODE (connection refused/timeout)
 ```
 
-A negative test passes **only when** the destination is independently reachable by an authorized identity AND the unauthorized attempt is rejected.
+Clean up the test ServiceAccount:
+```bash
+kubectl delete sa test-unauthorized -n distributed-engine
+```
+
+A negative test passes **only when** the destination is independently reachable by an authorized identity AND the unauthorized attempt is rejected. If the destination itself is unreachable by authorized identities, the negative test is inconclusive.
 
 **Rollback**:
 ```bash
@@ -214,7 +245,7 @@ kubectl delete -f k8s/istio/authz-postgres.yaml
 kubectl delete -f k8s/istio/authz-redis.yaml
 ```
 
-**GO/NO-GO**: API health shows postgres=up and redis=up. Unauthorized test pods cannot reach data stores. End-to-end task lifecycle works.
+**GO/NO-GO**: API-local health shows postgres=up and redis=up. Unauthorized test pods cannot reach data stores. End-to-end task lifecycle works.
 
 Run automated authorization verification:
 ```bash
@@ -226,7 +257,7 @@ Run automated authorization verification:
 
 ### Stage 5 — API Authorization Policy
 
-**Prerequisites**: Stage 4 complete. Stage 3 confirmed Gateway pod uses `engine-gateway-istio`. Data store policies verified.
+**Prerequisites**: Stage 4 complete. **Stage 3 MUST have confirmed the Gateway pod uses `engine-gateway-istio`**. If the Gateway pod uses a different ServiceAccount, DO NOT apply this policy — see "Gateway ServiceAccount" below.
 
 **Apply**:
 ```bash
@@ -235,37 +266,55 @@ kubectl apply -f k8s/istio/authz-api.yaml
 
 **Expected behavior**: API port 3000 accepts connections only from the Gateway's `engine-gateway-istio` identity. Kubelet probes continue to work — ztunnel rewrites kubelet probe packets to a link-local address (169.254.7.127), exempting them from policy enforcement.
 
-**Positive verification**:
+**Positive verification** (Gateway-path tests):
 ```bash
 # Kubelet probes still pass (pods remain Ready)
 kubectl get pods -n distributed-engine -l app=api
 # All pods should be 1/1 Ready
 
-# Gateway → API routing works
-# Get Gateway external IP:
-GW_IP=$(kubectl get svc -n distributed-engine -l istio.io/gateway-name=engine-gateway \
+# Gateway → API routing works (authorized Gateway identity)
+# Resolve Gateway address:
+GW_ADDR=$(kubectl get svc -n distributed-engine \
+  -l gateway.networking.k8s.io/gateway-name=engine-gateway \
   -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
-curl http://${GW_IP}/live
+# If empty, try hostname:
+GW_ADDR=${GW_ADDR:-$(kubectl get svc -n distributed-engine \
+  -l gateway.networking.k8s.io/gateway-name=engine-gateway \
+  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')}
+# If still empty, try legacy label:
+GW_ADDR=${GW_ADDR:-$(kubectl get svc -n distributed-engine \
+  -l istio.io/gateway-name=engine-gateway \
+  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')}
+
+curl http://${GW_ADDR}/live
 # Expected: {"success":true}
 ```
 
 **Negative verification**:
 ```bash
-# Unauthorized identity should be denied access to API
+# First establish positive control: Gateway → API succeeds
+curl http://${GW_ADDR}/live
+# Must return {"success":true} before proceeding
+
+# Then: unauthorized identity should be denied
+kubectl create sa test-unauthorized -n distributed-engine
 kubectl run api-test -n distributed-engine \
   --image=busybox:latest \
   --overrides='{"spec":{"serviceAccountName":"test-unauthorized"}}' \
-  --rm -i --restart=Never \
+  --rm -i --restart=Never --timeout=20s \
   -- sh -c "timeout 5 wget -qO- http://api:3000/live; echo EXIT_CODE:\$?"
-# Expected: non-zero exit code (connection refused/timeout)
+# Expected: non-zero EXIT_CODE (connection refused/timeout)
+kubectl delete sa test-unauthorized -n distributed-engine
 ```
+
+The API negative test establishes a valid control: the authorized Gateway identity succeeds, then the unauthorized workload identity is denied.
 
 **Rollback**:
 ```bash
 kubectl delete -f k8s/istio/authz-api.yaml
 ```
 
-**GO/NO-GO**: All API pods remain Ready. Gateway routes to API successfully. Unauthorized test pod cannot reach API. End-to-end task lifecycle still works via Gateway path.
+**GO/NO-GO**: All API pods remain Ready. Gateway routes to API successfully. Unauthorized test pod cannot reach API. End-to-end task lifecycle works via the Gateway path.
 
 ---
 
@@ -279,13 +328,11 @@ This stage transitions external traffic from the direct API LoadBalancer to the 
 
 1. Verify Gateway path is operational:
    ```bash
-   GW_IP=$(kubectl get svc -n distributed-engine -l istio.io/gateway-name=engine-gateway \
-     -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
-   curl http://${GW_IP}/health
+   curl http://${GW_ADDR}/health
    # Must return postgres=up, redis=up
    ```
 
-2. Update DNS or load balancer to point to the Gateway external IP.
+2. Update DNS or load balancer to point to the Gateway external address.
 
 3. Verify traffic flows through Gateway.
 
@@ -301,8 +348,8 @@ This stage transitions external traffic from the direct API LoadBalancer to the 
 
 5. Verify no disruption:
    ```bash
-   curl http://${GW_IP}/health
-   curl http://${GW_IP}/tasks
+   curl http://${GW_ADDR}/health
+   curl http://${GW_ADDR}/tasks
    ```
 
 **Rollback**: Change API service back to `type: LoadBalancer` and re-apply.
@@ -316,7 +363,30 @@ Run all stages:
 ./k8s/istio/verify-runtime.sh all
 ```
 
-The script exits with code 1 if any check fails. Critical negative tests fail the suite if unauthorized access unexpectedly succeeds.
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | **RUNTIME ACCEPTANCE PASS** — all critical checks ran and passed |
+| 1 | **RUNTIME ACCEPTANCE FAIL** — one or more checks failed |
+| 2 | **RUNTIME ACCEPTANCE INCOMPLETE** — no failures, but critical checks were skipped due to missing infrastructure |
+
+The script distinguishes between non-critical skips (informational) and critical skips (checks that must pass for runtime acceptance). A skipped critical check prevents the suite from reporting full PASS.
+
+### Overriding Gateway Address
+
+If the Gateway LoadBalancer is not directly reachable from the verification runner (e.g., in a private cluster), use a port-forward:
+
+```bash
+# In one terminal:
+kubectl -n distributed-engine port-forward svc/$(kubectl get svc -n distributed-engine \
+  -l gateway.networking.k8s.io/gateway-name=engine-gateway -o name | head -1) 8080:80
+
+# In another terminal:
+GW_ADDR=localhost:8080 ./k8s/istio/verify-runtime.sh e2e
+```
+
+The `GW_ADDR` environment variable overrides the auto-detected address. The request still traverses the Gateway proxy and HTTPRoute.
 
 ## AuthorizationPolicy Design Notes
 
@@ -334,10 +404,21 @@ PostgreSQL and Redis use headless services (`clusterIP: None`). DNS resolves dir
 
 ### Gateway ServiceAccount
 
-Istio's Kubernetes Gateway implementation creates a Deployment for each Gateway resource. The deployment uses a ServiceAccount named `<gateway-name>-istio` by convention. We pre-create the `engine-gateway-istio` SA so Istio adopts it. The Stage 3 verification gate confirms this before any policy references it.
+Istio's Kubernetes Gateway implementation creates a Deployment, Service, ServiceAccount, and related resources for each Gateway. Generated resources are named `<gateway-name>-<gateway-class-name>` (e.g., `engine-gateway-istio` for a Gateway named `engine-gateway` with `gatewayClassName: istio`).
 
-If the Gateway pod uses a different SA name, the `authz-api.yaml` principal must be updated to match before applying the API authorization policy in Stage 5.
+We pre-create the `engine-gateway-istio` ServiceAccount in `service-accounts.yaml` so it exists before the Gateway is applied. Istio's controller is expected to use this existing SA rather than fail on a naming collision. However, this pre-creation behavior is not explicitly documented as a guaranteed adoption mechanism in Istio's Gateway API documentation. The supported way to control Gateway infrastructure (including the ServiceAccount) is through `spec.infrastructure.parametersRef` on the Gateway resource, referencing a ConfigMap with overlay values.
+
+**The critical safeguard is runtime verification, not static YAML alone.** The Stage 3 identity check (`verify-runtime.sh gateway-identity`) confirms at runtime that the actual Gateway pod uses the expected ServiceAccount before any authorization policy references it. If there is a mismatch:
+
+- **Do NOT apply `authz-api.yaml`** — the policy would reference the wrong identity.
+- **Do NOT automatically widen the policy** (no wildcards, no namespace-wide allowances).
+- **Report the mismatch** and stop Stage 5.
+- **Reconcile deliberately**: either update `authz-api.yaml` to match the actual SA, or configure the Gateway to use the expected SA via `parametersRef`.
 
 ### Kubelet Probe Exemption
 
 ztunnel rewrites kubelet probe packets to use source address 169.254.7.127, which bypasses AuthorizationPolicy evaluation. This means liveness and readiness probes continue to work even with ALLOW policies on the API pods.
+
+### Gateway Service Labels
+
+Istio Gateway-generated resources carry the label `gateway.networking.k8s.io/gateway-name=<name>` (current Istio 1.22+). Older Istio versions used `istio.io/gateway-name=<name>`. The verification script and this documentation try both labels for compatibility. If neither matches, inspect the generated resources with `kubectl get pods,svc -n distributed-engine --show-labels`.
