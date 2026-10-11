@@ -1,0 +1,18 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-api
+  namespace: distributed-engine
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals:
+        - "cluster.local/ns/distributed-engine/sa/engine-gateway-istio"
+    to:
+    - operation:
+        ports: ["3000"]

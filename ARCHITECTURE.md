@@ -385,6 +385,100 @@ Higher-weight tenants accumulate deficit more slowly, so they are selected more 
 - **Worker**: Tasks belonging to SUSPENDED tenants are skipped (returned as `{status: 'SKIPPED', reason: 'tenant_suspended'}`) without consuming retries or leases
 - **In-flight**: Tasks already in PROCESSING continue to completion — suspension does not kill active work
 
+## Service Mesh (Istio Ambient Mode)
+
+### Overview
+
+The engine optionally runs under Istio Ambient mode, which provides transport security, workload identity, and L4 authorization without sidecars. Ambient mode uses ztunnel — a per-node DaemonSet that transparently intercepts pod-to-pod traffic.
+
+```
+                              ┌──────────────────────────┐
+                              │ Kubernetes Gateway API   │
+ External ──── HTTP :80 ────▶ │ engine-gateway           │
+ Client                       │ (gatewayClassName: istio)│
+                              │ SA: engine-gateway-istio │
+                              └────────┬─────────────────┘
+                                       │ HTTPRoute
+                                       ▼
+                              ┌──────────────────────────┐
+                              │ API (api-sa)             │
+                              │ AuthzPolicy: gateway     │
+                              │ only on :3000            │
+                              └────┬──────────┬──────────┘
+                                   │          │
+                    ┌──────────────▼──┐  ┌────▼──────────────┐
+                    │ PostgreSQL      │  │ Redis             │
+                    │ (postgres-sa)   │  │ (redis-sa)        │
+                    │ AuthzPolicy:    │  │ AuthzPolicy:      │
+                    │ api-sa,worker-sa│  │ api-sa,worker-sa  │
+                    │ on :5432       │  │ on :6379          │
+                    └─────────────────┘  └───────────────────┘
+                              ▲                    ▲
+                              │                    │
+                    ┌─────────┴────────────────────┴──┐
+                    │ Worker (worker-sa)               │
+                    │ (no inbound AuthzPolicy)         │
+                    └─────────────────────────────────┘
+```
+
+All connections between workloads are mTLS-encrypted by ztunnel. Authorization is L4 only (identity + port), enforced by ztunnel without waypoint proxies.
+
+### Data Plane
+
+ztunnel runs as a DaemonSet managed by Istio. When the namespace carries `istio.io/dataplane-mode: ambient`, ztunnel intercepts all pod traffic on that node and establishes mTLS tunnels (HBONE) between pods. No application changes are needed — ztunnel operates at the network layer.
+
+### Workload Identities
+
+Each workload's SPIFFE identity is derived from its Kubernetes ServiceAccount:
+
+| Workload   | ServiceAccount         | SPIFFE ID |
+|------------|------------------------|-----------|
+| API        | api-sa                 | `cluster.local/ns/distributed-engine/sa/api-sa` |
+| Worker     | worker-sa              | `cluster.local/ns/distributed-engine/sa/worker-sa` |
+| PostgreSQL | postgres-sa            | `cluster.local/ns/distributed-engine/sa/postgres-sa` |
+| Redis      | redis-sa               | `cluster.local/ns/distributed-engine/sa/redis-sa` |
+| Gateway    | engine-gateway-istio   | `cluster.local/ns/distributed-engine/sa/engine-gateway-istio` |
+
+Istio CA issues X.509 SVIDs to ztunnel for each identity. The certificates are never exposed to the application containers.
+
+### L4 Authorization
+
+AuthorizationPolicies use `selector.matchLabels` to target pods (not `targetRef`, which requires waypoint proxies). ALLOW policy semantics: once an ALLOW policy applies to a workload, requests that don't match any ALLOW rule are implicitly denied. No separate default-deny is needed.
+
+| Policy | Target | Allowed Sources | Port |
+|--------|--------|-----------------|------|
+| authz-postgres | `app: postgres` | api-sa, worker-sa | 5432 |
+| authz-redis | `app: redis` | api-sa, worker-sa | 6379 |
+| authz-api | `app: api` | engine-gateway-istio | 3000 |
+
+Workers have no inbound AuthorizationPolicy — they consume from Redis (outbound), not receive inbound connections.
+
+### Gateway Ingress
+
+The Kubernetes Gateway API (`gatewayClassName: istio`) creates a mesh-aware ingress point. An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`. The Gateway runs in its own pod with the `engine-gateway-istio` ServiceAccount.
+
+During initial rollout, the existing API `type: LoadBalancer` service is preserved to avoid disrupting external access. The transition to Gateway-only ingress is a controlled step after verification.
+
+### Headless Services
+
+PostgreSQL and Redis use headless services (`clusterIP: None`), where DNS resolves directly to pod IPs. AuthorizationPolicies target pods by label (`selector.matchLabels`), which works identically regardless of DNS resolution path. ztunnel intercepts traffic to the pod IP and enforces the policy.
+
+### Kubelet Probe Exemption
+
+ztunnel rewrites kubelet probe packets to use source address 169.254.7.127, which is exempted from AuthorizationPolicy evaluation. Liveness and readiness probes continue to work on API pods even with an ALLOW policy restricting port 3000.
+
+### Delivery Semantics
+
+Istio Ambient mode does not change the engine's delivery semantics. The system provides at-least-once delivery (transactional outbox with BullMQ jobId deduplication), not exactly-once. Ambient mode has no waypoint proxies and therefore no mesh-level retries — application-level retry logic (BullMQ attempts, exponential backoff) remains the sole retry mechanism.
+
+### What Is NOT Included
+
+- **Waypoint proxies**: No L7 policy enforcement, no mesh-level retries, no fault injection.
+- **Mesh retries or circuit breaking**: Application-level BullMQ retries remain authoritative.
+- **HTTP routing between API and Worker**: Workers consume from Redis queues, not HTTP calls from the API.
+- **Production TLS**: The Gateway listens on HTTP :80. TLS termination at the edge requires a certificate and Gateway listener configuration, which is environment-specific.
+- **Full observability migration**: The existing Pino/Alloy/Loki logging and OTel tracing stacks are independent of the mesh.
+
 ## Scaling Considerations
 
 - **API servers**: Stateless, horizontally scalable. PG pool size is the main constraint.
