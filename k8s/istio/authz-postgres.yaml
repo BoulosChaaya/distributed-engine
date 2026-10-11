@@ -1,0 +1,19 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-postgres
+  namespace: distributed-engine
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals:
+        - "cluster.local/ns/distributed-engine/sa/api-sa"
+        - "cluster.local/ns/distributed-engine/sa/worker-sa"
+    to:
+    - operation:
+        ports: ["5432"]

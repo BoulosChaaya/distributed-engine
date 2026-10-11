@@ -20,6 +20,7 @@ spec:
       labels:
         app: api
     spec:
+      serviceAccountName: api-sa
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

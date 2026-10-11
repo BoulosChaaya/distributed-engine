@@ -4,10 +4,12 @@ Production deployment of the distributed task execution engine on Kubernetes.
 
 ## Architecture
 
-Three deployments working together:
-1. **Redis** (StatefulSet) - Persistent state and message queue
-2. **API** (Deployment, 3 replicas) - REST endpoints for task management
-3. **Worker** (Deployment, 5 replicas) - Background job processors
+Four deployment layers:
+1. **Namespace + ServiceAccounts** (`namespace.yaml`, `istio/service-accounts.yaml`) - Cluster foundation
+2. **Redis** (StatefulSet) + **PostgreSQL** (StatefulSet) - Persistent state and message queue
+3. **API** (Deployment, 3 replicas) - REST endpoints for task management
+4. **Worker** (Deployment, 5 replicas) - Background job processors
+5. **Istio Ambient Mesh** (optional) - mTLS, identity, L4 authorization, Gateway ingress
 
 ## Prerequisites
 
@@ -31,14 +33,23 @@ Update image references in `api.yaml` and `worker.yaml` to match your registry.
 
 ## Deployment Steps
 
-### 1. Deploy Redis (persistent data store)
+### 1. Create namespace and deploy infrastructure
 
 ```bash
+# Create namespace (includes Istio ambient label if Istio is installed)
+kubectl apply -f k8s/namespace.yaml
+
+# Create PostgreSQL secret
+kubectl create secret generic postgres-secret \
+  --namespace distributed-engine \
+  --from-literal=password=<your-password>
+
+# Deploy data stores
+kubectl apply -f k8s/postgres.yaml
 kubectl apply -f k8s/redis.yaml
-```
 
-Wait for Redis to be ready:
-```bash
+# Wait for readiness
+kubectl wait --for=condition=ready pod -l app=postgres -n distributed-engine --timeout=120s
 kubectl wait --for=condition=ready pod -l app=redis -n distributed-engine --timeout=60s
 ```
 
@@ -216,6 +227,22 @@ kubectl delete svc api redis -n distributed-engine
 kubectl delete pvc -l app=redis -n distributed-engine
 ```
 
+## Istio Ambient Mesh (Optional)
+
+If Istio Ambient mode is installed on the cluster, the engine can be enrolled for mTLS, workload identity, and L4 authorization. See `k8s/istio/README.md` for the complete staged rollout guide.
+
+```bash
+# Quick start (after Stages 1-2 from the Istio README)
+kubectl apply -f k8s/istio/service-accounts.yaml
+kubectl apply -f k8s/istio/gateway.yaml
+kubectl apply -f k8s/istio/authz-postgres.yaml
+kubectl apply -f k8s/istio/authz-redis.yaml
+kubectl apply -f k8s/istio/authz-api.yaml
+
+# Verify
+./k8s/istio/verify-runtime.sh all
+```
+
 ## Production Hardening Checklist
 
 - [ ] Images pushed to private registry with authentication
@@ -226,8 +253,9 @@ kubectl delete pvc -l app=redis -n distributed-engine
 - [ ] Monitoring and alerting configured (Prometheus, DataDog, etc.)
 - [ ] Log aggregation set up (ELK, Splunk, Loki, etc.)
 - [ ] Secret management for Redis password (use Sealed Secrets or HashiCorp Vault)
-- [ ] Ingress controller configured for external API access
-- [ ] DNS entries created for API endpoints
+- [ ] Istio Ambient mesh enrolled with AuthorizationPolicies (see `k8s/istio/README.md`)
+- [ ] Gateway ingress configured with TLS
+- [ ] DNS entries created for API/Gateway endpoints
 
 ## References
 

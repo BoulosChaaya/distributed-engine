@@ -47,7 +47,9 @@ docker push <registry>/distributed-engine-worker:0.1.0
 ### 1. Create the namespace and secrets
 
 ```bash
-kubectl create namespace distributed-engine
+# Apply the declarative namespace (includes Istio ambient label if Istio is installed)
+kubectl apply -f k8s/namespace.yaml
+
 kubectl create secret generic postgres-secret \
   --namespace distributed-engine \
   --from-literal=password=<your-password>
@@ -215,6 +217,51 @@ kubectl -n distributed-engine rollout undo deployment/worker
 | Outbox events piling up | Outbox circuit breaker | Check `/health` for circuit state, check Redis |
 | Workers not listed | Redis heartbeat | Check worker logs for heartbeat errors |
 | Stale version errors | Concurrent processing | Normal under contention, only one wins |
+
+## Istio Ambient Mesh (Optional)
+
+The engine supports Istio Ambient mode for mTLS, workload identity, and L4 authorization without sidecars. This is an optional overlay — the engine operates identically without Istio.
+
+### What Istio Ambient Adds
+
+- Transparent mTLS between all pods (ztunnel, no sidecars)
+- SPIFFE workload identities derived from ServiceAccounts
+- L4 AuthorizationPolicies restricting which identities can reach data stores and the API
+- Kubernetes Gateway API for mesh-aware ingress
+
+### Deployment
+
+The Istio rollout is staged. See `k8s/istio/README.md` for the complete 6-stage rollout guide with per-stage verification, rollback, and GO/NO-GO criteria.
+
+Quick summary:
+```bash
+# Stage 1: Namespace + ServiceAccounts
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/istio/service-accounts.yaml
+
+# Stage 2: Bind SAs to workloads
+kubectl apply -f k8s/postgres.yaml -f k8s/redis.yaml -f k8s/api.yaml -f k8s/worker.yaml
+
+# Stage 3: Gateway
+kubectl apply -f k8s/istio/gateway.yaml
+
+# Stage 4: Data store authorization
+kubectl apply -f k8s/istio/authz-postgres.yaml -f k8s/istio/authz-redis.yaml
+
+# Stage 5: API authorization
+kubectl apply -f k8s/istio/authz-api.yaml
+
+# Verify
+./k8s/istio/verify-runtime.sh all
+```
+
+### API Service Transition
+
+During rollout, the API retains its `type: LoadBalancer` service so external access is not disrupted. After verifying the Gateway path (Stage 3), external traffic can be transitioned to the Gateway and the API service changed to `ClusterIP`. See Stage 6 in `k8s/istio/README.md`.
+
+### Runtime Verification
+
+`k8s/istio/verify-runtime.sh` runs automated checks for mesh enrollment, Gateway identity, positive authorization (authorized workloads reach destinations), negative authorization (unauthorized identities are denied), and end-to-end task lifecycle. The script exits with code 1 if any check fails.
 
 ## Backup
 
