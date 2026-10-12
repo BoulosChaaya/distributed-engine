@@ -8,9 +8,9 @@ import {
   Task,
   TaskStatus,
   OutboxEvent,
-} from '../types';
-import { generateId } from '../utils';
-import { injectTraceContext } from '../telemetry/propagation';
+} from '../types.js';
+import { generateId } from '../utils.js';
+import { injectTraceContext } from '../telemetry/propagation.js';
 
 export interface CreateScheduleInput {
   tenantId?: string;

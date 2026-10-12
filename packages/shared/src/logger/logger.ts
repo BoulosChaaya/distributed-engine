@@ -1,6 +1,6 @@
 import pino from 'pino';
 import { trace, context } from '@opentelemetry/api';
-import { serializeError } from './error-serializer';
+import { serializeError } from './error-serializer.js';
 
 export interface LoggerOptions {
   service: string;

@@ -1,11 +1,11 @@
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
-import { generateId } from '../utils';
-import { OutboxEvent, OutboxEventType } from '../types';
-import { tracing } from '../telemetry/spans';
-import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
-import { createLogger, type Logger } from '../logger/index';
-import { WeightedFairScheduler, TenantWeightEntry } from '../fairness';
+import { generateId } from '../utils.js';
+import { OutboxEvent, OutboxEventType } from '../types.js';
+import { tracing } from '../telemetry/spans.js';
+import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation.js';
+import { createLogger, type Logger } from '../logger/index.js';
+import { WeightedFairScheduler, TenantWeightEntry } from '../fairness.js';
 
 interface OutboxRow {
   id: string;

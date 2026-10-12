@@ -1,7 +1,7 @@
 import { Pool } from 'pg';
 import { createHash } from 'crypto';
-import { Tenant, TenantStatus, Plan, TenantOverride, TenantUsage, EffectiveLimits, TenantConcurrencyLease } from '../types';
-import { generateId } from '../utils';
+import { Tenant, TenantStatus, Plan, TenantOverride, TenantUsage, EffectiveLimits, TenantConcurrencyLease } from '../types.js';
+import { generateId } from '../utils.js';
 
 function rowToTenant(row: Record<string, unknown>): Tenant {
   return {

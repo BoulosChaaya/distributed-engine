@@ -1,7 +1,7 @@
-export { initTelemetry, shutdownTelemetry, getTracer } from './setup';
+export { initTelemetry, shutdownTelemetry, getTracer } from './setup.js';
 export {
   injectTraceContext,
   extractTraceContext,
   TRACE_CONTEXT_KEY,
-} from './propagation';
-export { tracing } from './spans';
+} from './propagation.js';
+export { tracing } from './spans.js';

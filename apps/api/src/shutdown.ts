@@ -1,7 +1,7 @@
 import { Queue } from 'bullmq';
 import { Pool } from 'pg';
 import { OutboxPublisher, SchedulerService, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
-import IORedis from 'ioredis';
+import type { Redis as IORedis } from 'ioredis';
 import type { Server } from 'http';
 
 const logger: Logger = createLogger({

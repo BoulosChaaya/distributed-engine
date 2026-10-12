@@ -1,8 +1,8 @@
 import { Pool } from 'pg';
-import { ScheduleRepository, DuplicateOccurrenceError } from '../db/schedule-repository';
-import { RecurringSchedule } from '../types';
-import { getNextOccurrence, getMissedOccurrences } from './cron-utils';
-import { type Logger } from '../logger/index';
+import { ScheduleRepository, DuplicateOccurrenceError } from '../db/schedule-repository.js';
+import { RecurringSchedule } from '../types.js';
+import { getNextOccurrence, getMissedOccurrences } from './cron-utils.js';
+import { type Logger } from '../logger/index.js';
 
 export interface SchedulerConfig {
   pollIntervalMs: number;

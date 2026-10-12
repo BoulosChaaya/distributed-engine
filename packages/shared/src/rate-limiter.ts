@@ -1,4 +1,4 @@
-import type IORedis from 'ioredis';
+import type { Redis as IORedis } from 'ioredis';
 
 export interface RateLimitResult {
   allowed: boolean;

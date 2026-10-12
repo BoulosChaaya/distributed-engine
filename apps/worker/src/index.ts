@@ -1,5 +1,5 @@
 import { Worker, DelayedError } from 'bullmq';
-import IORedis from 'ioredis';
+import { Redis as IORedis } from 'ioredis';
 import { Pool } from 'pg';
 import http from 'http';
 import {
@@ -16,8 +16,8 @@ import {
   createLogger,
 } from '@repo/shared';
 import { randomUUID } from 'crypto';
-import { createProcessTask, computeRenewalInterval, validateScheduleLeaseDuration } from './process-task';
-import { parseStrictIntInRange } from './config';
+import { createProcessTask, computeRenewalInterval, validateScheduleLeaseDuration } from './process-task.js';
+import { parseStrictIntInRange } from './config.js';
 
 initTelemetry({
   serviceName: 'distributed-engine-worker',

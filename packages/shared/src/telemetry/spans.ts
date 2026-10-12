@@ -6,7 +6,7 @@ import {
   Context,
   Span,
 } from '@opentelemetry/api';
-import { getTracer } from './setup';
+import { getTracer } from './setup.js';
 
 export const tracing = {
   startTaskCreation(taskId: string, taskName: string, priority: string): Span {
