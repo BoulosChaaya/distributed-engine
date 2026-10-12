@@ -776,6 +776,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     pool.connect = (async () => {
       const client = await realConnect();
       const realQuery = client.query.bind(client);
+      const origRelease = client.release;
 
       (client as any).query = async function (...args: any[]) {
         const sql = typeof args[0] === 'string' ? args[0] : '';
@@ -785,6 +786,11 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
         }
         return realQuery(...args);
       };
+
+      client.release = function (err?: any) {
+        (client as any).query = realQuery;
+        return origRelease.call(client, err);
+      } as any;
 
       return client;
     }) as any;
@@ -839,6 +845,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     pool.connect = (async () => {
       const client = await realConnect();
       const realQuery = client.query.bind(client);
+      const origRelease = client.release;
 
       (client as any).query = async function (...args: any[]) {
         const sql = typeof args[0] === 'string' ? args[0] : '';
@@ -847,6 +854,11 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
         }
         return realQuery(...args);
       };
+
+      client.release = function (err?: any) {
+        (client as any).query = realQuery;
+        return origRelease.call(client, err);
+      } as any;
 
       return client;
     }) as any;

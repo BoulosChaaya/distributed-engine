@@ -32,8 +32,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query('TRUNCATE tenant_concurrency_leases, tenant_usage, tenant_overrides, outbox_events, tasks CASCADE');
-  await pool.query('DELETE FROM tenants');
+  await pool.query('TRUNCATE tenant_concurrency_leases, tenant_usage, tenant_overrides, outbox_events, tasks, tenants CASCADE');
 });
 
 describe('TenantRepository (requires PostgreSQL)', () => {
@@ -241,7 +240,8 @@ describe('TenantRepository (requires PostgreSQL)', () => {
       const limits = await tenantRepo.getEffectiveLimits(tenant.id);
       const billingPeriodStart = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
 
-      for (let i = 0; i < limits.maxJobsPerPeriod; i++) {
+      const testQuota = 3;
+      for (let i = 0; i < testQuota; i++) {
         await taskRepo.acceptTask({
           tenantId: tenant.id,
           name: `quota-task-${i}`,
@@ -249,7 +249,7 @@ describe('TenantRepository (requires PostgreSQL)', () => {
           payload: {},
           maxRetries: 1,
           billingPeriodStart,
-          maxJobsPerPeriod: limits.maxJobsPerPeriod,
+          maxJobsPerPeriod: testQuota,
         });
       }
 
@@ -260,7 +260,7 @@ describe('TenantRepository (requires PostgreSQL)', () => {
         payload: {},
         maxRetries: 1,
         billingPeriodStart,
-        maxJobsPerPeriod: limits.maxJobsPerPeriod,
+        maxJobsPerPeriod: testQuota,
       })).rejects.toThrow(QuotaExceededError);
     });
   });
