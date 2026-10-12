@@ -30,6 +30,7 @@ function capturedMessages(lines: string[]): string[] {
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 const TEST_REDIS_HOST = process.env.TEST_REDIS_HOST || 'localhost';
 const TEST_REDIS_PORT = parseInt(process.env.TEST_REDIS_PORT || '6379');
+const TEST_REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 
 let pool: Pool;
 let repo: TaskRepository;
@@ -53,7 +54,7 @@ beforeAll(async () => {
     );
   }
 
-  redis = new IORedis({ host: TEST_REDIS_HOST, port: TEST_REDIS_PORT, maxRetriesPerRequest: null });
+  redis = new IORedis({ host: TEST_REDIS_HOST, port: TEST_REDIS_PORT, password: TEST_REDIS_PASSWORD, maxRetriesPerRequest: null });
   try {
     await redis.ping();
   } catch (err) {
@@ -775,6 +776,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     pool.connect = (async () => {
       const client = await realConnect();
       const realQuery = client.query.bind(client);
+      const origRelease = client.release;
 
       (client as any).query = async function (...args: any[]) {
         const sql = typeof args[0] === 'string' ? args[0] : '';
@@ -784,6 +786,11 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
         }
         return realQuery(...args);
       };
+
+      client.release = function (err?: any) {
+        (client as any).query = realQuery;
+        return origRelease.call(client, err);
+      } as any;
 
       return client;
     }) as any;
@@ -838,6 +845,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
     pool.connect = (async () => {
       const client = await realConnect();
       const realQuery = client.query.bind(client);
+      const origRelease = client.release;
 
       (client as any).query = async function (...args: any[]) {
         const sql = typeof args[0] === 'string' ? args[0] : '';
@@ -846,6 +854,11 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
         }
         return realQuery(...args);
       };
+
+      client.release = function (err?: any) {
+        (client as any).query = realQuery;
+        return origRelease.call(client, err);
+      } as any;
 
       return client;
     }) as any;

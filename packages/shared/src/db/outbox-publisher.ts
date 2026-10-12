@@ -1,11 +1,25 @@
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
 import { generateId } from '../utils';
-import { OutboxEvent } from '../types';
+import { OutboxEvent, OutboxEventType } from '../types';
 import { tracing } from '../telemetry/spans';
 import { TRACE_CONTEXT_KEY, injectTraceContext, extractTraceContext } from '../telemetry/propagation';
 import { createLogger, type Logger } from '../logger/index';
 import { WeightedFairScheduler, TenantWeightEntry } from '../fairness';
+
+interface OutboxRow {
+  id: string;
+  task_id: string;
+  event_type: OutboxEventType;
+  payload: Record<string, unknown>;
+  status: 'PENDING' | 'DELIVERED' | 'FAILED';
+  attempts: number;
+  created_at: string;
+  claimed_by: string | null;
+  claimed_at: string | null;
+  trace_context: Record<string, string> | null;
+  task_tenant_id: string | null;
+}
 
 const PRIORITY_MAP: Record<string, number> = {
   LOW: 10,
@@ -173,7 +187,7 @@ export class OutboxPublisher {
           status: row.status,
           attempts: row.attempts,
           createdAt: new Date(row.created_at),
-          claimedBy: row.claimed_by,
+          claimedBy: row.claimed_by ?? undefined,
           claimedAt: row.claimed_at ? new Date(row.claimed_at) : undefined,
           traceContext: row.trace_context ?? undefined,
         };
@@ -238,7 +252,7 @@ export class OutboxPublisher {
   private async claimGlobalFifo(
     client: import('pg').PoolClient,
     batchSize: number,
-  ): Promise<Array<Record<string, unknown>>> {
+  ): Promise<OutboxRow[]> {
     const result = await client.query(
       `UPDATE outbox_events
        SET claimed_by = $1, claimed_at = NOW(), attempts = attempts + 1
@@ -255,13 +269,13 @@ export class OutboxPublisher {
          (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
       [this.publisherId, this.maxAttempts, batchSize],
     );
-    return result.rows;
+    return result.rows as OutboxRow[];
   }
 
   private async claimFairly(
     client: import('pg').PoolClient,
     batchSize: number,
-  ): Promise<Array<Record<string, unknown>>> {
+  ): Promise<OutboxRow[]> {
     const tenantResult = await client.query(
       `SELECT t.tenant_id,
          COALESCE(ovr.weight, p.weight, 1)::int as weight,
@@ -282,12 +296,13 @@ export class OutboxPublisher {
       return this.claimGlobalFifo(client, batchSize);
     }
 
-    const entries: TenantWeightEntry[] = tenantResult.rows.map((r: Record<string, unknown>) => ({
-      tenantId: r.tenant_id as string,
-      weight: r.weight as number,
+    const tenantRows = tenantResult.rows as Array<{ tenant_id: string; weight: number; pending_count: number }>;
+    const entries: TenantWeightEntry[] = tenantRows.map((r) => ({
+      tenantId: r.tenant_id,
+      weight: r.weight,
     }));
     const pendingMap = new Map<string, number>(
-      tenantResult.rows.map((r: Record<string, unknown>) => [r.tenant_id as string, r.pending_count as number]),
+      tenantRows.map((r) => [r.tenant_id, r.pending_count]),
     );
 
     const selectionOrder: string[] = [];
@@ -307,7 +322,7 @@ export class OutboxPublisher {
       allocation.set(tid, (allocation.get(tid) ?? 0) + 1);
     }
 
-    const perTenantRows = new Map<string, Array<Record<string, unknown>>>();
+    const perTenantRows = new Map<string, OutboxRow[]>();
     for (const [tenantId, slots] of allocation) {
       const result = await client.query(
         `UPDATE outbox_events
@@ -327,10 +342,10 @@ export class OutboxPublisher {
            (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
         [this.publisherId, this.maxAttempts, tenantId, slots],
       );
-      perTenantRows.set(tenantId, result.rows);
+      perTenantRows.set(tenantId, result.rows as OutboxRow[]);
     }
 
-    const result: Array<Record<string, unknown>> = [];
+    const result: OutboxRow[] = [];
     const tenantCursors = new Map<string, number>();
     for (const tid of selectionOrder) {
       const cursor = tenantCursors.get(tid) ?? 0;
@@ -361,7 +376,7 @@ export class OutboxPublisher {
            (SELECT t.tenant_id FROM tasks t WHERE t.id = outbox_events.task_id) as task_tenant_id`,
         [this.publisherId, this.maxAttempts, remaining],
       );
-      result.push(...backfill.rows);
+      result.push(...(backfill.rows as OutboxRow[]));
     }
 
     return result;

@@ -34,6 +34,10 @@ spec:
                   - worker
               topologyKey: kubernetes.io/hostname
 
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
       containers:
       - name: worker
         image: distributed-engine-worker:0.1.0
@@ -46,6 +50,11 @@ spec:
           value: "redis.distributed-engine.svc.cluster.local"
         - name: REDIS_PORT
           value: "6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         - name: LOG_LEVEL
           value: "INFO"
         - name: QUEUE_CONCURRENCY
@@ -72,14 +81,36 @@ spec:
             memory: "1Gi"
             cpu: "1000m"
 
-        # preStop gives K8s time to stop routing; worker.close() then
-        # drains in-flight jobs within the remaining grace period.
-        lifecycle:
-          preStop:
-            exec:
-              command: ["/bin/sh", "-c", "sleep 5"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
 
-      # 5s preStop + 30s worker shutdown timeout + 5s buffer
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 9000
+          periodSeconds: 5
+          failureThreshold: 12
+          timeoutSeconds: 3
+
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9000
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 3
+
       terminationGracePeriodSeconds: 40
 
 ---

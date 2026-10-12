@@ -282,7 +282,7 @@ export class ScheduleRepository {
       await client.query('BEGIN');
       const taskResult = await client.query(
         `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version, scheduled_for, created_at, updated_at)
-         VALUES ($1, $2, 'SCHEDULED', $3, $4, $5, 0, 1, $6, NOW(), NOW())
+         VALUES ($1, $2, $3, 'SCHEDULED', $4, $5, $6, 0, 1, $7, NOW(), NOW())
          RETURNING *`,
         [taskId, input.tenantId ?? null, input.name, input.priority, JSON.stringify(input.payload), input.maxRetries, input.scheduledFor],
       );
@@ -415,7 +415,7 @@ export class ScheduleRepository {
         taskResult = await c.query(
           `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version,
              scheduled_for, schedule_id, created_at, updated_at)
-           VALUES ($1, $2, 'QUEUED', $3, $4, $5, 0, 1, $6, $7, NOW(), NOW())
+           VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, 0, 1, $7, $8, NOW(), NOW())
            RETURNING *`,
           [
             taskId, schedule.tenantId || null, schedule.taskName, schedule.taskPriority,

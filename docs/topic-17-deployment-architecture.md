@@ -176,7 +176,14 @@ a crashed process all fail this check.
 
 ### 4.4 postgres.yaml
 
-- Add command: `["postgres", "-c", "max_connections=150"]`
+- Add args: `["postgres", "-c", "max_connections=150"]`
+
+> **Correction (args, not command):** Kubernetes `command` overrides the container
+> image ENTRYPOINT, while `args` overrides CMD and preserves ENTRYPOINT. The official
+> `postgres:16-alpine` image uses `docker-entrypoint.sh` as its ENTRYPOINT, which
+> performs `initdb` on a fresh PVC and handles `POSTGRES_DB`/`POSTGRES_USER`/`POSTGRES_PASSWORD`
+> initialization. Using `args` ensures the entrypoint runs before executing
+> `postgres -c max_connections=150`.
 - Add securityContext: `allowPrivilegeEscalation: false` (proposed), drop `NET_RAW` capability
 
 **`allowPrivilegeEscalation: false` rationale:** This sets the Linux `no_new_privs` bit
