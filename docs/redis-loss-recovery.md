@@ -112,6 +112,8 @@ if (taskIds.length === 0) { console.error('Usage: provide task IDs as arguments'
 
   const queue = new Queue('tasks', { connection });
 
+  let failed = false;
+
   for (const taskId of taskIds) {
     try {
       const job = await Job.fromId(queue, taskId);
@@ -122,11 +124,13 @@ if (taskIds.length === 0) { console.error('Usage: provide task IDs as arguments'
       }
     } catch (err) {
       console.error('ERROR   ' + taskId + '  ' + err.message);
+      failed = true;
     }
   }
 
   await queue.close();
   connection.disconnect();
+  if (failed) process.exit(1);
 })();
 " -- <task_id_1> <task_id_2>
 ```
@@ -277,7 +281,6 @@ WHERE id IN (<event_ids>)
 
 ```sql
 -- Reset DELIVERED outbox events whose BullMQ jobs are confirmed absent
--- and whose tasks are still non-terminal
 -- Replace <delivered_event_ids> with the exact validated set from Step 3
 UPDATE outbox_events oe
 SET status = 'PENDING',
