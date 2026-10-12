@@ -322,6 +322,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     }
   }
 
+  await shutdownTelemetry();
+
   clearTimeout(fatalCleanupTimeout);
   process.exit(1);
 });

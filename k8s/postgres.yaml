@@ -21,7 +21,7 @@ spec:
         ports:
         - containerPort: 5432
           name: postgres
-        command: ["postgres", "-c", "max_connections=150"]
+        args: ["postgres", "-c", "max_connections=150"]
         env:
         - name: POSTGRES_DB
           value: "distributed_engine"

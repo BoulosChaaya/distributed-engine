@@ -9,13 +9,13 @@ operator judgment and verification.
 
 When Redis loses data (restart without persistence, corruption, or operator
 error), BullMQ jobs that were in-flight or queued disappear. Tasks in PostgreSQL
-may remain in non-terminal states (PENDING, PROCESSING) with no corresponding
+may remain in non-terminal states (QUEUED, PROCESSING) with no corresponding
 BullMQ job to drive them to completion.
 
 Additionally, outbox events marked DELIVERED may have lost their corresponding
 BullMQ job. The outbox publisher considers these events done, so no automatic
 re-publication occurs. The task remains in whatever state the worker left it —
-PENDING if the worker never picked it up, or PROCESSING if the worker started
+QUEUED if the worker never picked it up, or PROCESSING if the worker started
 but did not complete it.
 
 ### What PostgreSQL protects
@@ -73,15 +73,97 @@ WHERE oe.status = 'DELIVERED'
 ORDER BY oe.processed_at;
 ```
 
-Cross-reference each task_id against Redis to confirm the BullMQ job is absent:
+Cross-reference each task_id against Redis using the BullMQ API to confirm the
+job is absent. Do NOT rely on raw Redis key inspection (`EXISTS`, `KEYS`) —
+BullMQ's internal key layout is an implementation detail that can change between
+versions.
+
+Use the following Node.js script from a pod that has access to the `bullmq`
+package (e.g. the worker container) and to the Redis instance. The script uses
+the same queue name (`tasks`) and job ID semantics (`jobId = task_id`) as the
+application. Replace `<task_id_1>,<task_id_2>,...` with the exact task IDs from
+the query above.
 
 ```bash
-# For each task_id from the query above, check if a job exists
-kubectl exec -n distributed-engine redis-0 -- redis-cli EXISTS "bull:tasks:<task_id>"
+# Redis password must be available as an environment variable.
+# In the Topic 17 deployment model this is sourced from the redis-secret
+# Kubernetes Secret via the REDIS_PASSWORD environment variable.
+# Do NOT embed the password directly in this command.
+
+kubectl exec -n distributed-engine deploy/worker -- node --input-type=commonjs -e "
+const { Queue, Job } = require('bullmq');
+const IORedis = require('ioredis');
+
+const taskIds = process.argv.slice(1);
+if (taskIds.length === 0) { console.error('Usage: provide task IDs as arguments'); process.exit(1); }
+
+(async () => {
+  const connection = new IORedis({
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    password: process.env.REDIS_PASSWORD,
+    maxRetriesPerRequest: 3,
+  });
+
+  connection.on('error', (err) => {
+    console.error('ERROR   Redis connection: ' + err.message);
+    process.exit(1);
+  });
+
+  const queue = new Queue('tasks', { connection });
+
+  for (const taskId of taskIds) {
+    try {
+      const job = await Job.fromId(queue, taskId);
+      if (job) {
+        console.log('EXISTS  ' + taskId + '  state=' + (await job.getState()));
+      } else {
+        console.log('ABSENT  ' + taskId);
+      }
+    } catch (err) {
+      console.error('ERROR   ' + taskId + '  ' + err.message);
+    }
+  }
+
+  await queue.close();
+  connection.disconnect();
+})();
+" -- <task_id_1> <task_id_2>
 ```
 
-Only tasks where the BullMQ job is confirmed absent AND the task is non-terminal
-are candidates for recovery.
+Interpret the output for each task_id:
+
+- **EXISTS** — The BullMQ job is present. STOP for this task. Do NOT reset the
+  corresponding outbox event. Investigate the actual job state before taking
+  any action.
+
+- **ABSENT** — The BullMQ job is confirmed absent for this exact job ID. This
+  task_id is a candidate for the guarded manual recovery procedure, provided
+  the task is also non-terminal in PostgreSQL.
+
+- **ERROR** — The lookup failed (Redis unavailable, authentication failure,
+  connection refused, or any other error). STOP. Do NOT interpret an inability
+  to query Redis as proof that the job is absent. Resolve the error before
+  proceeding with recovery for this task_id.
+
+> **IMPORTANT — Point-in-time observation.** Job absence is a point-in-time
+> result, not a lock. Between the BullMQ lookup and the SQL recovery mutation,
+> another publisher or operator could create a new BullMQ job for the same
+> task ID. This TOCTOU (time-of-check/time-of-use) gap cannot be eliminated
+> without stopping all publishers. To reduce the window: stop the outbox
+> publisher before beginning recovery, repeat the BullMQ lookup immediately
+> before executing each recovery UPDATE, and restart the publisher only after
+> recovery and verification are complete.
+
+> **IMPORTANT — Job absence does not prove non-execution.** BullMQ is
+> configured with `removeOnComplete: 100` — completed jobs are evicted after
+> 100 newer completions. A task whose BullMQ job was evicted after successful
+> completion will show ABSENT even though the task executed. The recovery
+> decision must rely on PostgreSQL task state (non-terminal) combined with
+> BullMQ job absence, not on job absence alone.
+
+Only tasks where the BullMQ lookup returned **ABSENT** AND the task is
+non-terminal in PostgreSQL are candidates for recovery.
 
 ## Step 2: Inspect PostgreSQL and Redis evidence
 
@@ -100,12 +182,11 @@ WHERE oe.status = 'DELIVERED'
   AND t.status NOT IN ('COMPLETED', 'FAILED');
 ```
 
-Verify from Redis that corresponding BullMQ jobs are absent:
-
-```bash
-# Check if any jobs exist for the task queue
-kubectl exec -n distributed-engine redis-0 -- redis-cli KEYS "bull:tasks:*"
-```
+Verify from Redis that corresponding BullMQ jobs are absent using the
+BullMQ-aware lookup from Step 1c. Run the `Job.fromId` script above with the
+candidate task IDs from the count queries. Every candidate must return
+**ABSENT**; any **EXISTS** result removes that task from the recovery set, and
+any **ERROR** result means STOP — do not proceed until the lookup succeeds.
 
 ## Step 3: Validate the exact intended affected set
 
@@ -133,10 +214,10 @@ Compare against the queries above.
 > job is absent.
 
 ```sql
--- Reset stuck PROCESSING tasks to PENDING so they re-enter the outbox
+-- Reset stuck PROCESSING tasks to QUEUED so they re-enter the outbox
 -- Replace <task_ids> with the exact validated set from Step 3
 UPDATE tasks
-SET status = 'PENDING',
+SET status = 'QUEUED',
     claimed_by = NULL,
     claim_expires_at = NULL,
     version = version + 1,
@@ -198,14 +279,19 @@ WHERE id IN (<event_ids>)
 -- Reset DELIVERED outbox events whose BullMQ jobs are confirmed absent
 -- and whose tasks are still non-terminal
 -- Replace <delivered_event_ids> with the exact validated set from Step 3
-UPDATE outbox_events
+UPDATE outbox_events oe
 SET status = 'PENDING',
     attempts = 0,
     claimed_by = NULL,
     claimed_at = NULL,
     processed_at = NULL
-WHERE id IN (<delivered_event_ids>)
-  AND status = 'DELIVERED';
+WHERE oe.id IN (<delivered_event_ids>)
+  AND oe.status = 'DELIVERED'
+  AND EXISTS (
+    SELECT 1 FROM tasks t
+    WHERE t.id = oe.task_id
+      AND t.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+  );
 ```
 
 **Immediately after executing:**
@@ -238,10 +324,13 @@ and publish new BullMQ jobs. Monitor:
 ```bash
 # Watch worker logs for task processing
 kubectl logs -n distributed-engine -l app=worker --tail=50 -f
-
-# Verify jobs appear in Redis
-kubectl exec -n distributed-engine redis-0 -- redis-cli KEYS "bull:tasks:*"
 ```
+
+Verify that new BullMQ jobs were created for the recovered tasks using the
+BullMQ-aware lookup from Step 1c. Run the `Job.fromId` script with the
+recovered task IDs. Each should now return **EXISTS** with an active state.
+If any returns **ABSENT**, investigate why the outbox publisher did not
+re-publish the event.
 
 ## Step 7: Record duplicate-execution risk
 

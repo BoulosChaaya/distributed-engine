@@ -65,6 +65,12 @@ describe('parseStrictInt', () => {
         'Invalid integer for POSTGRES_PORT',
       );
     });
+
+    it('rejects unsafe integer beyond Number.MAX_SAFE_INTEGER', () => {
+      expect(() => parseStrictInt('99999999999999999', 0, 'BIG_NUM')).toThrow(
+        'Value out of safe integer range for BIG_NUM',
+      );
+    });
   });
 
   describe('parseStrictIntInRange', () => {
