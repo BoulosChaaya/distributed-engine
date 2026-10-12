@@ -12,7 +12,7 @@ COPY packages ./packages
 COPY apps/worker ./apps/worker
 
 # Install dependencies
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
+RUN npm install -g pnpm@10 && pnpm install --frozen-lockfile
 
 # Build the workspace
 RUN pnpm build
@@ -29,7 +29,7 @@ RUN apk add --no-cache dumb-init
 RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
 
 # Install pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10
 
 # Copy package files
 COPY --from=builder --chown=nodejs:nodejs /app/pnpm-lock.yaml ./
