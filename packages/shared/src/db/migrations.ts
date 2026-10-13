@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { log } from '../utils';
+import { log } from '../utils.js';
 
 const MIGRATIONS = [
   {

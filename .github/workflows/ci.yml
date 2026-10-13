@@ -75,6 +75,11 @@ jobs:
           docker build -f Dockerfile.api -t distributed-engine-api:ci .
           docker build -f Dockerfile.worker -t distributed-engine-worker:ci .
 
+      - name: Smoke production entrypoints
+        run: bash scripts/smoke-production-images.sh
+        env:
+          REDIS_PASSWORD: testpassword123
+
   publish-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test

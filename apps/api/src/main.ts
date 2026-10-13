@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Queue } from 'bullmq';
-import IORedis from 'ioredis';
+import { Redis as IORedis } from 'ioredis';
 import { Pool } from 'pg';
 import {
   AppError,
@@ -32,11 +32,11 @@ import {
   TenantSubmitTaskSchema,
   TenantCreateScheduleSchema,
   ValidationError,
-} from './validation';
-import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware';
-import { MetricsCollector } from './metrics';
-import { ShutdownManager } from './shutdown';
-import { config } from './config';
+} from './validation.js';
+import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
+import { MetricsCollector } from './metrics.js';
+import { ShutdownManager } from './shutdown.js';
+import { config } from './config.js';
 
 initTelemetry({
   serviceName: 'distributed-engine-api',

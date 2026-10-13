@@ -1,4 +1,4 @@
-import { TaskStatus } from './types';
+import { TaskStatus } from './types.js';
 
 const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   SCHEDULED: ['QUEUED', 'CANCELLED'],

@@ -5,8 +5,12 @@ const config = {
   roots: ['<rootDir>'],
   testMatch: ['**/__tests__/**/*.test.ts'],
   preset: 'ts-jest',
+  transform: {
+    '^.+\\.tsx?$': ['ts-jest', { tsconfig: { module: 'CommonJS', moduleResolution: 'Node' } }],
+  },
   moduleFileExtensions: ['ts', 'js', 'json'],
   moduleNameMapper: {
+    '^(\\.{1,2}/.*)\\.js$': '$1',
     '^@repo/shared$': '<rootDir>/../../packages/shared/src',
   },
   collectCoverageFrom: [

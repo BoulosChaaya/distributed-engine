@@ -555,6 +555,7 @@ describe('Concurrent quota race (requires PostgreSQL)', () => {
       return tenantRepo.createTenant('quota-race-tenant', plan.id, hash);
     })();
 
+    await tenantRepo.setOverrides(tenant.id, { maxJobsPerPeriod: 3 });
     const limits = await tenantRepo.getEffectiveLimits(tenant.id);
     const bp = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
 

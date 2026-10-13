@@ -1,9 +1,9 @@
 import { Pool } from 'pg';
-import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types';
-import { assertValidTransition } from '../state-machine';
-import { generateId } from '../utils';
-import { injectTraceContext } from '../telemetry/propagation';
-import { computeIdempotencyHash, IdempotencyConflictError, QuotaExceededError } from './tenant-repository';
+import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types.js';
+import { assertValidTransition } from '../state-machine.js';
+import { generateId } from '../utils.js';
+import { injectTraceContext } from '../telemetry/propagation.js';
+import { computeIdempotencyHash, IdempotencyConflictError, QuotaExceededError } from './tenant-repository.js';
 
 export interface CreateTaskInput {
   name: string;
