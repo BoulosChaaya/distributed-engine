@@ -1,289 +1,287 @@
 # Distributed Task Execution Engine
 
-A learning/portfolio distributed task execution engine with production-oriented reliability patterns. Built with TypeScript, Node.js, BullMQ, PostgreSQL, and Redis.
+A multi-tenant task execution engine in TypeScript: Node.js, PostgreSQL,
+Redis/BullMQ, Next.js. Built as a learning project to practise
+production-grade backend design. Every reliability claim below is backed by
+a test or a CI job that breaks the system on purpose.
 
-## What This Is
+**What it does.** Clients submit tasks over HTTP. PostgreSQL records them, and
+workers execute them through a handler registry, with retries, leases, quotas
+and fair scheduling across tenants. An operator dashboard shows and controls
+the system.
 
-An asynchronous task processing system demonstrating:
+**What it proves, on every pull request**
 
-- **Transactional outbox pattern** for reliable event publishing
-- **PostgreSQL as source of truth** for task state (not Redis)
-- **Optimistic concurrency control** with version columns
-- **State machine enforcement** on all task transitions
-- **At-least-once delivery** with idempotent job publication
-- **Circuit breaker** protecting the outbox publisher from Redis failures
-- **Stalled job recovery** for worker crash scenarios
-- **Graceful shutdown** for both API and worker processes
-
-This is **not** a production SaaS platform. It does not include service mesh, distributed tracing, log aggregation, advanced scheduling, or multi-tenancy. Those would be the next phase.
+| Claim | Proof |
+|---|---|
+| PostgreSQL is the source of truth; Redis only delivers | Transactional outbox; reconciler requeues anything Redis loses |
+| A killed worker or a flushed Redis loses nothing | `compose-chaos` CI job: SIGKILL a worker + FLUSHALL Redis mid-run, all 60 tasks still COMPLETED, none recorded twice |
+| Manifests work on Kubernetes with Istio ambient mTLS and L4 policies | `kind-istio` CI job: runtime verifier passes, including deny paths |
+| Production images work end to end | Smoke test on the built images: auth boundaries, retries, unknown types, tenant path |
+| Logic is correct under concurrency | 453 tests against real PostgreSQL and Redis (Node 22 and 24) |
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   Client App    │
-└────────┬────────┘
-         │ POST /tasks
-┌────────▼────────────┐     ┌──────────────┐
-│   API Server (3)    │────▶│  PostgreSQL   │  ← Source of truth
-└─────────────────────┘     └──────┬───────┘
-                                   │ outbox poll
-                            ┌──────▼───────┐
-                            │ Outbox       │
-                            │ Publisher    │
-                            └──────┬───────┘
-                                   │ BullMQ add
-                            ┌──────▼───────┐
-                            │    Redis     │  ← Job queue only
-                            └──────┬───────┘
-                                   │ consume
-                            ┌──────▼───────┐
-                            │ Workers (5+) │
-                            └──────────────┘
+ Operator browser                         Tenant client
+       │ Basic auth                            │ Bearer te_… (tenant key)
+┌──────▼──────────────┐  Bearer operator key  │
+│ Dashboard (Next.js) │──────────────┐        │
+│ /api/engine/* proxy │              │        │
+└─────────────────────┘        ┌─────▼────────▼──────────────────────┐
+                               │ API (Express)                       │
+                               │  outbox publisher · scheduler ·     │
+                               │  task reconciler (background)       │
+                               └──────┬───────────────────┬──────────┘
+                 task + outbox in one │                   │ BullMQ.add(jobId = taskId)
+                 transaction          ▼                   ▼
+                        ┌──────────────────┐     ┌─────────────────┐
+                        │ PostgreSQL       │     │ Redis (BullMQ)  │
+                        │ source of truth  │     │ delivery only   │
+                        └────────▲─────────┘     └────────┬────────┘
+                                 │ claim / renew /        │
+                                 │ complete (claim token) │
+                        ┌────────┴────────────────────────▼────────┐
+                        │ Workers: handler registry, leases, retry │
+                        └──────────────────────────────────────────┘
 ```
 
-**Task submission flow:**
+1. `POST /tasks` writes the task (QUEUED) and an outbox event in **one
+   transaction**. If either write fails, neither exists.
+2. The outbox publisher puts the job on BullMQ with `jobId = taskId`, so
+   publishing twice is a no-op.
+3. A worker claims the task in PostgreSQL (version check + claim token + lease
+   on the database clock), renews the lease while it works, and runs the
+   handler for the task's type.
+4. Success → COMPLETED with the result. Transient error → QUEUED with backoff.
+   Permanent error or spent budget → FAILED.
+5. If Redis drops the job, or BullMQ gives up on it, the **reconciler** finds
+   the orphan from PostgreSQL and requeues it through the outbox.
 
-1. API inserts task (status=QUEUED) + outbox event atomically in one PG transaction
-2. Outbox publisher polls PG for pending events, publishes to BullMQ using taskId as jobId (idempotent while the job exists in BullMQ)
-3. Worker picks up job, transitions task QUEUED → PROCESSING → COMPLETED/FAILED in PG
-4. On intermediate failure with remaining BullMQ retries: PROCESSING → QUEUED
-5. On final failure (retries exhausted): PROCESSING → FAILED
+Full design: [ARCHITECTURE.md](ARCHITECTURE.md). Operations:
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+## Features
+
+- **Reliability:**
+  - transactional outbox
+  - optimistic concurrency (version column) plus claim tokens on every
+    transition out of PROCESSING
+  - leases renewed on the database clock
+  - stalled-worker reclaim
+  - outbox circuit breaker
+  - Redis-loss reconciler
+  - graceful shutdown
+  - startup that waits for PostgreSQL and heals its Redis connection
+- **Task handlers:**
+  - `echo`, `sleep`, `flaky` (fails on purpose), and `http` (SSRF-safe
+    allow-list, no redirects)
+  - permanent vs transient errors
+  - retry budget owned by PostgreSQL
+  - per-task timeout
+  - abort when the lease is lost
+- **Scheduling:**
+  - one-time `scheduledFor`
+  - cron schedules with IANA time zones, misfire policies (`CATCH_UP_ALL`,
+    `SKIP_MISSED`, `RUN_ONCE`) and overlap policies (`ALLOW_OVERLAP`,
+    `FORBID_OVERLAP`)
+- **Multi-tenancy:**
+  - plans and per-tenant overrides
+  - per-period quotas, idempotency keys, concurrency leases
+  - Redis sliding-window rate limits
+  - weighted fair publishing
+  - suspension
+  - operator provisioning with keys shown once
+- **Security:**
+  - operator key on every operator route
+  - per-tenant keys stored as hashes only
+  - dashboard behind Basic auth with a server-side allow-listed proxy,
+    CSRF guard and strict CSP
+  - fail-closed defaults everywhere
+- **Observability:**
+  - OpenTelemetry traces from API → outbox → worker
+  - Pino JSON logs with trace correlation
+  - optional Jaeger, Loki/Alloy/Grafana via compose profiles
+- **Deployment:**
+  - multi-stage non-root images published to GHCR
+  - docker compose
+  - Kubernetes manifests with HPA/PDB
+  - Istio ambient (mTLS, Gateway API, L4 AuthorizationPolicies)
 
 ## Quick Start
 
-### Prerequisites
-
-- Node.js 20+
-- pnpm
-- Docker & Docker Compose (for PostgreSQL and Redis)
-
-### Local Development
+Requirements: Node.js 22+, pnpm (via corepack), Docker.
 
 ```bash
-pnpm install
-
-# Start PostgreSQL and Redis
-docker-compose up -d postgres redis
-
-# Operator key for /tasks, /schedules, /workers, /metrics
-export OPERATOR_API_KEY="$(openssl rand -hex 32)"
-
-# Run API server
-pnpm -F @distributed-engine/api run dev
-
-# Run worker (separate terminal)
-pnpm -F @distributed-engine/worker run dev
+cp .env.example .env     # set OPERATOR_API_KEY (openssl rand -hex 32) and dashboard login
+docker compose up -d --build --scale worker=3 postgres redis api worker web
 ```
 
-### Submit a Task
+- Dashboard: http://localhost:3001 (log in with `DASHBOARD_USER` / `DASHBOARD_PASSWORD`)
+- API: http://localhost:3000
 
 ```bash
+source .env
 curl -X POST http://localhost:3000/tasks \
   -H "Authorization: Bearer $OPERATOR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"echo","priority":"HIGH","maxRetries":3,"payload":{"hello":"world"}}'
 ```
 
-### Task Types
+Guided demo (stack, tenant, every task type, then a killed worker and a wiped
+Redis): `bash scripts/demo.sh`.
 
-A task's `name` is its type. The worker runs the handler registered under that
-name; an unknown name fails at once (retrying cannot make code appear).
+Development without containers for the app:
+
+```bash
+pnpm install
+docker compose up -d postgres redis
+export OPERATOR_API_KEY="$(openssl rand -hex 32)"
+pnpm -F @distributed-engine/api run dev
+pnpm -F @distributed-engine/worker run dev
+pnpm -F @distributed-engine/web run dev          # needs ENGINE_API_URL, OPERATOR_API_KEY, DASHBOARD_*
+```
+
+## Task Types
+
+A task's `name` is its type. Unknown types fail at once, because retrying
+cannot make code appear.
 
 | Type | Payload | Does |
 |------|---------|------|
 | `echo` | anything | Returns the payload as the result |
 | `sleep` | `{ "ms": 1000 }` (max 300000) | Waits; stands in for slow I/O |
-| `flaky` | `{ "failTimes": 1 }` | Fails the first N attempts, then succeeds; shows retries |
-| `http` | `{ "url", "method", "headers", "body", "timeoutMs" }` | Calls an allow-listed host. Disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set on the worker |
+| `flaky` | `{ "failTimes": 1 }` | Fails the first N attempts, then succeeds |
+| `http` | `{ "url", "method", "headers", "body", "timeoutMs" }` | Calls an allow-listed host; disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set |
 
-Errors are either permanent (unknown type, bad payload, HTTP 4xx), which fail the
-task immediately, or transient (timeout, HTTP 5xx/429, network), which are retried
-with exponential backoff until `maxRetries` is spent. Worker settings:
-`TASK_TIMEOUT_MS` (default 300000) and `HTTP_TASK_ALLOWED_HOSTS` (comma-separated
-hostnames, `*.example.com` allowed).
+- **Permanent errors** (unknown type, bad payload, HTTP 4xx): FAILED on that
+  attempt.
+- **Transient errors** (timeout, 5xx/429, network): retried with exponential
+  backoff until `maxRetries` is spent.
 
-### API Endpoints
+## API
 
-Operator routes (`/tasks`, `/schedules`, `/workers`, `/metrics`) require
-`Authorization: Bearer $OPERATOR_API_KEY` and answer 503 when no key is configured.
-Health probes are open. Tenant routes (`/tenant/*`) use per-tenant API keys.
+**Operator routes.** All require `Authorization: Bearer $OPERATOR_API_KEY`.
+They answer 503 if no key is configured.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /tasks | Create a task |
-| GET | /tasks | List tasks (paginated) |
-| GET | /tasks/:id | Get task by ID |
-| PUT | /tasks/:id/cancel | Cancel a task |
-| GET | /health | Health check (PG + Redis + circuit breaker) |
-| GET | /ready | Readiness probe (PG connectivity only) |
-| GET | /live | Liveness probe (always 200) |
-| GET | /metrics | JSON metrics (task counts, queue depth, outbox stats) |
-| GET | /workers | Live worker list from Redis heartbeats |
+| POST | /tasks | Create a task (`scheduledFor` makes it one-time scheduled) |
+| GET | /tasks, /tasks/:id | List (paginated) / get |
+| PUT | /tasks/:id/cancel | Cancel |
+| POST/GET/PUT | /schedules, /schedules/:id | Cron schedules |
+| PUT | /schedules/:id/status | ACTIVE / PAUSED / DISABLED |
+| GET | /metrics | JSON: task counts, queue depth, outbox |
+| GET | /workers | Live workers (heartbeats) |
+| GET | /plans | Plans |
+| GET/POST | /tenants | List / create (returns the tenant key **once**) |
+| GET | /tenants/:id | Limits, usage, live concurrency |
+| PUT | /tenants/:id/status | ACTIVE / SUSPENDED |
+| POST | /tenants/:id/api-key | Rotate key (old key revoked at once) |
+
+**Tenant routes.** All require `Authorization: Bearer te_…`. They are
+rate-limited and quota-checked.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /tenant/tasks | Submit (supports `idempotencyKey`) |
+| GET | /tenant/tasks, /tenant/tasks/:id | List / get own tasks |
+| PUT | /tenant/tasks/:id/cancel | Cancel own task |
+| POST/GET | /tenant/schedules, /tenant/schedules/:id | Own schedules |
+| GET | /tenant/usage | Limits and usage this period |
+
+**Probes** (no auth): `/health` (PG, Redis, breaker), `/ready` (PG), `/live`.
 
 ## Task State Machine
 
 ```
-QUEUED ──▶ PROCESSING ──▶ COMPLETED
-  │  ▲        │  │  ▲
-  │  │        │  │  │
-  │  └────────┘  │  └── (BullMQ retry: intermediate failure)
-  │              │
-  │              ▼
-  │           FAILED
-  │              
-  ▼
-CANCELLED ◀── QUEUED | PROCESSING
+SCHEDULED ──▶ QUEUED ──▶ PROCESSING ──▶ COMPLETED
+                ▲            │
+                └────────────┤  transient failure, budget left
+                             ▼
+                           FAILED   (permanent error or budget spent)
+
+QUEUED / SCHEDULED / PROCESSING ──▶ CANCELLED
 ```
 
-- **QUEUED**: Task created and waiting for a worker
-- **PROCESSING**: Worker has picked up the task
-- **COMPLETED**: Task finished successfully (terminal)
-- **FAILED**: Task failed after all retries exhausted (terminal). The state machine permits FAILED → QUEUED but no user-facing retry endpoint is exposed.
-- **CANCELLED**: Task cancelled by user (terminal)
+COMPLETED and CANCELLED are terminal. Leaving PROCESSING requires the current
+claim token, so a worker that lost its lease can never record an outcome.
 
-## Reliability Patterns
+## Delivery Guarantee
 
-### Source of Truth: PostgreSQL
+**At-least-once execution, exactly-once outcome.**
 
-All task state lives in PostgreSQL. Redis/BullMQ is a job queue only — if Redis loses data, the outbox publisher will re-publish pending events. Tasks are never created in Redis first.
+- A task whose worker dies mid-run executes again on another worker.
+- PostgreSQL records exactly one result per task.
+- Handlers that call external systems should be idempotent.
 
-### Transactional Outbox
+## Configuration
 
-Task creation and the outbox event are inserted in a single PG transaction. The outbox publisher polls for pending events and publishes to BullMQ. This guarantees at-least-once delivery: if the publisher crashes after BullMQ.add() but before marking the event DELIVERED, it will re-publish on the next poll.
+**API**
 
-**Idempotency boundary:** The outbox publisher uses taskId as the BullMQ jobId. BullMQ rejects duplicate jobIds while the job exists, making re-publication a no-op. However, completed jobs are removed after a retention window (`removeOnComplete: 100`), after which the jobId becomes reusable. The outbox marks events as DELIVERED after successful publication, so this window only matters if the outbox itself is manually reset.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| PORT | 3000 | HTTP port |
+| POSTGRES_HOST / PORT / DB / USER / PASSWORD | localhost / 5432 / distributed_engine / postgres / — | PostgreSQL |
+| POSTGRES_MAX_CONNECTIONS | 20 | Pool size |
+| REDIS_HOST / PORT / PASSWORD | localhost / 6379 / — | Redis |
+| OPERATOR_API_KEY | — | Operator Bearer key, 32+ chars; unset = operator routes 503 |
+| OUTBOX_POLL_INTERVAL_MS / BATCH_SIZE / MAX_ATTEMPTS | 1000 / 10 / 5 | Outbox publisher |
+| SCHEDULER_POLL_INTERVAL_MS / BATCH_SIZE | 5000 / 50 | Scheduler |
+| RECONCILER_INTERVAL_MS / QUEUED_GRACE_MS / BATCH_SIZE | 30000 / 60000 / 100 | Redis-loss reconciler |
+| GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Drain timeout |
+| LOG_LEVEL | INFO | DEBUG, INFO, WARN, ERROR |
 
-### Cancellation Safety
+**Worker**
 
-The outbox publisher performs a best-effort cancellation check before publishing to BullMQ. Because PostgreSQL and Redis are separate systems, the check and the publish are **not** atomic — a task can be cancelled between the check and the BullMQ.add() call. If this race occurs, BullMQ will hold a job for a cancelled task. The worker guards (status check before processing, version-checked state transitions) ensure such a job is skipped harmlessly. PostgreSQL is the authoritative source of task state; workers always verify task status before processing.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| POSTGRES_* / REDIS_* | as API | Connections |
+| QUEUE_CONCURRENCY | 5 | Jobs in parallel per worker |
+| TASK_TIMEOUT_MS | 300000 | Per-task execution limit |
+| HTTP_TASK_ALLOWED_HOSTS | — | Comma-separated hosts for `http` tasks (`*.example.com` allowed); empty = disabled |
+| SCHEDULE_LEASE_DURATION_MS | 300000 | FORBID_OVERLAP execution lease |
 
-### Optimistic Concurrency
+**Dashboard:** `ENGINE_API_URL`, `OPERATOR_API_KEY`, `DASHBOARD_USER`,
+`DASHBOARD_PASSWORD`. Missing login → 503.
 
-Every task has a `version` column. State transitions use `SELECT FOR UPDATE` + version check. If two workers race to process the same task, only one wins — the other gets a `StaleVersionError`.
-
-### Stalled Job Recovery
-
-If a worker crashes while processing a task, BullMQ detects the stalled job and redelivers it. The new worker finds the task in PROCESSING state and reclaims it by verifying the version and bumping it under a row lock. This prevents the task from getting stuck in PROCESSING after a worker crash. BullMQ's `maxStalledCount` limits how many times a single job can be reclaimed before being marked as failed.
-
-### Circuit Breaker (Outbox Publisher)
-
-The outbox publisher has a built-in circuit breaker for BullMQ operations. After 5 consecutive failures, it stops attempting to publish (OPEN state). After 30 seconds, it tries a single operation as a probe (HALF_OPEN) — not the full batch. After 2 consecutive successes, it resumes normal operation (CLOSED). The `/health` endpoint reports this state.
-
-### At-Least-Once, Not Exactly-Once
-
-This system provides **at-least-once delivery**. A task may be processed more than once if:
-- The worker crashes after completing work but before writing COMPLETED to PG
-- BullMQ retries a job that the worker already processed
-
-Task handlers should be **idempotent** — processing the same task twice should produce the same result.
+**Tracing:** standard `OTEL_*` variables (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_SDK_DISABLED`, `OTEL_TRACES_SAMPLER_ARG`).
 
 ## Testing
 
 ```bash
-# Run all tests (requires PostgreSQL + Redis)
-docker-compose up -d postgres redis
-pnpm test
-
-# Full verification (build + test)
-pnpm verify
+docker compose up -d postgres redis
+pnpm test            # unit + integration against real PostgreSQL and Redis
+pnpm verify          # build + test
+bash scripts/chaos-compose.sh       # full stack under a killed worker and a flushed Redis
+bash scripts/k8s-kind-e2e.sh        # kind + Istio ambient + runtime verifier (needs images built)
 ```
 
-Integration tests for TaskRepository and OutboxPublisher require PostgreSQL and Redis. Tests fail with a clear error when infrastructure is unavailable rather than silently passing.
+Integration tests fail loudly when PostgreSQL or Redis is missing. They never
+skip silently.
 
 ## Project Structure
 
 ```
-distributed-engine/
-├── apps/
-│   ├── api/           # Express REST API server
-│   ├── worker/        # BullMQ job processor
-│   └── web/           # Next.js dashboard
-├── packages/
-│   ├── shared/        # Types, state machine, DB layer, outbox
-│   └── ui/            # Shared React components
-├── k8s/               # Kubernetes manifests
-├── docker-compose.yml # Local development services
-├── Dockerfile.api     # API container image
-└── Dockerfile.worker  # Worker container image
+apps/
+  api/        Express API, operator + tenant routes, background loops
+  worker/     BullMQ worker, task execution orchestration
+  web/        Next.js operator dashboard (server-side proxy to the API)
+packages/
+  shared/     state machine, repositories, outbox, reconciler, scheduler,
+              task handlers, tenancy, telemetry, logger
+  ui/         shared React components
+k8s/          Kubernetes manifests (+ istio/ for the ambient mesh layer)
+ci/kind/      kustomize overlay used by CI on kind
+scripts/      smoke, chaos, kind e2e, demo
+docs/         runbooks (backup/restore, Redis-loss recovery, deployment)
 ```
 
-## Configuration
+## Not Included (Yet)
 
-All configuration is via environment variables with sensible defaults for local development.
-
-### API Server
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| PORT | 3000 | API server port |
-| REDIS_HOST | localhost | Redis hostname |
-| REDIS_PORT | 6379 | Redis port |
-| POSTGRES_HOST | localhost | PostgreSQL hostname |
-| POSTGRES_PORT | 5432 | PostgreSQL port |
-| POSTGRES_DB | distributed_engine | Database name |
-| POSTGRES_USER | postgres | Database user |
-| POSTGRES_PASSWORD | (none) | Database password |
-| POSTGRES_MAX_CONNECTIONS | 20 | PG pool size |
-| OUTBOX_POLL_INTERVAL_MS | 1000 | Outbox polling frequency |
-| OUTBOX_BATCH_SIZE | 10 | Events per outbox poll |
-| OUTBOX_MAX_ATTEMPTS | 5 | Max outbox publish attempts |
-| OPERATOR_API_KEY | (none) | Bearer key for operator routes; at least 32 characters. Unset = operator routes return 503 |
-| RECONCILER_INTERVAL_MS | 30000 | How often the API checks PostgreSQL against Redis for lost tasks |
-| RECONCILER_QUEUED_GRACE_MS | 60000 | How long a QUEUED task may sit untouched before its BullMQ job is checked |
-| RECONCILER_BATCH_SIZE | 100 | Tasks checked per reconcile cycle |
-| GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Shutdown drain timeout |
-| LOG_LEVEL | INFO | Logging level |
-
-### Worker
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| REDIS_HOST | localhost | Redis hostname |
-| REDIS_PORT | 6379 | Redis port |
-| POSTGRES_HOST | localhost | PostgreSQL hostname |
-| POSTGRES_PORT | 5432 | PostgreSQL port |
-| POSTGRES_DB | distributed_engine | Database name |
-| POSTGRES_USER | postgres | Database user |
-| POSTGRES_PASSWORD | (none) | Database password |
-| QUEUE_CONCURRENCY | 5 | Concurrent jobs per worker |
-
-## Kubernetes Deployment
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the full deployment guide. The K8s manifests in `k8s/` provide:
-
-- API: 3 replicas with HPA (3-10), readiness probe on `/ready` (PG only), liveness on `/live`
-- Workers: 5 replicas with HPA (5-20), graceful shutdown with 40s termination grace period
-- Redis: StatefulSet with AOF persistence
-- PostgreSQL: StatefulSet with persistent volume
-
-HPA scales on CPU and memory utilization. Queue-depth-based scaling requires a custom metrics adapter (not included).
-
-## What's Not Included (Future Work)
-
-- Service mesh (Istio)
-- Distributed tracing (OpenTelemetry/Jaeger)
-- Log aggregation (ELK/Loki)
-- Prometheus-format metrics endpoint
-- Advanced scheduling (cron, dependencies, DAGs)
-- Multi-tenancy
-- Authentication/authorization on the API
-
-## Dashboard
-
-`apps/web` is the operator dashboard (Next.js 16). The browser never talks to the
-engine API directly: pages call `/api/engine/*` on the dashboard, which checks the
-operator's Basic credentials, allows only a fixed list of calls, refuses
-cross-site writes, and forwards the call with the operator key held server-side.
-
-| Variable | Description |
-|----------|-------------|
-| ENGINE_API_URL | Engine API base URL, e.g. `http://api:3000` |
-| OPERATOR_API_KEY | Same key the API uses |
-| DASHBOARD_USER / DASHBOARD_PASSWORD | Basic auth login. Unset = dashboard answers 503 |
-
-```bash
-cp .env.example .env   # fill in the three values
-docker compose up -d --build postgres redis api worker web
-# open http://localhost:3001
-```
+- Prometheus-format metrics (`/metrics` is JSON), so no queue-depth autoscaling
+- DAG / workflow dependencies between tasks
+- A dead-letter queue beyond FAILED tasks; saga/compensation
+- TLS at the Gateway (environment-specific certificates)
+- Load and soak testing

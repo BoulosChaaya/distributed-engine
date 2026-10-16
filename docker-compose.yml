@@ -81,6 +81,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       LOG_LEVEL: info
+      # Hosts the `http` task type may call (comma-separated). Empty disables it.
+      HTTP_TASK_ALLOWED_HOSTS: ${HTTP_TASK_ALLOWED_HOSTS:-}
     depends_on:
       redis:
         condition: service_healthy
