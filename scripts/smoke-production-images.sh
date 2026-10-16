@@ -154,3 +154,17 @@ wait_status "$flaky_id" COMPLETED
 # 3. Unknown task type: must fail permanently instead of retrying forever.
 unknown_id=$(submit '{"name":"no-such-type","maxRetries":5}')
 wait_status "$unknown_id" FAILED
+
+# 4. Tenant path: operator provisions a tenant, the tenant submits with its own key.
+tenant=$(curl -sf "${op[@]}" -H 'Content-Type: application/json' -X POST \
+  -d '{"name":"smoke-tenant","planId":"plan_starter"}' http://localhost:3000/tenants)
+tenant_key=$(node -e 'console.log(JSON.parse(process.argv[1]).data.apiKey)' "$tenant")
+tk=(-H "Authorization: Bearer ${tenant_key}")
+expect 401 "tenant route without tenant key" http://localhost:3000/tenant/tasks
+expect 401 "operator key is not a tenant key" "${op[@]}" http://localhost:3000/tenant/tasks
+tenant_task=$(curl -sf "${tk[@]}" -H 'Content-Type: application/json' -X POST \
+  -d '{"name":"echo","payload":{"from":"tenant"}}' http://localhost:3000/tenant/tasks \
+  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.id))')
+wait_status "$tenant_task" COMPLETED
+expect 200 "tenant reads its usage" "${tk[@]}" http://localhost:3000/tenant/usage
+

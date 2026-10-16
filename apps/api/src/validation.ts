@@ -93,3 +93,12 @@ export class ValidationError extends Error {
     };
   }
 }
+
+export const CreateTenantSchema = z.object({
+  name: z.string().trim().min(1, 'Tenant name is required').max(255, 'Tenant name too long'),
+  planId: z.string().min(1, 'planId is required'),
+});
+
+export const SetTenantStatusSchema = z.object({
+  status: z.enum(['ACTIVE', 'SUSPENDED']),
+});

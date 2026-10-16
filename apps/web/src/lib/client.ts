@@ -71,3 +71,20 @@ export interface WorkerView {
   jobsFailed: number;
   lastHeartbeat: string;
 }
+
+export interface PlanView {
+  id: string;
+  name: string;
+  maxConcurrentExecutions: number;
+  maxJobsPerPeriod: number;
+  rateLimit: number;
+  weight: number;
+}
+
+export interface TenantView {
+  id: string;
+  name: string;
+  status: 'ACTIVE' | 'SUSPENDED';
+  planId: string;
+  createdAt: string;
+}

@@ -173,6 +173,21 @@ export class TenantRepository {
     return rowToTenant(result.rows[0]);
   }
 
+  async listTenants(): Promise<Tenant[]> {
+    const result = await this.pool.query('SELECT * FROM tenants ORDER BY created_at DESC');
+    return result.rows.map(rowToTenant);
+  }
+
+  /** Replaces the tenant's API key hash; the old key stops working at once. */
+  async rotateApiKey(tenantId: string, apiKeyHash: string): Promise<Tenant> {
+    const result = await this.pool.query(
+      `UPDATE tenants SET api_key_hash = $2, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [tenantId, apiKeyHash],
+    );
+    if (result.rows.length === 0) throw new Error(`Tenant ${tenantId} not found`);
+    return rowToTenant(result.rows[0]);
+  }
+
   async setTenantStatus(tenantId: string, status: TenantStatus): Promise<Tenant> {
     const result = await this.pool.query(
       `UPDATE tenants SET status = $2, updated_at = NOW() WHERE id = $1 RETURNING *`,
