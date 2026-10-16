@@ -35,6 +35,7 @@ import {
   ValidationError,
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
+import { createOperatorAuth } from './operator-auth.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { config } from './config.js';
@@ -117,7 +118,8 @@ const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher);
 
 const shutdownManager = new ShutdownManager(config.gracefulShutdown.timeoutMs);
 
-app.use(express.json({ limit: '10mb' }));
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 
 app.use((_req: Request, res: Response, next: NextFunction) => {
   try {
@@ -193,6 +195,11 @@ app.get('/live', (_req: Request, res: Response) => {
   res.json({ success: true, data: { status: 'alive' } });
 });
 
+// Everything below that is not /tenant/* or a health probe is operator-only.
+// app.use with a path prefix matches '/tasks' and '/tasks/...', never '/tenant/tasks'.
+const operatorAuth = createOperatorAuth(config.operator.apiKey);
+app.use(['/metrics', '/workers', '/tasks', '/schedules'], operatorAuth);
+
 app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const metricsData = await metrics.getMetrics();
@@ -206,9 +213,16 @@ app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => 
   try {
     let workers: unknown[] = [];
     try {
-      const keys = await redisClient.keys('worker:*');
-      for (const key of keys) {
-        const workerData = await redisClient.get(key);
+      // SCAN, not KEYS: KEYS blocks Redis for the whole keyspace walk.
+      const keys: string[] = [];
+      let cursor = '0';
+      do {
+        const [next, batch] = await redisClient.scan(cursor, 'MATCH', 'worker:*', 'COUNT', 200);
+        cursor = next;
+        keys.push(...batch);
+      } while (cursor !== '0');
+      const values = keys.length > 0 ? await redisClient.mget(...keys) : [];
+      for (const workerData of values) {
         if (workerData) {
           workers.push(JSON.parse(workerData));
         }
@@ -768,6 +782,10 @@ async function start() {
 
   await runMigrations(pgPool);
   logger.info('Database migrations complete');
+
+  if (!config.operator.apiKey) {
+    logger.warn('OPERATOR_API_KEY is not set: /tasks, /schedules, /workers and /metrics will answer 503');
+  }
 
   outboxPublisher.start();
   logger.info('Outbox publisher started');

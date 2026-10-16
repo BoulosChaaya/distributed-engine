@@ -1,98 +1,51 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import { engine, type MetricsView } from '@/lib/client';
+import { usePoll } from '@/lib/use-poll';
 
-interface DashboardStats {
-  totalTasks: number;
-  queuedTasks: number;
-  processingTasks: number;
-  completedTasks: number;
-  failedTasks: number;
-}
+const STATUSES = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED', 'SCHEDULED'] as const;
 
-export default function Dashboard() {
-  const [stats, setStats] = useState<DashboardStats>({
-    totalTasks: 0,
-    queuedTasks: 0,
-    processingTasks: 0,
-    completedTasks: 0,
-    failedTasks: 0,
-  });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const fetchStats = async () => {
-      try {
-        const response = await fetch(
-          `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/metrics`
-        );
-        const data = await response.json();
-
-        if (data.success) {
-          const byStatus = data.data.tasks.byStatus || {};
-          setStats({
-            totalTasks: data.data.tasks.total || 0,
-            queuedTasks: (byStatus.QUEUED || 0) + (byStatus.PENDING || 0),
-            processingTasks: byStatus.PROCESSING || 0,
-            completedTasks: byStatus.COMPLETED || 0,
-            failedTasks: byStatus.FAILED || 0,
-          });
-          setError(null);
-        }
-      } catch (err) {
-        setError('Unable to connect to API');
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchStats();
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
-  }, []);
+export default function Overview() {
+  const { data, error } = usePoll(() => engine<MetricsView>('metrics'), 5000);
 
   return (
-    <div>
-      <h1>Dashboard</h1>
-      <p>System Overview</p>
-
-      {loading ? (
-        <p>Loading...</p>
-      ) : error ? (
-        <p style={{ color: 'red' }}>{error}</p>
-      ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '16px' }}>
-          <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.totalTasks}</h3>
-            <p>Total Tasks</p>
-          </div>
-          <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.queuedTasks}</h3>
-            <p>Queued</p>
-          </div>
-          <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.processingTasks}</h3>
-            <p>Processing</p>
-          </div>
-          <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.completedTasks}</h3>
-            <p>Completed</p>
-          </div>
-          <div style={{ background: 'white', padding: '16px', borderRadius: '4px' }}>
-            <h3>{stats.failedTasks}</h3>
-            <p>Failed</p>
-          </div>
-        </div>
+    <>
+      <h1>Overview</h1>
+      {error && <p className="error" role="alert">{error}</p>}
+      {!data && !error && <p className="muted">Loading…</p>}
+      {data && (
+        <>
+          <section className="cards" aria-label="Tasks by status">
+            <Stat label="Total tasks" value={data.tasks.total} />
+            {STATUSES.map((s) => (
+              <Stat
+                key={s}
+                label={s.charAt(0) + s.slice(1).toLowerCase()}
+                value={data.tasks.byStatus[s] ?? 0}
+                tone={(data.tasks.byStatus[s] ?? 0) > 0 ? s.toLowerCase() : undefined}
+              />
+            ))}
+          </section>
+          <h2>Pipeline</h2>
+          <section className="cards" aria-label="Queue and outbox">
+            <Stat label="Queue waiting" value={data.queue.waiting} />
+            <Stat label="Queue active" value={data.queue.active} />
+            <Stat label="Outbox pending" value={data.outbox.pending} />
+            <Stat label="Outbox failed" value={data.outbox.failed} tone={data.outbox.failed > 0 ? 'failed' : undefined} />
+            <Stat label="API uptime (seconds)" value={data.uptime} />
+            <Stat label="API error rate" value={`${data.requests.errorRate}%`} />
+          </section>
+        </>
       )}
+    </>
+  );
+}
 
-      <div style={{ marginTop: '32px', background: 'white', padding: '16px', borderRadius: '4px' }}>
-        <h2>Quick Actions</h2>
-        <button onClick={() => (window.location.href = '/tasks')}>Manage Tasks</button>
-        <button onClick={() => (window.location.href = '/workers')} style={{ marginLeft: '8px' }}>
-          View Workers
-        </button>
-      </div>
+function Stat({ label, value, tone }: { label: string; value: number | string; tone?: string }) {
+  return (
+    <div className={`card${tone ? ` tone-${tone}` : ''}`}>
+      <div className="value">{value}</div>
+      <div className="label">{label}</div>
     </div>
   );
 }

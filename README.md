@@ -66,6 +66,9 @@ pnpm install
 # Start PostgreSQL and Redis
 docker-compose up -d postgres redis
 
+# Operator key for /tasks, /schedules, /workers, /metrics
+export OPERATOR_API_KEY="$(openssl rand -hex 32)"
+
 # Run API server
 pnpm -F @distributed-engine/api run dev
 
@@ -77,11 +80,16 @@ pnpm -F @distributed-engine/worker run dev
 
 ```bash
 curl -X POST http://localhost:3000/tasks \
+  -H "Authorization: Bearer $OPERATOR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"hello-world","priority":"HIGH","maxRetries":3}'
 ```
 
 ### API Endpoints
+
+Operator routes (`/tasks`, `/schedules`, `/workers`, `/metrics`) require
+`Authorization: Bearer $OPERATOR_API_KEY` and answer 503 when no key is configured.
+Health probes are open. Tenant routes (`/tenant/*`) use per-tenant API keys.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -202,6 +210,7 @@ All configuration is via environment variables with sensible defaults for local 
 | OUTBOX_POLL_INTERVAL_MS | 1000 | Outbox polling frequency |
 | OUTBOX_BATCH_SIZE | 10 | Events per outbox poll |
 | OUTBOX_MAX_ATTEMPTS | 5 | Max outbox publish attempts |
+| OPERATOR_API_KEY | (none) | Bearer key for operator routes; at least 32 characters. Unset = operator routes return 503 |
 | RECONCILER_INTERVAL_MS | 30000 | How often the API checks PostgreSQL against Redis for lost tasks |
 | RECONCILER_QUEUED_GRACE_MS | 60000 | How long a QUEUED task may sit untouched before its BullMQ job is checked |
 | RECONCILER_BATCH_SIZE | 100 | Tasks checked per reconcile cycle |
@@ -241,3 +250,22 @@ HPA scales on CPU and memory utilization. Queue-depth-based scaling requires a c
 - Advanced scheduling (cron, dependencies, DAGs)
 - Multi-tenancy
 - Authentication/authorization on the API
+
+## Dashboard
+
+`apps/web` is the operator dashboard (Next.js 16). The browser never talks to the
+engine API directly: pages call `/api/engine/*` on the dashboard, which checks the
+operator's Basic credentials, allows only a fixed list of calls, refuses
+cross-site writes, and forwards the call with the operator key held server-side.
+
+| Variable | Description |
+|----------|-------------|
+| ENGINE_API_URL | Engine API base URL, e.g. `http://api:3000` |
+| OPERATOR_API_KEY | Same key the API uses |
+| DASHBOARD_USER / DASHBOARD_PASSWORD | Basic auth login. Unset = dashboard answers 503 |
+
+```bash
+cp .env.example .env   # fill in the three values
+docker compose up -d --build postgres redis api worker web
+# open http://localhost:3001
+```

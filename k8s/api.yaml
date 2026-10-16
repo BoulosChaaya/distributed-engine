@@ -77,6 +77,16 @@ spec:
             secretKeyRef:
               name: postgres-secret
               key: password
+        # Operator routes (/tasks, /schedules, /workers, /metrics) answer 503
+        # until this secret exists. Create it with:
+        #   kubectl -n distributed-engine create secret generic operator-secret \
+        #     --from-literal=api-key="$(openssl rand -hex 32)"
+        - name: OPERATOR_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: operator-secret
+              key: api-key
+              optional: true
 
         resources:
           requests:

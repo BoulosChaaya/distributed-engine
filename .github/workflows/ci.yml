@@ -76,6 +76,7 @@ jobs:
         run: |
           docker build -f Dockerfile.api -t distributed-engine-api:ci .
           docker build -f Dockerfile.worker -t distributed-engine-worker:ci .
+          docker build -f Dockerfile.web -t distributed-engine-web:ci .
 
       - name: Smoke production entrypoints
         if: matrix.node == 22
@@ -102,6 +103,7 @@ jobs:
           owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           echo "api=ghcr.io/${owner}/distributed-engine-api:${{ github.sha }}" >> "$GITHUB_OUTPUT"
           echo "worker=ghcr.io/${owner}/distributed-engine-worker:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "web=ghcr.io/${owner}/distributed-engine-web:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
@@ -110,10 +112,13 @@ jobs:
         run: |
           docker build -f Dockerfile.api -t '${{ steps.names.outputs.api }}' .
           docker build -f Dockerfile.worker -t '${{ steps.names.outputs.worker }}' .
+          docker build -f Dockerfile.web -t '${{ steps.names.outputs.web }}' .
           docker push '${{ steps.names.outputs.api }}'
           docker push '${{ steps.names.outputs.worker }}'
+          docker push '${{ steps.names.outputs.web }}'
 
       - name: Image digests
         run: |
           echo "API:    $(docker inspect --format='{{index .RepoDigests 0}}' '${{ steps.names.outputs.api }}')"
           echo "Worker: $(docker inspect --format='{{index .RepoDigests 0}}' '${{ steps.names.outputs.worker }}')"
+          echo "Web:    $(docker inspect --format='{{index .RepoDigests 0}}' '${{ steps.names.outputs.web }}')"

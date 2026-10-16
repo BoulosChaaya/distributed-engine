@@ -1,0 +1,42 @@
+# Operator dashboard (Next.js standalone output).
+# Stage 1: install and build only the web workspace.
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY apps/web ./apps/web
+
+RUN npm install -g pnpm@10.34.7 \
+  && pnpm install --frozen-lockfile --filter @distributed-engine/web \
+  && pnpm --filter @distributed-engine/web build
+
+# Stage 2: the standalone server needs no node_modules install and no pnpm.
+FROM node:22-alpine
+
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3001 \
+    HOSTNAME=0.0.0.0
+
+RUN apk add --no-cache dumb-init \
+  && addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+# In a workspace the standalone tree mirrors the repo layout: server.js lives in apps/web.
+COPY --from=builder --chown=nodejs:nodejs /app/apps/web/.next/standalone ./
+COPY --from=builder --chown=nodejs:nodejs /app/apps/web/.next/static ./apps/web/.next/static
+
+USER nodejs
+EXPOSE 3001
+
+# Health probe: an unauthenticated request must get the Basic challenge (401), which proves
+# the server and the auth proxy are both up. 503 (credentials not configured) counts as unhealthy.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:3001/').then(r=>process.exit(r.status===401?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "apps/web/server.js"]
+
+LABEL description="Operator dashboard for the distributed task execution engine"
