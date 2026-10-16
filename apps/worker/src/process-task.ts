@@ -7,6 +7,8 @@ export interface TaskRepoLike {
   transitionStatus(taskId: string, version: number, status: string, opts: any): Promise<any>;
   reclaimStalledTask(taskId: string, version: number, workerId: string): Promise<any>;
   renewClaim(taskId: string, claimToken: string): Promise<any>;
+  /** Workflow steps: outputs of direct dependencies keyed by step key. */
+  getUpstreamOutputs?(taskId: string): Promise<Record<string, unknown>>;
 }
 
 export interface ScheduleRepoLike {
@@ -78,6 +80,7 @@ export interface ExecuteContext {
   payload: Record<string, unknown>;
   attempt: number;
   signal: AbortSignal;
+  upstream?: Record<string, unknown>;
 }
 
 /** Matches NonRetryableTaskError from @repo/shared without importing it here. */
@@ -152,6 +155,17 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       parentSpan.setAttribute('task.skipped', true);
       parentSpan.setAttribute('task.skip_reason', 'already_failed');
       return { status: 'SKIPPED', taskId, reason: 'already_failed' };
+    }
+
+    // Only QUEUED (claim) and PROCESSING (reclaim) can run. A job for a
+    // SCHEDULED or BLOCKED task would otherwise fall through to execution
+    // without a claim. That cannot happen through the outbox, but a stray or
+    // replayed job must never execute a step whose dependencies are not done.
+    if (currentTask.status !== 'QUEUED' && currentTask.status !== 'PROCESSING') {
+      logger.warn('Task is not runnable, skipping', { taskId, status: currentTask.status });
+      parentSpan.setAttribute('task.skipped', true);
+      parentSpan.setAttribute('task.skip_reason', 'not_runnable');
+      return { status: 'SKIPPED', taskId, reason: 'not_runnable' };
     }
 
     if (tenantRepo && currentTask.tenantId) {
@@ -326,12 +340,16 @@ export function createProcessTask(deps: ProcessTaskDeps) {
 
       logger.info('Task execution started', { taskId });
 
+      const upstream = currentTask.workflowId && taskRepo.getUpstreamOutputs
+        ? await taskRepo.getUpstreamOutputs(taskId)
+        : undefined;
       const output = await execute({
         taskId,
         name: currentTask.name,
         payload: (currentTask.payload ?? {}) as Record<string, unknown>,
         attempt: currentRetries + 1,
         signal: abort.signal,
+        upstream,
       });
 
       if (ownershipLost) {

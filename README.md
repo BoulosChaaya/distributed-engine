@@ -5,20 +5,21 @@ Redis/BullMQ, Next.js. Built as a learning project to practise
 production-grade backend design. Every reliability claim below is backed by
 a test or a CI job that breaks the system on purpose.
 
-**What it does.** Clients submit tasks over HTTP. PostgreSQL records them, and
-workers execute them through a handler registry, with retries, leases, quotas
-and fair scheduling across tenants. An operator dashboard shows and controls
-the system.
+**What it does.** Clients submit tasks, or whole workflows (DAGs of tasks),
+over HTTP. PostgreSQL records them, and workers execute them through a handler
+registry, with retries, leases, quotas and fair scheduling across tenants. An
+operator dashboard shows and controls the system.
 
 **What it proves, on every pull request**
 
 | Claim | Proof |
 |---|---|
 | PostgreSQL is the source of truth; Redis only delivers | Transactional outbox; reconciler requeues anything Redis loses |
-| A killed worker or a flushed Redis loses nothing | `compose-chaos` CI job: SIGKILL a worker + FLUSHALL Redis mid-run, all 60 tasks still COMPLETED, none recorded twice |
+| A killed worker or a flushed Redis loses nothing | `compose-chaos` CI job: SIGKILL a worker + FLUSHALL Redis mid-run, all 60 tasks and 5 workflows still COMPLETED, none recorded twice |
+| Workflows advance exactly when their dependencies finish | Parent completion and child release commit in one transaction; concurrent parents release a join exactly once (tested) |
 | Manifests work on Kubernetes with Istio ambient mTLS and L4 policies | `kind-istio` CI job: runtime verifier passes, including deny paths |
 | Production images work end to end | Smoke test on the built images: auth boundaries, retries, unknown types, tenant path |
-| Logic is correct under concurrency | 453 tests against real PostgreSQL and Redis (Node 22 and 24) |
+| Logic is correct under concurrency | 490 tests against real PostgreSQL and Redis (Node 22 and 24) |
 
 ## Architecture
 
@@ -73,6 +74,11 @@ Full design: [ARCHITECTURE.md](ARCHITECTURE.md). Operations:
   - Redis-loss reconciler
   - graceful shutdown
   - startup that waits for PostgreSQL and heals its Redis connection
+- **Workflows (DAG):**
+  - fan-out and fan-in, validated up front: cycles rejected with the cycle named
+  - a step runs when all its parents have completed, and receives their outputs
+  - a failed step cancels only its downstream; independent branches finish
+  - cancel a whole workflow; idempotency keys; tenants charged one job per step
 - **Task handlers:**
   - `echo`, `sleep`, `flaky` (fails on purpose), and `http` (SSRF-safe
     allow-list, no redirects)
@@ -169,6 +175,9 @@ They answer 503 if no key is configured.
 | POST | /tasks | Create a task (`scheduledFor` makes it one-time scheduled) |
 | GET | /tasks, /tasks/:id | List (paginated) / get |
 | PUT | /tasks/:id/cancel | Cancel |
+| POST | /workflows | Start a workflow `{ name, steps: [{ key, name, payload, dependsOn }], idempotencyKey? }` |
+| GET | /workflows, /workflows/:id | List with progress / steps with status, level, dependencies, output |
+| PUT | /workflows/:id/cancel | Cancel the workflow and every unfinished step |
 | POST/GET/PUT | /schedules, /schedules/:id | Cron schedules |
 | PUT | /schedules/:id/status | ACTIVE / PAUSED / DISABLED |
 | GET | /metrics | JSON: task counts, queue depth, outbox |
@@ -187,21 +196,50 @@ rate-limited and quota-checked.
 | POST | /tenant/tasks | Submit (supports `idempotencyKey`) |
 | GET | /tenant/tasks, /tenant/tasks/:id | List / get own tasks |
 | PUT | /tenant/tasks/:id/cancel | Cancel own task |
+| POST/GET | /tenant/workflows, /tenant/workflows/:id | Own workflows (quota: one job per step) |
+| PUT | /tenant/workflows/:id/cancel | Cancel own workflow |
 | POST/GET | /tenant/schedules, /tenant/schedules/:id | Own schedules |
 | GET | /tenant/usage | Limits and usage this period |
 
 **Probes** (no auth): `/health` (PG, Redis, breaker), `/ready` (PG), `/live`.
 
+## Workflows
+
+```bash
+curl -X POST http://localhost:3000/workflows \
+  -H "Authorization: Bearer $OPERATOR_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"nightly-report","steps":[
+        {"key":"fetch","name":"echo","payload":{"source":"orders"}},
+        {"key":"by-region","name":"sleep","payload":{"ms":2000},"dependsOn":["fetch"]},
+        {"key":"by-product","name":"flaky","payload":{"failTimes":1},"dependsOn":["fetch"]},
+        {"key":"merge","name":"echo","dependsOn":["by-region","by-product"]}]}'
+```
+
+```
+fetch ──┬──▶ by-region ──┐
+        └──▶ by-product ─┴──▶ merge      (merge receives both outputs as `upstream`)
+```
+
+- Steps with dependencies start BLOCKED: no queue job exists until their last
+  parent completes.
+- Completion and release commit in the same transaction, so a crash between
+  "parent done" and "child released" is impossible.
+- If a step fails (after its retries), its downstream steps are CANCELLED with
+  "Upstream step … failed". Branches that do not depend on it run to the end,
+  and then the workflow is FAILED.
+- The dashboard's Workflows page draws the graph by level and updates live.
+
 ## Task State Machine
 
 ```
 SCHEDULED ──▶ QUEUED ──▶ PROCESSING ──▶ COMPLETED
+BLOCKED ────▶ QUEUED     (workflow step: last dependency completed)
                 ▲            │
                 └────────────┤  transient failure, budget left
                              ▼
                            FAILED   (permanent error or budget spent)
 
-QUEUED / SCHEDULED / PROCESSING ──▶ CANCELLED
+QUEUED / SCHEDULED / BLOCKED / PROCESSING ──▶ CANCELLED
 ```
 
 COMPLETED and CANCELLED are terminal. Leaving PROCESSING requires the current
@@ -270,7 +308,7 @@ apps/
   web/        Next.js operator dashboard (server-side proxy to the API)
 packages/
   shared/     state machine, repositories, outbox, reconciler, scheduler,
-              task handlers, tenancy, telemetry, logger
+              workflows (DAG engine), task handlers, tenancy, telemetry, logger
   ui/         shared React components
 k8s/          Kubernetes manifests (+ istio/ for the ambient mesh layer)
 ci/kind/      kustomize overlay used by CI on kind
@@ -281,7 +319,7 @@ docs/         runbooks (backup/restore, Redis-loss recovery, deployment)
 ## Not Included (Yet)
 
 - Prometheus-format metrics (`/metrics` is JSON), so no queue-depth autoscaling
-- DAG / workflow dependencies between tasks
+- Workflows started by cron schedules (schedules create single tasks today)
 - A dead-letter queue beyond FAILED tasks; saga/compensation
 - TLS at the Gateway (environment-specific certificates)
 - Load and soak testing

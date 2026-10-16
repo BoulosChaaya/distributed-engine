@@ -31,7 +31,7 @@ export async function engine<T>(path: string, init?: RequestInit): Promise<T> {
   return body.data as T;
 }
 
-export type TaskStatus = 'SCHEDULED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type TaskStatus = 'SCHEDULED' | 'BLOCKED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type TaskPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface TaskView {
@@ -44,6 +44,8 @@ export interface TaskView {
   error?: string | null;
   createdAt: string;
   updatedAt: string;
+  workflowId?: string;
+  stepKey?: string;
 }
 
 export interface TaskPage {
@@ -87,4 +89,35 @@ export interface TenantView {
   status: 'ACTIVE' | 'SUSPENDED';
   planId: string;
   createdAt: string;
+}
+
+export type WorkflowStatus = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export interface WorkflowSummaryView {
+  id: string;
+  name: string;
+  status: WorkflowStatus;
+  createdAt: string;
+  completedAt?: string;
+  totalSteps: number;
+  completedSteps: number;
+  failedSteps: number;
+}
+
+export interface WorkflowStepView {
+  key: string;
+  taskId: string;
+  name: string;
+  status: TaskStatus;
+  dependsOn: string[];
+  level: number;
+  retries: number;
+  maxRetries: number;
+  error?: string;
+  output?: unknown;
+}
+
+export interface WorkflowDetailView {
+  workflow: { id: string; name: string; status: WorkflowStatus; createdAt: string; completedAt?: string };
+  steps: WorkflowStepView[];
 }

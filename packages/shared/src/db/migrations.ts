@@ -269,6 +269,49 @@ const MIGRATIONS = [
         ON outbox_events(task_id) WHERE status = 'PENDING';
     `,
   },
+  {
+    version: 18,
+    name: 'create_workflows_and_task_dependencies',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workflows (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT REFERENCES tenants(id),
+        name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        idempotency_key TEXT,
+        idempotency_hash TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        CONSTRAINT valid_workflow_status CHECK (status IN ('RUNNING','COMPLETED','FAILED','CANCELLED'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_workflows_created_at ON workflows(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_idempotency
+        ON workflows(COALESCE(tenant_id, ''), idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_id TEXT REFERENCES workflows(id);
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS step_key TEXT;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_dependencies INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS pending_dependencies_non_negative;
+      ALTER TABLE tasks ADD CONSTRAINT pending_dependencies_non_negative CHECK (pending_dependencies >= 0);
+      CREATE INDEX IF NOT EXISTS idx_tasks_workflow ON tasks(workflow_id) WHERE workflow_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_workflow_step
+        ON tasks(workflow_id, step_key) WHERE workflow_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS task_dependencies (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, depends_on),
+        CONSTRAINT no_self_dependency CHECK (task_id <> depends_on)
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on);
+
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS valid_status;
+      ALTER TABLE tasks ADD CONSTRAINT valid_status
+        CHECK (status IN ('SCHEDULED','BLOCKED','QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED'));
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

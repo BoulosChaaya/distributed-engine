@@ -7,6 +7,7 @@ export function Nav() {
       <nav aria-label="Main">
         <Link href="/">Overview</Link>
         <Link href="/tasks">Tasks</Link>
+        <Link href="/workflows">Workflows</Link>
         <Link href="/workers">Workers</Link>
         <Link href="/tenants">Tenants</Link>
       </nav>

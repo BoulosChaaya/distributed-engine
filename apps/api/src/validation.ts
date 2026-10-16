@@ -102,3 +102,18 @@ export const CreateTenantSchema = z.object({
 export const SetTenantStatusSchema = z.object({
   status: z.enum(['ACTIVE', 'SUSPENDED']),
 });
+
+const WorkflowStepSchema = z.object({
+  key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, 'Step key must be 1-64 of A-Z a-z 0-9 _ -'),
+  name: z.string().min(1, 'Step name (task type) is required').max(255),
+  payload: z.record(z.unknown()).optional().default({}),
+  priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
+  maxRetries: z.number().int().min(0).max(10).optional().default(3),
+  dependsOn: z.array(z.string()).max(200).optional().default([]),
+});
+
+export const CreateWorkflowSchema = z.object({
+  name: z.string().trim().min(1, 'Workflow name is required').max(255),
+  steps: z.array(WorkflowStepSchema).min(1).max(200),
+  idempotencyKey: z.string().min(1).max(255).optional(),
+});

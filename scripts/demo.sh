@@ -84,7 +84,30 @@ printf '  %-8s %-10s %s\n' http COMPLETED "upstream status $(op "$API/tasks/$htt
 printf '  %-8s %-10s %s\n' unknown FAILED "$(op "$API/tasks/$unknown_id" | json data.error | cut -c1-60)…"
 pause "See them on the Tasks page, then continue to the chaos test"
 
-step "5. Chaos: 45 tasks in flight, then SIGKILL a worker and FLUSHALL Redis"
+step "5. A workflow (DAG): fan-out, a planned retry, fan-in, data passed along the edges"
+WF='{"name":"nightly-report","steps":[{"key":"fetch","name":"echo","payload":{"source":"orders"}},'\
+'{"key":"by-region","name":"sleep","payload":{"ms":2000},"dependsOn":["fetch"]},'\
+'{"key":"by-product","name":"flaky","payload":{"failTimes":1},"dependsOn":["fetch"]},'\
+'{"key":"merge","name":"echo","dependsOn":["by-region","by-product"]}]}'
+wf_id=$(op -X POST -d "$WF" "$API/workflows" | json data.workflow.id)
+for _ in $(seq 1 90); do
+  [ "$(op "$API/workflows/$wf_id" | json data.workflow.status)" = RUNNING ] || break
+  sleep 1
+done
+op "$API/workflows/$wf_id" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s).data;
+  console.log("  workflow " + d.workflow.status);
+  for (const x of d.steps) console.log(`    L${x.level} ${x.key.padEnd(11)} ${x.status.padEnd(10)} ${x.dependsOn.length ? "after " + x.dependsOn.join(", ") : ""}`);
+  const m = d.steps.find(x => x.key === "merge"); console.log("  merge received: " + JSON.stringify(m.output.upstream));})'
+broken=$(op -X POST -d '{"name":"broken","steps":[{"key":"a","name":"echo"},{"key":"b","name":"no-such-type","dependsOn":["a"]},{"key":"c","name":"echo","dependsOn":["b"]},{"key":"side","name":"echo","dependsOn":["a"]}]}' "$API/workflows" | json data.workflow.id)
+for _ in $(seq 1 60); do
+  [ "$(op "$API/workflows/$broken" | json data.workflow.status)" = RUNNING ] || break
+  sleep 1
+done
+op "$API/workflows/$broken" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s).data;
+  console.log("  failing workflow " + d.workflow.status + ": " + d.steps.map(x => x.key + "=" + x.status).join("  "));})'
+pause "See both on the Workflows page, then continue to the chaos test"
+
+step "6. Chaos: 45 tasks in flight, then SIGKILL a worker and FLUSHALL Redis"
 ids=()
 for _ in $(seq 1 45); do ids+=("$(submit '{"name":"sleep","payload":{"ms":3000}}')"); done
 sleep 3

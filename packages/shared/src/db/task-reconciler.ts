@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { generateId } from '../utils.js';
 import { createLogger, type Logger } from '../logger/index.js';
+import { lockWorkflowForTask, onTaskTerminal } from './workflow-engine.js';
 
 /**
  * Re-derives the queue from PostgreSQL when Redis has lost work.
@@ -227,6 +228,8 @@ export class TaskReconciler {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Workflow row before task row; the FAILED path below may cancel descendants.
+      const workflowId = await lockWorkflowForTask(client, orphan.id);
 
       const current = await client.query(
         `SELECT id, name, status, priority, payload, max_retries, retries, version,
@@ -266,6 +269,7 @@ export class TaskReconciler {
              WHERE id = $1`,
             [row.id, retries, 'Worker lost the task lease and the retry budget is exhausted'],
           );
+          if (workflowId) await onTaskTerminal(client, workflowId, row.id, 'FAILED');
           await client.query('COMMIT');
           this.logger.warn('Orphaned task failed: retry budget exhausted', { taskId: row.id, retries });
           return 'failed';

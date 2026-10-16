@@ -37,6 +37,11 @@ export interface TaskContext {
   payload: Record<string, unknown>;
   /** 1-based attempt number, from the retry count in PostgreSQL. */
   attempt: number;
+  /**
+   * Workflow steps only: outputs of the direct dependencies, keyed by step
+   * key. This is how data flows along the DAG (fan-in sees all parents).
+   */
+  upstream?: Record<string, unknown>;
   signal: AbortSignal;
 }
 
@@ -106,8 +111,10 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
     return { sleptMs: ms };
   });
 
-  // Returns its payload. Proves the payload made the full round trip.
-  handlers.set('echo', async ({ payload }) => ({ echo: payload }));
+  // Returns its payload (and, in a workflow, what its parents produced).
+  // Proves data made the full round trip.
+  handlers.set('echo', async ({ payload, upstream }) =>
+    upstream && Object.keys(upstream).length > 0 ? { echo: payload, upstream } : { echo: payload });
 
   // Fails the first payload.failTimes attempts, then succeeds. Retry
   // behaviour can then be shown and tested on purpose instead of hoped for.
