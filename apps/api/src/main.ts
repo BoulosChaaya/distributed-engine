@@ -6,6 +6,7 @@ import {
   AppError,
   TaskRepository,
   OutboxPublisher,
+  TaskReconciler,
   ScheduleRepository,
   ScheduleStaleVersionError,
   TenantRepository,
@@ -96,6 +97,13 @@ const outboxPublisher = new OutboxPublisher(
   config.outbox.maxAttempts,
   { fairScheduler: new WeightedFairScheduler() },
 );
+
+const taskReconciler = new TaskReconciler(pgPool, taskQueue, {
+  intervalMs: config.reconciler.intervalMs,
+  queuedGraceMs: config.reconciler.queuedGraceMs,
+  batchSize: config.reconciler.batchSize,
+  logger: logger.child({ component: 'reconciler' }),
+});
 
 const schedulerService = new SchedulerService(pgPool, logger.child({ component: 'scheduler' }), {
   pollIntervalMs: config.scheduler?.pollIntervalMs ?? 5000,
@@ -767,6 +775,8 @@ async function start() {
   schedulerService.start();
   logger.info('Scheduler service started');
 
+  taskReconciler.start();
+
   const server = app.listen(config.port, () => {
     logger.info('API server started', { port: config.port });
   });
@@ -777,6 +787,7 @@ async function start() {
     pgPool,
     outboxPublisher,
     schedulerService,
+    taskReconciler,
   });
 }
 

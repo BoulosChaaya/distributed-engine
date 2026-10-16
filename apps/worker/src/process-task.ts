@@ -58,6 +58,13 @@ export interface ProcessTaskDeps {
   workerMetrics: WorkerMetrics;
   ClaimNotExpiredError: new (...args: any[]) => any;
   DelayedError: new (...args: any[]) => any;
+  /**
+   * BullMQ's UnrecoverableError. Thrown when PostgreSQL says the retry budget
+   * is spent but the BullMQ job still has attempts left (a job re-published by
+   * the reconciler starts with a fresh attempt counter), so BullMQ stops
+   * retrying a task the database already marked FAILED.
+   */
+  UnrecoverableError?: new (message: string) => Error;
 }
 
 export function computeRenewalInterval(taskClaimTtlMs: number, scheduleLeaseDurationMs: number): number {
@@ -91,6 +98,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     workerMetrics,
     ClaimNotExpiredError,
     DelayedError,
+    UnrecoverableError,
   } = deps;
 
   return async function processTask(
@@ -350,7 +358,12 @@ export function createProcessTask(deps: ProcessTaskDeps) {
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       const maxAttempts = job.opts.attempts ?? 1;
-      const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+      const queueBudgetSpent = job.attemptsMade + 1 >= maxAttempts;
+      // PostgreSQL owns the retry budget. BullMQ's attempt counter is per job,
+      // and a job re-published after Redis lost it starts again from zero.
+      const dbBudgetSpent = typeof currentTask.maxRetries === 'number'
+        && currentRetries + 1 > currentTask.maxRetries;
+      const isFinalAttempt = queueBudgetSpent || dbBudgetSpent;
 
       const failSpan = tracing.startTaskFail(taskId, workerId, isFinalAttempt);
       try {
@@ -388,6 +401,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         errorType: error instanceof Error ? error.name : 'UnknownError',
       });
 
+      if (isFinalAttempt && !queueBudgetSpent && UnrecoverableError) {
+        throw new UnrecoverableError(errorMessage);
+      }
       throw error;
     } finally {
       if (renewalTimer) {

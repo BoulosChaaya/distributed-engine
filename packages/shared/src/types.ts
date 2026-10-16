@@ -155,7 +155,7 @@ export interface EffectiveLimits {
   weight: number;
 }
 
-export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED';
+export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED' | 'TASK_REQUEUED';
 
 export interface OutboxEvent {
   id: string;

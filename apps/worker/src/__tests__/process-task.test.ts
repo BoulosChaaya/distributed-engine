@@ -495,4 +495,83 @@ describe('Worker orchestration', () => {
     expect(releaseExecutionLease).not.toHaveBeenCalled();
     expect(metrics.jobsCompleted).toBe(1);
   });
+  describe('retry budget is owned by PostgreSQL', () => {
+    class MockUnrecoverableError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = 'UnrecoverableError';
+      }
+    }
+
+    function setup(retriesInDb: number, maxRetries: number) {
+      const transitions: Array<{ status: string; opts: any }> = [];
+      const taskRepo = makeMockTaskRepo({
+        getTask: jest.fn<any>().mockImplementation(() =>
+          Promise.resolve(makeTask({ status: 'QUEUED', retries: retriesInDb, maxRetries })),
+        ),
+        transitionStatus: jest.fn<any>().mockImplementation((_id: string, _v: number, status: string, opts: any) => {
+          transitions.push({ status, opts });
+          if (status === 'PROCESSING') return Promise.resolve({ version: 2, claimToken: 'ct-1', retries: retriesInDb });
+          if (status === 'COMPLETED') return Promise.reject(new Error('handler blew up'));
+          return Promise.resolve({ version: 3 });
+        }),
+      });
+      const processTask = createProcessTask({
+        taskRepo,
+        scheduleRepo: makeMockScheduleRepo(),
+        tracing: makeMockTracing(),
+        logger: makeMockLogger(),
+        workerId: 'w-1',
+        scheduleLeaseDurationMs: 300000,
+        leaseDeferralMarginMs: 2000,
+        renewalIntervalMs: 10000,
+        workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
+        ClaimNotExpiredError: MockClaimNotExpiredError,
+        DelayedError: MockDelayedError,
+        UnrecoverableError: MockUnrecoverableError,
+      });
+      return { processTask, transitions };
+    }
+
+    async function run(processTask: ReturnType<typeof createProcessTask>, job: any) {
+      const promise = processTask(job, 'task-1', makeMockSpan());
+      promise.catch(() => {});
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2000);
+      await flushMicrotasks();
+      return promise;
+    }
+
+    it('fails the task and stops BullMQ when the database budget is spent, even if the job has attempts left', async () => {
+      // A job re-published by the reconciler starts at attemptsMade = 0.
+      const { processTask, transitions } = setup(3, 3);
+      const job = makeMockJob({ attemptsMade: 0, opts: { attempts: 4 } });
+
+      await expect(run(processTask, job)).rejects.toBeInstanceOf(MockUnrecoverableError);
+      const last = transitions[transitions.length - 1];
+      expect(last.status).toBe('FAILED');
+      expect(last.opts.retries).toBe(4);
+    });
+
+    it('requeues with a normal retryable error while budget remains', async () => {
+      const { processTask, transitions } = setup(1, 3);
+      const job = makeMockJob({ attemptsMade: 1, opts: { attempts: 4 } });
+
+      const err = await run(processTask, job).catch((e) => e);
+      expect(err).not.toBeInstanceOf(MockUnrecoverableError);
+      expect((err as Error).message).toBe('handler blew up');
+      const last = transitions[transitions.length - 1];
+      expect(last.status).toBe('QUEUED');
+      expect(last.opts.retries).toBe(2);
+    });
+
+    it('still honours the BullMQ attempt limit on the final attempt', async () => {
+      const { processTask, transitions } = setup(1, 3);
+      const job = makeMockJob({ attemptsMade: 3, opts: { attempts: 4 } });
+
+      const err = await run(processTask, job).catch((e) => e);
+      expect(err).not.toBeInstanceOf(MockUnrecoverableError);
+      expect(transitions[transitions.length - 1].status).toBe('FAILED');
+    });
+  });
 });

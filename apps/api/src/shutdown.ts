@@ -1,6 +1,6 @@
 import { Queue } from 'bullmq';
 import { Pool } from 'pg';
-import { OutboxPublisher, SchedulerService, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
+import { OutboxPublisher, SchedulerService, TaskReconciler, shutdownTelemetry, createLogger, type Logger } from '@repo/shared';
 import type { Redis as IORedis } from 'ioredis';
 import type { Server } from 'http';
 
@@ -30,6 +30,7 @@ export class ShutdownManager {
       pgPool: Pool;
       outboxPublisher: OutboxPublisher;
       schedulerService?: SchedulerService;
+      taskReconciler?: TaskReconciler;
     },
   ) {
     const shutdown = (signal: string) => this.shutdown(server, deps, signal);
@@ -56,6 +57,7 @@ export class ShutdownManager {
       pgPool: Pool;
       outboxPublisher: OutboxPublisher;
       schedulerService?: SchedulerService;
+      taskReconciler?: TaskReconciler;
     },
     signal: string,
   ) {
@@ -74,6 +76,11 @@ export class ShutdownManager {
     if (deps.schedulerService) {
       await deps.schedulerService.stop();
       logger.info('Scheduler stopped');
+    }
+
+    if (deps.taskReconciler) {
+      await deps.taskReconciler.stop();
+      logger.info('Task reconciler stopped');
     }
 
     await deps.outboxPublisher.stop();
