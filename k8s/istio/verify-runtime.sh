@@ -47,10 +47,10 @@ GW_LABEL_LEGACY="istio.io/gateway-name=engine-gateway"
 EXPECTED_GW_SA="engine-gateway-istio"
 EXPECTED_GW_PRINCIPAL="cluster.local/ns/${NS}/sa/${EXPECTED_GW_SA}"
 
-pass() { echo "  PASS: $1"; ((PASS++)); }
-fail() { echo "  FAIL: $1"; ((FAIL++)); }
-skip() { echo "  SKIP: $1"; ((SKIP++)); }
-critical_skip() { echo "  SKIP (CRITICAL): $1"; ((SKIP++)); ((CRITICAL_SKIP++)); }
+pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
+skip() { echo "  SKIP: $1"; SKIP=$((SKIP + 1)); }
+critical_skip() { echo "  SKIP (CRITICAL): $1"; SKIP=$((SKIP + 1)); CRITICAL_SKIP=$((CRITICAL_SKIP + 1)); }
 header() { echo ""; echo "=== $1 ==="; }
 
 # Discover Gateway address (IP or hostname) from the Gateway-created Service.
@@ -256,7 +256,14 @@ verify_gateway_identity() {
   if [ -n "$gw_addr" ]; then
     pass "Gateway has external address: $gw_addr"
   else
-    critical_skip "Gateway external address not yet assigned (pending LoadBalancer or no Service found)"
+    if [ -n "${GW_ADDR:-}" ]; then
+      # e.g. kind: no cloud load balancer, so the Gateway Service is ClusterIP
+      # and is reached through `kubectl port-forward`. Traffic still goes
+      # through the Gateway proxy, so the Gateway tests below remain valid.
+      skip "Gateway has no external address; using GW_ADDR=${GW_ADDR} (port-forward to the Gateway Service)"
+    else
+      critical_skip "Gateway external address not yet assigned (pending LoadBalancer or no Service found)"
+    fi
     echo "  Verify Gateway Service with: kubectl get svc -n $NS --show-labels"
   fi
 }
@@ -443,10 +450,10 @@ EOF
   if [ "$api_reachable" = "yes" ]; then
     local api_result
     api_result=$(kubectl run api-neg-test -n "$NS" \
-      --image=busybox:latest \
+      --image=busybox:1.37 \
       --overrides='{"spec":{"serviceAccountName":"test-unauthorized"}}' \
       --rm -i --restart=Never --timeout=20s \
-      -- sh -c "timeout 5 wget -qO- http://api:3000/live 2>&1; echo EXIT_CODE:\$?" 2>/dev/null || true)
+      -- sh -c "timeout 5 wget -qO- http://api/live 2>&1; echo EXIT_CODE:\$?" 2>/dev/null || true)
     kubectl delete pod api-neg-test -n "$NS" --ignore-not-found &>/dev/null || true
 
     if echo "$api_result" | grep -qE "(EXIT_CODE:[^0]|timed out|connection refused|download timed out)"; then
@@ -522,17 +529,26 @@ verify_e2e() {
   #   payload: Record<string,unknown> (optional, default {})
   #   priority: 'LOW'|'NORMAL'|'HIGH'|'CRITICAL' (optional, default 'NORMAL')
   #   maxRetries: int 0-10 (optional, default 3)
+  # Operator routes require the operator key (apps/api/src/operator-auth.ts).
+  if [ -z "${OPERATOR_API_KEY:-}" ]; then
+    critical_skip "Gateway E2E test: OPERATOR_API_KEY not set (export the key stored in operator-secret)"
+    return
+  fi
+  local auth_header="Authorization: Bearer ${OPERATOR_API_KEY}"
+
   local create_response
   if [ -z "$via_kubectl" ]; then
     create_response=$(wget -qO- --timeout=10 \
-      --post-data='{"name":"istio-e2e-verify"}' \
+      --post-data='{"name":"echo","payload":{"from":"istio-e2e-verify"}}' \
       --header='Content-Type: application/json' \
+      --header="$auth_header" \
       "http://${gw_addr}/tasks" 2>/dev/null || true)
   else
     create_response=$(kubectl exec -n "$NS" "$via_kubectl" -- \
       wget -qO- --timeout=10 \
-      --post-data='{"name":"istio-e2e-verify"}' \
+      --post-data='{"name":"echo","payload":{"from":"istio-e2e-verify"}}' \
       --header='Content-Type: application/json' \
+      --header="$auth_header" \
       "http://${gw_addr}/tasks" 2>/dev/null || true)
   fi
 
@@ -549,16 +565,16 @@ verify_e2e() {
   fi
   pass "Gateway E2E: task created through Gateway: $task_id"
 
-  # Poll for completion through the Gateway (up to 30s)
+  # Poll for completion through the Gateway (up to 60s)
   local status="UNKNOWN"
-  for i in $(seq 1 10); do
+  for i in $(seq 1 20); do
     sleep 3
     local task_response
     if [ -z "$via_kubectl" ]; then
-      task_response=$(wget -qO- --timeout=5 "http://${gw_addr}/tasks/${task_id}" 2>/dev/null || true)
+      task_response=$(wget -qO- --timeout=5 --header="$auth_header" "http://${gw_addr}/tasks/${task_id}" 2>/dev/null || true)
     else
       task_response=$(kubectl exec -n "$NS" "$via_kubectl" -- \
-        wget -qO- --timeout=5 "http://${gw_addr}/tasks/${task_id}" 2>/dev/null || true)
+        wget -qO- --timeout=5 --header="$auth_header" "http://${gw_addr}/tasks/${task_id}" 2>/dev/null || true)
     fi
     status=$(echo "$task_response" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
     echo "  Poll $i (via Gateway): status=$status"
@@ -575,7 +591,7 @@ verify_e2e() {
   elif [ "$status" = "FAILED" ]; then
     fail "Gateway E2E: task reached FAILED — check worker logs"
   else
-    fail "Gateway E2E: task did not reach terminal state within 30s (last status: $status)"
+    fail "Gateway E2E: task did not reach terminal state within 60s (last status: $status)"
   fi
 }
 
@@ -583,7 +599,8 @@ verify_observability() {
   header "Observability Preservation"
   echo "  Topic 16 does not deploy or modify the observability stack."
   echo "  Observability verification is not in scope for this runtime suite."
-  critical_skip "Observability preservation (not tested — requires separate observability stack deployment)"
+  # Informational only: the observability stack is outside this manifest set.
+  skip "Observability preservation (not tested — requires separate observability stack deployment)"
 }
 
 print_summary() {

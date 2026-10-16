@@ -8,6 +8,7 @@ import {
   ScheduleRepository,
   TenantRepository,
   runMigrations,
+  waitForPostgres,
   initTelemetry,
   shutdownTelemetry,
   tracing,
@@ -218,6 +219,9 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     taskTimeoutMs: TASK_TIMEOUT_MS,
   });
 
+  await waitForPostgres(pgPool, {
+    onRetry: (attempt, error) => logger.warn('PostgreSQL not ready, retrying', { attempt, reason: String(error) }),
+  });
   await runMigrations(pgPool);
   logger.info('Database migrations complete');
 

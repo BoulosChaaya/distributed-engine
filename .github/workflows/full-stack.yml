@@ -1,0 +1,53 @@
+name: Full stack
+
+# Proves the system as deployed, not just as unit-tested:
+#   compose-chaos: the whole docker compose stack under a killed worker and
+#                  a flushed Redis.
+#   kind-istio:    the real k8s manifests on Kubernetes with Istio ambient,
+#                  including mTLS identity, AuthorizationPolicy deny paths and
+#                  a task driven through the Gateway.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-stack-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  compose-chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Chaos test (SIGKILL a worker, FLUSHALL Redis, require every task to complete)
+        run: |
+          set -o pipefail
+          bash scripts/chaos-compose.sh 2>&1 | tee "$RUNNER_TEMP/chaos.log"
+      - name: Publish result as annotations
+        if: always()
+        run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/chaos.log" compose-chaos 40
+
+  kind-istio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build images
+        run: |
+          docker build -f Dockerfile.api -t distributed-engine-api:ci .
+          docker build -f Dockerfile.worker -t distributed-engine-worker:ci .
+          docker build -f Dockerfile.web -t distributed-engine-web:ci .
+      - name: Deploy to kind with Istio ambient and verify
+        run: |
+          set -o pipefail
+          bash scripts/k8s-kind-e2e.sh 2>&1 | tee "$RUNNER_TEMP/kind.log"
+      - name: Publish result as annotations
+        if: always()
+        run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/kind.log" kind-istio 120

@@ -24,4 +24,5 @@ spec:
   rules:
   - backendRefs:
     - name: api
-      port: 3000
+      # Service port, not container port: the api Service maps 80 -> 3000.
+      port: 80

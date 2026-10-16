@@ -51,6 +51,8 @@ services:
       QUEUE_CONCURRENCY: 5
       # Required for /tasks, /schedules, /workers, /metrics. Set it in .env (see .env.example).
       OPERATOR_API_KEY: ${OPERATOR_API_KEY:?Set OPERATOR_API_KEY in .env - see .env.example}
+      RECONCILER_INTERVAL_MS: ${RECONCILER_INTERVAL_MS:-30000}
+      RECONCILER_QUEUED_GRACE_MS: ${RECONCILER_QUEUED_GRACE_MS:-60000}
     depends_on:
       redis:
         condition: service_healthy
@@ -68,7 +70,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    container_name: engine-worker-1
+    # No container_name: workers must be scalable (docker compose up --scale worker=3).
     environment:
       NODE_ENV: development
       REDIS_HOST: redis

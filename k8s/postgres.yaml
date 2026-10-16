@@ -23,6 +23,9 @@ spec:
           name: postgres
         args: ["postgres", "-c", "max_connections=150"]
         env:
+        # A subdirectory, so initdb never trips over lost+found on a fresh volume.
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
         - name: POSTGRES_DB
           value: "distributed_engine"
         - name: POSTGRES_USER
