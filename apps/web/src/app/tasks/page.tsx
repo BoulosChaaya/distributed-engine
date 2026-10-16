@@ -5,6 +5,15 @@ import { engine, type TaskPage, type TaskPriority, type TaskView } from '@/lib/c
 import { usePoll } from '@/lib/use-poll';
 
 const PAGE_SIZE = 20;
+
+// Built-in task types and a starting payload for each. The name is the type:
+// workers run the handler registered under it, and unknown types fail at once.
+const TASK_TYPES: Record<string, string> = {
+  echo: '{ "hello": "world" }',
+  sleep: '{ "ms": 3000 }',
+  flaky: '{ "failTimes": 1 }',
+  http: '{ "url": "https://example.com/", "method": "GET" }',
+};
 const CANCELLABLE = new Set(['SCHEDULED', 'QUEUED', 'PROCESSING']);
 
 export default function TasksPage() {
@@ -46,7 +55,7 @@ export default function TasksPage() {
               <thead>
                 <tr>
                   <th>ID</th>
-                  <th>Name</th>
+                  <th>Type</th>
                   <th>Status</th>
                   <th>Priority</th>
                   <th>Retries</th>
@@ -90,10 +99,16 @@ export default function TasksPage() {
 }
 
 function SubmitTask({ onSubmitted }: { onSubmitted: () => Promise<void> }) {
-  const [name, setName] = useState('');
+  const [name, setName] = useState('echo');
+  const [payloadTouched, setPayloadTouched] = useState(false);
   const [priority, setPriority] = useState<TaskPriority>('NORMAL');
   const [maxRetries, setMaxRetries] = useState(3);
-  const [payload, setPayload] = useState('{}');
+  const [payload, setPayload] = useState(TASK_TYPES.echo);
+
+  function chooseType(value: string) {
+    setName(value);
+    if (!payloadTouched && TASK_TYPES[value]) setPayload(TASK_TYPES[value]);
+  }
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
 
@@ -114,7 +129,6 @@ function SubmitTask({ onSubmitted }: { onSubmitted: () => Promise<void> }) {
         body: JSON.stringify({ name: name.trim(), priority, maxRetries, payload: parsed }),
       });
       setMessage({ kind: 'ok', text: `Submitted ${task.id.slice(0, 8)}.` });
-      setName('');
       await onSubmitted();
     } catch (err) {
       setMessage({ kind: 'error', text: err instanceof Error ? err.message : 'Submit failed' });
@@ -127,8 +141,12 @@ function SubmitTask({ onSubmitted }: { onSubmitted: () => Promise<void> }) {
     <form className="panel form" onSubmit={submit}>
       <h2>Submit a task</h2>
       <label>
-        Name
-        <input required maxLength={255} value={name} onChange={(e) => setName(e.target.value)} disabled={submitting} />
+        Task type
+        <input required maxLength={255} list="task-types" value={name}
+          onChange={(e) => chooseType(e.target.value)} disabled={submitting} />
+        <datalist id="task-types">
+          {Object.keys(TASK_TYPES).map((t) => <option key={t} value={t} />)}
+        </datalist>
       </label>
       <div className="row">
         <label>
@@ -148,7 +166,7 @@ function SubmitTask({ onSubmitted }: { onSubmitted: () => Promise<void> }) {
       </div>
       <label>
         Payload (JSON)
-        <textarea rows={3} value={payload} onChange={(e) => setPayload(e.target.value)} disabled={submitting} spellCheck={false} />
+        <textarea rows={3} value={payload} onChange={(e) => { setPayloadTouched(true); setPayload(e.target.value); }} disabled={submitting} spellCheck={false} />
       </label>
       <button type="submit" disabled={submitting || !name.trim()}>{submitting ? 'Submitting…' : 'Submit'}</button>
       {message && <p className={message.kind === 'ok' ? 'ok' : 'error'} role="status">{message.text}</p>}

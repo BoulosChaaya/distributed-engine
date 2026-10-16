@@ -121,20 +121,36 @@ expect 404 "dashboard refuses non-allow-listed call" "${dash[@]}" http://localho
 expect 403 "dashboard refuses cross-site write" "${dash[@]}" -X POST -H 'Sec-Fetch-Site: cross-site' \
   -H 'Content-Type: application/json' -d '{"name":"smoke"}' http://localhost:3001/api/engine/tasks
 
-# Submit through the dashboard exactly as its own page would, then wait for the worker.
-response=$(curl -sf "${dash[@]}" -X POST -H 'Sec-Fetch-Site: same-origin' -H 'Content-Type: application/json' \
-  -d '{"name":"smoke-production-images","priority":"HIGH"}' http://localhost:3001/api/engine/tasks)
-task_id=$(node -e 'console.log(JSON.parse(process.argv[1]).data.id)' "$response")
-echo "submitted task ${task_id} through the dashboard"
+# wait_status <task id> <expected status>: polls the API with the operator key.
+wait_status() {
+  local id=$1 want=$2 got=""
+  for _ in $(seq 1 90); do
+    got=$(curl -s "${op[@]}" "http://localhost:3000/tasks/${id}" \
+      | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).data.status)}catch{console.log("?")}})')
+    if [ "$got" = "$want" ]; then
+      echo "ok: task ${id} reached ${want}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: task ${id} did not reach ${want} (last status: ${got})" >&2
+  exit 1
+}
 
-for _ in $(seq 1 60); do
-  task_status=$(curl -s "${op[@]}" "http://localhost:3000/tasks/${task_id}" \
-    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).data.status)}catch{console.log("?")}})')
-  if [ "$task_status" = COMPLETED ]; then
-    echo "ok: task ${task_id} COMPLETED (api -> outbox -> redis -> worker -> postgres)"
-    exit 0
-  fi
-  sleep 1
-done
-echo "FAIL: task ${task_id} did not complete (last status: ${task_status})" >&2
-exit 1
+# submit <json>: posts through the dashboard exactly as its own page does; prints the task id.
+submit() {
+  curl -sf "${dash[@]}" -X POST -H 'Sec-Fetch-Site: same-origin' -H 'Content-Type: application/json' \
+    -d "$1" http://localhost:3001/api/engine/tasks | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.id))'
+}
+
+# 1. Happy path: dashboard -> api -> outbox -> redis -> worker -> postgres.
+echo_id=$(submit '{"name":"echo","priority":"HIGH","payload":{"from":"smoke"}}')
+wait_status "$echo_id" COMPLETED
+
+# 2. Retries: fails its first attempt on purpose, must succeed on the second.
+flaky_id=$(submit '{"name":"flaky","maxRetries":2,"payload":{"failTimes":1}}')
+wait_status "$flaky_id" COMPLETED
+
+# 3. Unknown task type: must fail permanently instead of retrying forever.
+unknown_id=$(submit '{"name":"no-such-type","maxRetries":5}')
+wait_status "$unknown_id" FAILED

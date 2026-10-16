@@ -7,3 +7,4 @@ export * from './logger/index.js';
 export * from './scheduler/index.js';
 export * from './rate-limiter.js';
 export * from './fairness.js';
+export * from './task-handlers.js';

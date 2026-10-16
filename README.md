@@ -82,8 +82,26 @@ pnpm -F @distributed-engine/worker run dev
 curl -X POST http://localhost:3000/tasks \
   -H "Authorization: Bearer $OPERATOR_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"hello-world","priority":"HIGH","maxRetries":3}'
+  -d '{"name":"echo","priority":"HIGH","maxRetries":3,"payload":{"hello":"world"}}'
 ```
+
+### Task Types
+
+A task's `name` is its type. The worker runs the handler registered under that
+name; an unknown name fails at once (retrying cannot make code appear).
+
+| Type | Payload | Does |
+|------|---------|------|
+| `echo` | anything | Returns the payload as the result |
+| `sleep` | `{ "ms": 1000 }` (max 300000) | Waits; stands in for slow I/O |
+| `flaky` | `{ "failTimes": 1 }` | Fails the first N attempts, then succeeds; shows retries |
+| `http` | `{ "url", "method", "headers", "body", "timeoutMs" }` | Calls an allow-listed host. Disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set on the worker |
+
+Errors are either permanent (unknown type, bad payload, HTTP 4xx), which fail the
+task immediately, or transient (timeout, HTTP 5xx/429, network), which are retried
+with exponential backoff until `maxRetries` is spent. Worker settings:
+`TASK_TIMEOUT_MS` (default 300000) and `HTTP_TASK_ALLOWED_HOSTS` (comma-separated
+hostnames, `*.example.com` allowed).
 
 ### API Endpoints
 

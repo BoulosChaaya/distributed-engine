@@ -65,6 +65,24 @@ export interface ProcessTaskDeps {
    * retrying a task the database already marked FAILED.
    */
   UnrecoverableError?: new (message: string) => Error;
+  /**
+   * Runs the task's handler. The signal fires when this worker loses its
+   * lease, so the handler can stop work another worker may now own.
+   */
+  execute: (ctx: ExecuteContext) => Promise<unknown>;
+}
+
+export interface ExecuteContext {
+  taskId: string;
+  name: string;
+  payload: Record<string, unknown>;
+  attempt: number;
+  signal: AbortSignal;
+}
+
+/** Matches NonRetryableTaskError from @repo/shared without importing it here. */
+function isNonRetryable(error: unknown): boolean {
+  return error instanceof Error && error.name === 'NonRetryableTaskError';
 }
 
 export function computeRenewalInterval(taskClaimTtlMs: number, scheduleLeaseDurationMs: number): number {
@@ -99,6 +117,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     ClaimNotExpiredError,
     DelayedError,
     UnrecoverableError,
+    execute,
   } = deps;
 
   return async function processTask(
@@ -150,6 +169,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     let currentRetries = currentTask.retries;
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
     let ownershipLost = false;
+    const abort = new AbortController();
     let scheduleLeaseToken: string | undefined;
     let concurrencyLeaseToken: string | undefined;
 
@@ -296,6 +316,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         } catch (renewError) {
           logger.warn('Lease renewal failed, ownership lost', { taskId, reason: String(renewError) });
           ownershipLost = true;
+          abort.abort(new Error('task lease lost'));
           if (renewalTimer) {
             clearInterval(renewalTimer);
             renewalTimer = undefined;
@@ -305,7 +326,13 @@ export function createProcessTask(deps: ProcessTaskDeps) {
 
       logger.info('Task execution started', { taskId });
 
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const output = await execute({
+        taskId,
+        name: currentTask.name,
+        payload: (currentTask.payload ?? {}) as Record<string, unknown>,
+        attempt: currentRetries + 1,
+        signal: abort.signal,
+      });
 
       if (ownershipLost) {
         logger.warn('Ownership lost during execution, aborting', { taskId });
@@ -331,7 +358,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       try {
         await taskRepo.transitionStatus(taskId, taskVersion, 'COMPLETED', {
           completedAt: new Date(),
-          result: { processedBy: workerId },
+          result: { processedBy: workerId, output },
+          // Earlier attempts' errors stay visible through `retries`; a completed task has no current error.
+          error: null,
           claimToken,
         });
         tracing.setSpanOk(completeSpan);
@@ -354,16 +383,25 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       logger.info('Task durably completed', { taskId });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
     } catch (error) {
+      if (ownershipLost) {
+        // Another worker may own the task now; any write from here would be
+        // rejected by the claim token anyway, so stand down cleanly.
+        logger.warn('Ownership lost during execution, aborting', { taskId, reason: String(error) });
+        parentSpan.setAttribute('task.ownership_lost', true);
+        return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
+      }
+
       workerMetrics.jobsFailed++;
 
       const errorMessage = error instanceof Error ? error.message : String(error);
+      const permanent = isNonRetryable(error);
       const maxAttempts = job.opts.attempts ?? 1;
       const queueBudgetSpent = job.attemptsMade + 1 >= maxAttempts;
       // PostgreSQL owns the retry budget. BullMQ's attempt counter is per job,
       // and a job re-published after Redis lost it starts again from zero.
       const dbBudgetSpent = typeof currentTask.maxRetries === 'number'
         && currentRetries + 1 > currentTask.maxRetries;
-      const isFinalAttempt = queueBudgetSpent || dbBudgetSpent;
+      const isFinalAttempt = permanent || queueBudgetSpent || dbBudgetSpent;
 
       const failSpan = tracing.startTaskFail(taskId, workerId, isFinalAttempt);
       try {

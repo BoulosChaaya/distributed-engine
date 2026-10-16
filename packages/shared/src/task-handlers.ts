@@ -1,0 +1,229 @@
+/**
+ * Task handlers: what a worker actually does with a task.
+ *
+ * A task's `name` is its type, the way a BullMQ job name or a Celery task name
+ * is. The worker looks the name up in a registry and runs the matching
+ * handler. A name with no handler fails immediately and permanently, because
+ * retrying cannot make code appear. Before this module every task was a
+ * hard-coded 2-second sleep.
+ *
+ * Error contract (read by the worker):
+ *  - NonRetryableTaskError: the task can never succeed as submitted (unknown
+ *    type, invalid payload, HTTP 4xx). The worker fails it at once without
+ *    spending the remaining retries.
+ *  - Any other error: transient (timeout, HTTP 5xx/429, network). The worker
+ *    requeues it with backoff until the retry budget is spent.
+ *
+ * Every handler receives an AbortSignal. It fires when the worker loses its
+ * lease (another worker may already own the task), when the task exceeds its
+ * timeout, or on shutdown. Handlers must stop promptly when it fires.
+ */
+
+export class NonRetryableTaskError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetryableTaskError';
+  }
+}
+
+/** Name check rather than instanceof: survives duplicate module copies. */
+export function isNonRetryable(error: unknown): boolean {
+  return error instanceof Error && error.name === 'NonRetryableTaskError';
+}
+
+export interface TaskContext {
+  taskId: string;
+  name: string;
+  payload: Record<string, unknown>;
+  /** 1-based attempt number, from the retry count in PostgreSQL. */
+  attempt: number;
+  signal: AbortSignal;
+}
+
+export type TaskHandler = (ctx: TaskContext) => Promise<unknown>;
+
+export interface BuiltinHandlerOptions {
+  /**
+   * Hostnames the `http` handler may call. Exact names or `*.example.com`
+   * suffix patterns. Empty means the handler is disabled. An open HTTP
+   * handler inside the cluster would let anyone who can submit a task make
+   * requests to internal services (SSRF).
+   */
+  httpAllowedHosts?: string[];
+  maxSleepMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+export const MAX_RESULT_BYTES = 64 * 1024;
+const MAX_HTTP_BODY_CHARS = 16 * 1024;
+const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+function abortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason ?? new Error('aborted'));
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function intField(payload: Record<string, unknown>, key: string, def: number, min: number, max: number): number {
+  const value = payload[key];
+  if (value === undefined) return def;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw new NonRetryableTaskError(`payload.${key} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+export function hostAllowed(hostname: string, allowed: string[]): boolean {
+  const host = hostname.toLowerCase();
+  return allowed.some((rule) => {
+    const r = rule.trim().toLowerCase();
+    if (!r) return false;
+    if (r.startsWith('*.')) return host.endsWith(r.slice(1)) && host.length > r.length - 1;
+    return host === r;
+  });
+}
+
+export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<string, TaskHandler> {
+  const maxSleepMs = options.maxSleepMs ?? 300_000;
+  const allowed = options.httpAllowedHosts ?? [];
+  const doFetch = options.fetchImpl ?? fetch;
+
+  const handlers = new Map<string, TaskHandler>();
+
+  // Waits for payload.ms (default 1000). Stands in for any slow I/O-bound job.
+  handlers.set('sleep', async ({ payload, signal }) => {
+    const ms = intField(payload, 'ms', 1000, 0, maxSleepMs);
+    await abortable(ms, signal);
+    return { sleptMs: ms };
+  });
+
+  // Returns its payload. Proves the payload made the full round trip.
+  handlers.set('echo', async ({ payload }) => ({ echo: payload }));
+
+  // Fails the first payload.failTimes attempts, then succeeds. Retry
+  // behaviour can then be shown and tested on purpose instead of hoped for.
+  handlers.set('flaky', async ({ payload, attempt }) => {
+    const failTimes = intField(payload, 'failTimes', 1, 0, 10);
+    if (attempt <= failTimes) {
+      throw new Error(`planned failure ${attempt} of ${failTimes}`);
+    }
+    return { succeededOnAttempt: attempt };
+  });
+
+  // Calls an HTTP endpoint on an allow-listed host.
+  handlers.set('http', async ({ payload, signal }) => {
+    if (allowed.length === 0) {
+      throw new NonRetryableTaskError('http handler is disabled: set HTTP_TASK_ALLOWED_HOSTS on the worker');
+    }
+    if (typeof payload.url !== 'string') throw new NonRetryableTaskError('payload.url is required');
+    let url: URL;
+    try {
+      url = new URL(payload.url);
+    } catch {
+      throw new NonRetryableTaskError('payload.url is not a valid URL');
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      throw new NonRetryableTaskError('payload.url must be http or https');
+    }
+    if (url.username || url.password) {
+      throw new NonRetryableTaskError('payload.url must not contain credentials');
+    }
+    if (!hostAllowed(url.hostname, allowed)) {
+      throw new NonRetryableTaskError(`host ${url.hostname} is not in HTTP_TASK_ALLOWED_HOSTS`);
+    }
+    const method = typeof payload.method === 'string' ? payload.method.toUpperCase() : 'GET';
+    if (!HTTP_METHODS.has(method)) throw new NonRetryableTaskError(`payload.method ${method} is not supported`);
+
+    const headers: Record<string, string> = {};
+    if (payload.headers !== undefined) {
+      if (typeof payload.headers !== 'object' || payload.headers === null || Array.isArray(payload.headers)) {
+        throw new NonRetryableTaskError('payload.headers must be an object of strings');
+      }
+      for (const [k, v] of Object.entries(payload.headers)) {
+        if (typeof v !== 'string') throw new NonRetryableTaskError('payload.headers must be an object of strings');
+        headers[k] = v;
+      }
+    }
+    let body: string | undefined;
+    if (payload.body !== undefined && method !== 'GET' && method !== 'HEAD') {
+      body = JSON.stringify(payload.body);
+      headers['content-type'] ??= 'application/json';
+    }
+
+    const timeoutMs = intField(payload, 'timeoutMs', 10_000, 100, 120_000);
+    const response = await doFetch(url, {
+      method,
+      headers,
+      body,
+      // Following a redirect could leave the allow-list.
+      redirect: 'manual',
+      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+    });
+    const text = method === 'HEAD' ? '' : await response.text();
+    const result = {
+      status: response.status,
+      contentType: response.headers.get('content-type'),
+      body: text.length > MAX_HTTP_BODY_CHARS ? text.slice(0, MAX_HTTP_BODY_CHARS) : text,
+      truncated: text.length > MAX_HTTP_BODY_CHARS,
+    };
+    if (response.status === 429 || response.status >= 500) {
+      throw new Error(`upstream responded ${response.status}`);
+    }
+    if (response.status >= 400) {
+      throw new NonRetryableTaskError(`upstream responded ${response.status}`);
+    }
+    return result;
+  });
+
+  return handlers;
+}
+
+/** Keeps stored results bounded: tasks.result is a JSONB column, not blob storage. */
+export function boundResult(output: unknown): unknown {
+  if (output === undefined) return null;
+  let json: string;
+  try {
+    json = JSON.stringify(output);
+  } catch {
+    return { unserializable: true };
+  }
+  if (json === undefined) return null;
+  if (Buffer.byteLength(json, 'utf8') <= MAX_RESULT_BYTES) return output;
+  return { truncated: true, preview: json.slice(0, 1024) };
+}
+
+/**
+ * Looks up and runs the handler for ctx.name with an overall timeout.
+ * Unknown task types fail permanently.
+ */
+export async function runTaskHandler(
+  handlers: Map<string, TaskHandler>,
+  ctx: TaskContext,
+  timeoutMs: number,
+): Promise<unknown> {
+  const handler = handlers.get(ctx.name);
+  if (!handler) {
+    throw new NonRetryableTaskError(
+      `No handler registered for task type "${ctx.name}". Known types: ${[...handlers.keys()].sort().join(', ')}`,
+    );
+  }
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = AbortSignal.any([ctx.signal, timeout]);
+  try {
+    return boundResult(await handler({ ...ctx, signal }));
+  } catch (error) {
+    if (timeout.aborted && !ctx.signal.aborted) {
+      throw new Error(`task timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  }
+}

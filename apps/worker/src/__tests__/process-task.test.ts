@@ -6,6 +6,9 @@ import {
   ProcessTaskDeps,
 } from '../process-task';
 
+// Stand-in handler with the timing the orchestration tests were written against.
+const sleepExecute = () => new Promise<unknown>((resolve) => setTimeout(() => resolve({ slept: 2000 }), 2000));
+
 class MockDelayedError extends Error {
   constructor() {
     super('DelayedError');
@@ -187,6 +190,7 @@ describe('Worker orchestration', () => {
       workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -250,6 +254,7 @@ describe('Worker orchestration', () => {
       workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -304,6 +309,7 @@ describe('Worker orchestration', () => {
       workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -346,6 +352,7 @@ describe('Worker orchestration', () => {
       workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -388,6 +395,7 @@ describe('Worker orchestration', () => {
       workerMetrics: metrics,
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -430,6 +438,7 @@ describe('Worker orchestration', () => {
       workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -478,6 +487,7 @@ describe('Worker orchestration', () => {
       workerMetrics: metrics,
       ClaimNotExpiredError: MockClaimNotExpiredError,
       DelayedError: MockDelayedError,
+      execute: sleepExecute,
     });
 
     const job = makeMockJob();
@@ -528,6 +538,7 @@ describe('Worker orchestration', () => {
         workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
         ClaimNotExpiredError: MockClaimNotExpiredError,
         DelayedError: MockDelayedError,
+      execute: sleepExecute,
         UnrecoverableError: MockUnrecoverableError,
       });
       return { processTask, transitions };
@@ -572,6 +583,102 @@ describe('Worker orchestration', () => {
       const err = await run(processTask, job).catch((e) => e);
       expect(err).not.toBeInstanceOf(MockUnrecoverableError);
       expect(transitions[transitions.length - 1].status).toBe('FAILED');
+    });
+  });
+  describe('task handlers', () => {
+    class MockUnrecoverableError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = 'UnrecoverableError';
+      }
+    }
+
+    function build(execute: ProcessTaskDeps['execute'], overrides: Partial<ProcessTaskDeps['taskRepo']> = {}) {
+      const transitions: Array<{ status: string; opts: any }> = [];
+      const taskRepo = makeMockTaskRepo({
+        getTask: jest.fn<any>().mockImplementation(() =>
+          Promise.resolve(makeTask({ name: 'echo', payload: { hello: 'world' }, retries: 0, maxRetries: 3 })),
+        ),
+        transitionStatus: jest.fn<any>().mockImplementation((_id: string, _v: number, status: string, opts: any) => {
+          transitions.push({ status, opts });
+          return Promise.resolve({ version: 2, claimToken: 'ct-1', retries: 0 });
+        }),
+        ...overrides,
+      });
+      const processTask = createProcessTask({
+        taskRepo,
+        scheduleRepo: makeMockScheduleRepo(),
+        tracing: makeMockTracing(),
+        logger: makeMockLogger(),
+        workerId: 'w-1',
+        scheduleLeaseDurationMs: 300000,
+        leaseDeferralMarginMs: 2000,
+        renewalIntervalMs: 1000,
+        workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
+        ClaimNotExpiredError: MockClaimNotExpiredError,
+        DelayedError: MockDelayedError,
+        UnrecoverableError: MockUnrecoverableError,
+        execute,
+      });
+      return { processTask, transitions, taskRepo };
+    }
+
+    it('passes name, payload and attempt to the handler and stores its output', async () => {
+      const execute = jest.fn<any>().mockResolvedValue({ echo: { hello: 'world' } });
+      const { processTask, transitions } = build(execute);
+
+      const result = await processTask(makeMockJob(), 'task-1', makeMockSpan());
+
+      expect(result.status).toBe('COMPLETED');
+      const ctx = execute.mock.calls[0][0] as any;
+      expect(ctx).toMatchObject({ taskId: 'task-1', name: 'echo', payload: { hello: 'world' }, attempt: 1 });
+      expect(ctx.signal).toBeInstanceOf(AbortSignal);
+      const done = transitions.find((t) => t.status === 'COMPLETED')!;
+      expect(done.opts.result).toEqual({ processedBy: 'w-1', output: { echo: { hello: 'world' } } });
+      expect(done.opts.error).toBeNull();
+    });
+
+    it('fails a permanent error on the first attempt and stops BullMQ retries', async () => {
+      const permanent = new Error('No handler registered for task type "nope"');
+      permanent.name = 'NonRetryableTaskError';
+      const { processTask, transitions } = build(jest.fn<any>().mockRejectedValue(permanent));
+
+      await expect(processTask(makeMockJob({ attemptsMade: 0, opts: { attempts: 4 } }), 'task-1', makeMockSpan()))
+        .rejects.toBeInstanceOf(MockUnrecoverableError);
+      const last = transitions[transitions.length - 1];
+      expect(last.status).toBe('FAILED');
+      expect(last.opts.error).toMatch(/No handler registered/);
+    });
+
+    it('requeues a transient error while retries remain', async () => {
+      const { processTask, transitions } = build(jest.fn<any>().mockRejectedValue(new Error('upstream responded 503')));
+
+      const err = await processTask(makeMockJob({ attemptsMade: 0, opts: { attempts: 4 } }), 'task-1', makeMockSpan()).catch((e) => e);
+      expect(err).not.toBeInstanceOf(MockUnrecoverableError);
+      expect(transitions[transitions.length - 1].status).toBe('QUEUED');
+    });
+
+    it('aborts the handler and writes nothing when the lease is lost mid-run', async () => {
+      let seenSignal: AbortSignal | undefined;
+      const execute = jest.fn<any>().mockImplementation((ctx: any) => {
+        seenSignal = ctx.signal;
+        return new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(ctx.signal.reason));
+        });
+      });
+      const { processTask, transitions } = build(execute, {
+        renewClaim: jest.fn<any>().mockRejectedValue(new Error('claim token mismatch')),
+      });
+
+      const promise = processTask(makeMockJob(), 'task-1', makeMockSpan());
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1000);
+      await flushMicrotasks();
+      const result = await promise;
+
+      expect(seenSignal!.aborted).toBe(true);
+      expect(result).toMatchObject({ status: 'SKIPPED', reason: 'ownership_lost' });
+      expect(transitions.map((t) => t.status)).toEqual(['PROCESSING']);
     });
   });
 });
