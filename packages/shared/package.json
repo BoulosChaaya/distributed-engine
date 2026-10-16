@@ -33,7 +33,7 @@
     "@opentelemetry/sdk-trace-base": "2.12.0",
     "@opentelemetry/sdk-trace-node": "2.12.0",
     "@opentelemetry/semantic-conventions": "1.43.0",
-    "bullmq": "^5.81.5",
+    "bullmq": "^6.3.14",
     "ioredis": "^5.11.1",
     "pg": "^8.23.1",
     "pino": "^10.4.0"
