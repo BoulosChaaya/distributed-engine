@@ -17,7 +17,7 @@
     "test": "jest"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@types/pg": "^8.23.1",
     "typescript": "^5.2.0"
   },
