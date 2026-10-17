@@ -85,6 +85,20 @@ ORDER BY updated_at
 LIMIT 50;
 ```
 
+A large outbox `pending` count is not by itself a publishing problem: with
+publish-time admission a tenant at its concurrency limit (or suspended) keeps
+its backlog in the outbox on purpose. Split it by tenant before acting:
+
+```sql
+SELECT t.tenant_id, COUNT(*) AS waiting, MIN(oe.created_at) AS oldest
+FROM outbox_events oe JOIN tasks t ON t.id = oe.task_id
+WHERE oe.status = 'PENDING'
+GROUP BY t.tenant_id ORDER BY waiting DESC;
+```
+
+Waiting only behind tenants at their limit is normal. Waiting with no tenant
+(`tenant_id` NULL), or `attempts` climbing, is the publisher or Redis.
+
 ## How fast it resumes after an outage
 
 The API's Redis connections (the shared client and the BullMQ queue) retry
