@@ -1,97 +1,47 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
-import { Task } from '@repo/shared';
+import { useState, type FormEvent } from 'react';
+import { engine, type TaskPage, type TaskPriority, type TaskView } from '@/lib/client';
+import { usePoll } from '@/lib/use-poll';
+
+const PAGE_SIZE = 20;
+const CANCELLABLE = new Set(['SCHEDULED', 'QUEUED', 'PROCESSING']);
 
 export default function TasksPage() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [newTaskName, setNewTaskName] = useState('');
-  const [submitting, setSubmitting] = useState(false);
+  const [page, setPage] = useState(1);
+  const { data, error, refresh } = usePoll(
+    () => engine<TaskPage>(`tasks?page=${page}&pageSize=${PAGE_SIZE}`),
+    3000,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
-  const fetchTasks = async () => {
+  async function cancel(task: TaskView) {
+    setBusyId(task.id);
+    setActionError(null);
     try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/tasks`
-      );
-      const data = await response.json();
-      if (data.success) {
-        setTasks(data.data.items || []);
-      }
-    } catch (error) {
-      console.error('Failed to fetch tasks:', error);
+      await engine(`tasks/${task.id}/cancel`, { method: 'PUT' });
+      await refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Cancel failed');
     } finally {
-      setLoading(false);
+      setBusyId(null);
     }
-  };
+  }
 
-  useEffect(() => {
-    fetchTasks();
-    const interval = setInterval(fetchTasks, 3000); // Refresh every 3s
-    return () => clearInterval(interval);
-  }, []);
-
-  const handleSubmitTask = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTaskName.trim()) return;
-
-    setSubmitting(true);
-    try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/tasks`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: newTaskName,
-            payload: { createdAt: new Date().toISOString() },
-          }),
-        }
-      );
-
-      if (response.ok) {
-        setNewTaskName('');
-        fetchTasks();
-      }
-    } catch (error) {
-      console.error('Failed to submit task:', error);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const getStatusClass = (status: string) => {
-    return `status-badge status-${status.toLowerCase()}`;
-  };
+  const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
   return (
-    <div>
+    <>
       <h1>Tasks</h1>
+      <SubmitTask onSubmitted={refresh} />
 
-      <div style={{ background: 'white', padding: '16px', borderRadius: '4px', marginBottom: '24px' }}>
-        <h2>Submit New Task</h2>
-        <form onSubmit={handleSubmitTask}>
-          <input
-            type="text"
-            placeholder="Task name"
-            value={newTaskName}
-            onChange={(e) => setNewTaskName(e.target.value)}
-            disabled={submitting}
-            style={{ padding: '8px', marginRight: '8px', width: '300px' }}
-          />
-          <button type="submit" disabled={submitting}>
-            {submitting ? 'Submitting...' : 'Submit'}
-          </button>
-        </form>
-      </div>
-
-      {loading ? (
-        <p>Loading tasks...</p>
-      ) : (
-        <div style={{ background: 'white', borderRadius: '4px', overflow: 'hidden' }}>
-          {tasks.length === 0 ? (
-            <p style={{ padding: '16px' }}>No tasks yet</p>
-          ) : (
+      {(error || actionError) && <p className="error" role="alert">{actionError ?? error}</p>}
+      {!data && !error && <p className="muted">Loading…</p>}
+      {data && data.items.length === 0 && <p className="muted">No tasks yet.</p>}
+      {data && data.items.length > 0 && (
+        <>
+          <div className="table-wrap">
             <table>
               <thead>
                 <tr>
@@ -99,28 +49,109 @@ export default function TasksPage() {
                   <th>Name</th>
                   <th>Status</th>
                   <th>Priority</th>
-                  <th>Created</th>
+                  <th>Retries</th>
                   <th>Updated</th>
+                  <th><span className="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
-                {tasks.map((task) => (
-                  <tr key={task.id}>
-                    <td style={{ fontSize: '12px', fontFamily: 'monospace' }}>{task.id.slice(0, 8)}</td>
-                    <td>{task.name}</td>
+                {data.items.map((t) => (
+                  <tr key={t.id}>
+                    <td className="mono" title={t.id}>{t.id.slice(0, 8)}</td>
                     <td>
-                      <span className={getStatusClass(task.status)}>{task.status}</span>
+                      {t.name}
+                      {t.error && <div className="row-error" title={t.error}>{t.error}</div>}
                     </td>
-                    <td>{task.priority}</td>
-                    <td>{new Date(task.createdAt).toLocaleString()}</td>
-                    <td>{new Date(task.updatedAt).toLocaleString()}</td>
+                    <td><span className={`badge badge-${t.status.toLowerCase()}`}>{t.status}</span></td>
+                    <td>{t.priority}</td>
+                    <td>{t.retries}/{t.maxRetries}</td>
+                    <td>{new Date(t.updatedAt).toLocaleString()}</td>
+                    <td>
+                      {CANCELLABLE.has(t.status) && (
+                        <button className="secondary" disabled={busyId === t.id} onClick={() => cancel(t)}>
+                          {busyId === t.id ? 'Cancelling…' : 'Cancel'}
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          )}
-        </div>
+          </div>
+          <div className="pager">
+            <button className="secondary" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Previous</button>
+            <span>Page {page} of {totalPages} · {data.total} tasks</span>
+            <button className="secondary" disabled={!data.hasMore} onClick={() => setPage((p) => p + 1)}>Next</button>
+          </div>
+        </>
       )}
-    </div>
+    </>
+  );
+}
+
+function SubmitTask({ onSubmitted }: { onSubmitted: () => Promise<void> }) {
+  const [name, setName] = useState('');
+  const [priority, setPriority] = useState<TaskPriority>('NORMAL');
+  const [maxRetries, setMaxRetries] = useState(3);
+  const [payload, setPayload] = useState('{}');
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setMessage(null);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload || '{}');
+    } catch {
+      setMessage({ kind: 'error', text: 'Payload must be valid JSON.' });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const task = await engine<TaskView>('tasks', {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim(), priority, maxRetries, payload: parsed }),
+      });
+      setMessage({ kind: 'ok', text: `Submitted ${task.id.slice(0, 8)}.` });
+      setName('');
+      await onSubmitted();
+    } catch (err) {
+      setMessage({ kind: 'error', text: err instanceof Error ? err.message : 'Submit failed' });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <form className="panel form" onSubmit={submit}>
+      <h2>Submit a task</h2>
+      <label>
+        Name
+        <input required maxLength={255} value={name} onChange={(e) => setName(e.target.value)} disabled={submitting} />
+      </label>
+      <div className="row">
+        <label>
+          Priority
+          <select value={priority} onChange={(e) => setPriority(e.target.value as TaskPriority)} disabled={submitting}>
+            <option>LOW</option>
+            <option>NORMAL</option>
+            <option>HIGH</option>
+            <option>CRITICAL</option>
+          </select>
+        </label>
+        <label>
+          Max retries
+          <input type="number" min={0} max={10} value={maxRetries}
+            onChange={(e) => setMaxRetries(Number(e.target.value))} disabled={submitting} />
+        </label>
+      </div>
+      <label>
+        Payload (JSON)
+        <textarea rows={3} value={payload} onChange={(e) => setPayload(e.target.value)} disabled={submitting} spellCheck={false} />
+      </label>
+      <button type="submit" disabled={submitting || !name.trim()}>{submitting ? 'Submitting…' : 'Submit'}</button>
+      {message && <p className={message.kind === 'ok' ? 'ok' : 'error'} role="status">{message.text}</p>}
+    </form>
   );
 }

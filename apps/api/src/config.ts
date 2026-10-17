@@ -27,6 +27,10 @@ export interface AppConfig {
     maxAttempts: number;
   };
 
+  operator: {
+    apiKey?: string;
+  };
+
   reconciler: {
     intervalMs: number;
     queuedGraceMs: number;
@@ -83,6 +87,10 @@ export function loadConfig(): AppConfig {
       maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
     },
 
+    operator: {
+      apiKey: process.env.OPERATOR_API_KEY || undefined,
+    },
+
     reconciler: {
       intervalMs: parseNumber(process.env.RECONCILER_INTERVAL_MS, 30000),
       queuedGraceMs: parseNumber(process.env.RECONCILER_QUEUED_GRACE_MS, 60000),
@@ -125,6 +133,9 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.outbox.maxAttempts < 1) {
     errors.push('OUTBOX_MAX_ATTEMPTS must be at least 1');
+  }
+  if (config.operator.apiKey !== undefined && config.operator.apiKey.length < 32) {
+    errors.push('OPERATOR_API_KEY must be at least 32 characters (generate one with: openssl rand -hex 32)');
   }
   if (config.reconciler.intervalMs < 1000) {
     errors.push('RECONCILER_INTERVAL_MS must be at least 1000');

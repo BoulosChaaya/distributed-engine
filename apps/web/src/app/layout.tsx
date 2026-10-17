@@ -1,30 +1,22 @@
-import React from 'react';
+import type { Metadata, Viewport } from 'next';
+import type { ReactNode } from 'react';
+import { Nav } from '@/components/nav';
 import './globals.css';
 
-export const metadata = {
-  title: 'Distributed Engine Dashboard',
-  description: 'Monitor and manage distributed tasks',
+export const metadata: Metadata = {
+  title: 'Distributed Engine',
+  description: 'Operator dashboard for tasks, queue and workers',
+  robots: { index: false, follow: false },
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export const viewport: Viewport = { width: 'device-width', initialScale: 1 };
+
+export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <nav style={{ padding: '16px', borderBottom: '1px solid #ccc' }}>
-          <h1>Distributed Engine</h1>
-          <ul style={{ display: 'flex', gap: '16px', listStyle: 'none', margin: 0, padding: 0 }}>
-            <li>
-              <a href="/">Dashboard</a>
-            </li>
-            <li>
-              <a href="/tasks">Tasks</a>
-            </li>
-            <li>
-              <a href="/workers">Workers</a>
-            </li>
-          </ul>
-        </nav>
-        <main style={{ padding: '24px' }}>{children}</main>
+        <Nav />
+        <main>{children}</main>
       </body>
     </html>
   );
