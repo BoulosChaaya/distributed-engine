@@ -37,6 +37,7 @@ import {
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
 import { createOperatorAuth } from './operator-auth.js';
+import { createTenantAdminRouter } from './tenant-admin.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { config } from './config.js';
@@ -207,7 +208,8 @@ app.get('/live', (_req: Request, res: Response) => {
 // Everything below that is not /tenant/* or a health probe is operator-only.
 // app.use with a path prefix matches '/tasks' and '/tasks/...', never '/tenant/tasks'.
 const operatorAuth = createOperatorAuth(config.operator.apiKey);
-app.use(['/metrics', '/workers', '/tasks', '/schedules'], operatorAuth);
+app.use(['/metrics', '/workers', '/tasks', '/schedules', '/tenants', '/plans'], operatorAuth);
+app.use(createTenantAdminRouter(tenantRepo));
 
 app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => {
   try {

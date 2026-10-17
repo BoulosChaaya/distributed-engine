@@ -98,3 +98,8 @@ tr:last-child td { border-bottom: none; }
 @media (max-width: 480px) {
   .form .row { grid-template-columns: 1fr; }
 }
+
+.row-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.key-panel { border-color: var(--accent); display: grid; gap: 8px; }
+.key { display: block; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }

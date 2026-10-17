@@ -14,6 +14,12 @@ const ALLOWED: Array<{ method: string; pattern: RegExp }> = [
   { method: 'PUT', pattern: new RegExp(`^tasks/${ID}/cancel$`) },
   { method: 'GET', pattern: /^schedules$/ },
   { method: 'GET', pattern: new RegExp(`^schedules/${ID}$`) },
+  { method: 'GET', pattern: /^plans$/ },
+  { method: 'GET', pattern: /^tenants$/ },
+  { method: 'GET', pattern: new RegExp(`^tenants/${ID}$`) },
+  { method: 'POST', pattern: /^tenants$/ },
+  { method: 'PUT', pattern: new RegExp(`^tenants/${ID}/status$`) },
+  { method: 'POST', pattern: new RegExp(`^tenants/${ID}/api-key$`) },
 ];
 
 export function isAllowedEngineCall(method: string, path: string): boolean {

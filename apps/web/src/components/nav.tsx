@@ -8,6 +8,7 @@ export function Nav() {
         <Link href="/">Overview</Link>
         <Link href="/tasks">Tasks</Link>
         <Link href="/workers">Workers</Link>
+        <Link href="/tenants">Tenants</Link>
       </nav>
     </header>
   );

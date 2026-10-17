@@ -52,6 +52,11 @@ describe('engine call allow-list', () => {
     ['PUT', 'tasks/abc-123/cancel'],
     ['GET', 'schedules'],
     ['GET', 'schedules/s_1'],
+    ['GET', 'plans'],
+    ['GET', 'tenants'],
+    ['POST', 'tenants'],
+    ['PUT', 'tenants/t1/status'],
+    ['POST', 'tenants/t1/api-key'],
   ])('allows %s %s', (method, path) => {
     expect(isAllowedEngineCall(method, path)).toBe(true);
   });
@@ -61,6 +66,8 @@ describe('engine call allow-list', () => {
     ['POST', 'schedules'],
     ['PUT', 'schedules/abc/status'],
     ['GET', 'tenant/usage'],
+    ['DELETE', 'tenants/t1'],
+    ['PUT', 'tenants/t1/overrides'],
     ['GET', 'tasks/../metrics'],
     ['GET', 'tasks/a/b'],
     ['GET', 'health/../tasks'],
