@@ -28,8 +28,8 @@ export default function Overview() {
           </section>
           <h2>Pipeline</h2>
           <section className="cards" aria-label="Queue and outbox">
-            <Stat label="Queue waiting" value={data.queue.waiting} />
-            <Stat label="Queue active" value={data.queue.active} />
+            <Stat label="Queue waiting" value={data.queue.waiting ?? 'Redis unreachable'} tone={data.queue.waiting === null ? 'failed' : undefined} />
+            <Stat label="Queue active" value={data.queue.active ?? 'Redis unreachable'} tone={data.queue.active === null ? 'failed' : undefined} />
             <Stat label="Outbox pending" value={data.outbox.pending} />
             <Stat label="Outbox failed" value={data.outbox.failed} tone={data.outbox.failed > 0 ? 'failed' : undefined} />
             <Stat label="API uptime (seconds)" value={data.uptime} />
