@@ -88,9 +88,14 @@ LIMIT 50;
 ## When an operator is still needed
 
 - **Redis is down, not just emptied.** The reconciler skips its cycles and the
-  outbox circuit breaker opens. Nothing is lost: tasks wait in PostgreSQL.
-  Restore Redis and both resume on their own. `/health` shows
-  `redis: down` and the breaker state.
+  outbox publisher pauses: while the queue's Redis connection is not ready it
+  claims nothing, so no event is charged an attempt. Nothing is lost: tasks
+  wait in PostgreSQL as `QUEUED` with `PENDING` events. Restore Redis and both
+  resume on their own. `/health` shows `redis: down`.
+- **Redis is up but slow or failing.** Each `queue.add` is bounded by
+  `OUTBOX_PUBLISH_TIMEOUT_MS` (default 5000). A slow or failed add counts as a
+  failure; five in a row open the circuit breaker, which then probes with one
+  event every 30 s.
 - **Outbox events marked `FAILED`** (publishing exhausted `OUTBOX_MAX_ATTEMPTS`,
   e.g. a long Redis outage). Their tasks are still `QUEUED`, so the reconciler
   picks them up after the grace period. No manual reset is needed. The FAILED
