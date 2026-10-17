@@ -11,6 +11,7 @@ import {
   computeBillingPeriodStart,
 } from '@repo/shared';
 import { CreateWorkflowSchema, PaginationSchema, ValidationError } from './validation.js';
+import { routeId } from './route-params.js';
 
 /**
  * Workflow (DAG) routes. The same handlers serve the operator surface
@@ -77,13 +78,13 @@ export function createWorkflowRouter(
   }));
 
   router.get('/:id', wrap(async (req, res) => {
-    const detail = await workflows.getWorkflow(req.params.id, req.tenant?.id);
-    if (!detail) throw new AppError(404, `Workflow ${req.params.id} not found`);
+    const detail = await workflows.getWorkflow(routeId(req), req.tenant?.id);
+    if (!detail) throw new AppError(404, `Workflow ${routeId(req)} not found`);
     res.json({ success: true, data: detail, timestamp: new Date() });
   }));
 
   router.put('/:id/cancel', wrap(async (req, res) => {
-    const result = await workflows.cancelWorkflow(req.params.id, req.tenant?.id);
+    const result = await workflows.cancelWorkflow(routeId(req), req.tenant?.id);
     // PostgreSQL is already authoritative; dropping queued jobs only saves
     // workers a no-op (they skip CANCELLED tasks anyway).
     for (const taskId of result.cancelledTaskIds) {

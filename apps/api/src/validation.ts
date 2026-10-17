@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 export const SubmitTaskSchema = z.object({
   name: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
-  payload: z.record(z.unknown()).optional().default({}),
+  payload: z.record(z.string(), z.unknown()).optional().default({}),
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
   maxRetries: z.number().int().min(0).max(10).optional().default(3),
   scheduledFor: z.string().datetime().optional(),
@@ -21,7 +21,7 @@ export const CreateScheduleSchema = z.object({
   name: z.string().min(1, 'Schedule name is required').max(255, 'Schedule name too long'),
   taskName: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
   taskPriority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
-  taskPayload: z.record(z.unknown()).optional().default({}),
+  taskPayload: z.record(z.string(), z.unknown()).optional().default({}),
   taskMaxRetries: z.number().int().min(0).max(10).optional().default(3),
   cronExpression: z.string().min(1, 'Cron expression is required'),
   timezone: z.string().min(1, 'Timezone is required').default('UTC'),
@@ -36,7 +36,7 @@ export const UpdateScheduleSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   taskName: z.string().min(1).max(255).optional(),
   taskPriority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional(),
-  taskPayload: z.record(z.unknown()).optional(),
+  taskPayload: z.record(z.string(), z.unknown()).optional(),
   taskMaxRetries: z.number().int().min(0).max(10).optional(),
   cronExpression: z.string().min(1).optional(),
   timezone: z.string().min(1).optional(),
@@ -55,7 +55,7 @@ export type SetScheduleStatusInput = z.infer<typeof SetScheduleStatusSchema>;
 
 export const TenantSubmitTaskSchema = z.object({
   name: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
-  payload: z.record(z.unknown()).optional().default({}),
+  payload: z.record(z.string(), z.unknown()).optional().default({}),
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
   maxRetries: z.number().int().min(0).max(10).optional().default(3),
   idempotencyKey: z.string().max(255).optional(),
@@ -68,7 +68,7 @@ export const TenantCreateScheduleSchema = z.object({
   name: z.string().min(1, 'Schedule name is required').max(255, 'Schedule name too long'),
   taskName: z.string().min(1, 'Task name is required').max(255, 'Task name too long'),
   taskPriority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
-  taskPayload: z.record(z.unknown()).optional().default({}),
+  taskPayload: z.record(z.string(), z.unknown()).optional().default({}),
   taskMaxRetries: z.number().int().min(0).max(10).optional().default(3),
   cronExpression: z.string().min(1, 'Cron expression is required'),
   timezone: z.string().min(1, 'Timezone is required').default('UTC'),
@@ -87,7 +87,7 @@ export class ValidationError extends Error {
   toJSON() {
     return {
       errors: this.errors.issues.map((issue) => ({
-        field: issue.path.join('.'),
+        field: issue.path.map(String).join('.'),
         message: issue.message,
       })),
     };
@@ -106,7 +106,7 @@ export const SetTenantStatusSchema = z.object({
 const WorkflowStepSchema = z.object({
   key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, 'Step key must be 1-64 of A-Z a-z 0-9 _ -'),
   name: z.string().min(1, 'Step name (task type) is required').max(255),
-  payload: z.record(z.unknown()).optional().default({}),
+  payload: z.record(z.string(), z.unknown()).optional().default({}),
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
   maxRetries: z.number().int().min(0).max(10).optional().default(3),
   dependsOn: z.array(z.string()).max(200).optional().default([]),

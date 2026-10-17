@@ -113,6 +113,7 @@ expect 200 "api /health without key" http://localhost:3000/health
 expect 401 "api /tasks without key" http://localhost:3000/tasks
 expect 401 "api /tasks with wrong key" -H 'Authorization: Bearer wrong' http://localhost:3000/tasks
 expect 200 "api /tasks with operator key" "${op[@]}" http://localhost:3000/tasks
+expect 422 "api rejects a malformed query string (not 500)" "${op[@]}" "http://localhost:3000/tasks?page=abc"
 expect 401 "dashboard without credentials" http://localhost:3001/
 expect 401 "dashboard with wrong password" -u "${DASHBOARD_USER}:wrong" http://localhost:3001/
 expect 200 "dashboard with credentials" "${dash[@]}" http://localhost:3001/
