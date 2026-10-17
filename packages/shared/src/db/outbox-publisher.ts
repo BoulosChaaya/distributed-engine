@@ -30,6 +30,37 @@ const PRIORITY_MAP: Record<string, number> = {
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
+export class PublishTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`queue.add did not complete within ${timeoutMs}ms`);
+    this.name = 'PublishTimeoutError';
+  }
+}
+
+/**
+ * Bounds a promise in time. The Queue's Redis connection is created with
+ * maxRetriesPerRequest: null, so while Redis is unreachable a command is not
+ * rejected: it waits in the client's offline queue until Redis returns. A
+ * publish that waits forever counts as neither success nor failure, so the
+ * circuit breaker can never open and the poll loop stalls on one batch.
+ * Racing it against a timer turns "Redis is gone" into a failure the breaker
+ * can count.
+ *
+ * The original promise keeps running. If Redis comes back it may still add
+ * the job later; that is harmless, because the event was released and will
+ * be published again with the same jobId, which BullMQ deduplicates. Its
+ * eventual rejection is swallowed so it cannot surface as an unhandled
+ * rejection, which would crash the process.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  promise.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new PublishTimeoutError(timeoutMs)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 export class OutboxPublisher {
   private running = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -46,6 +77,8 @@ export class OutboxPublisher {
   private readonly circuitResetTimeoutMs: number;
   private readonly nowFn: () => number;
   private readonly fairScheduler?: WeightedFairScheduler;
+  private readonly publishTimeoutMs: number;
+  private waitingForRedis = false;
 
   constructor(
     private pool: Pool,
@@ -60,6 +93,8 @@ export class OutboxPublisher {
       nowFn?: () => number;
       logger?: Logger;
       fairScheduler?: WeightedFairScheduler;
+      /** Upper bound for one queue.add; a slower add counts as a failure. */
+      publishTimeoutMs?: number;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -68,6 +103,7 @@ export class OutboxPublisher {
     this.circuitResetTimeoutMs = circuitOptions?.resetTimeoutMs ?? 30000;
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
     this.fairScheduler = circuitOptions?.fairScheduler;
+    this.publishTimeoutMs = circuitOptions?.publishTimeoutMs ?? 5000;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -139,6 +175,27 @@ export class OutboxPublisher {
     }
   }
 
+  /** False while the Queue's Redis connection is down (ioredis status is not "ready"). */
+  private async queueConnected(): Promise<boolean> {
+    // BullMQ 6 keeps the raw Redis client on the backend (queue.getBackend().client);
+    // older versions exposed it as queue.client.
+    type WithClient = { client?: Promise<{ status?: string }> };
+    const q = this.taskQueue as unknown as WithClient & { getBackend?: () => WithClient };
+    const client = q.getBackend?.().client ?? q.client;
+    if (!client) return true; // test doubles without a connection
+    try {
+      const redis = await withTimeout(client, 1000);
+      return redis.status === undefined || redis.status === 'ready';
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether the last poll found Redis unreachable (for /health). */
+  isWaitingForRedis(): boolean {
+    return this.waitingForRedis;
+  }
+
   private schedulePoll(): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
@@ -160,6 +217,22 @@ export class OutboxPublisher {
       return 0;
     }
 
+    // Redis unreachable: claim nothing. Claiming would charge every event an
+    // attempt for a publish that cannot succeed, and the call itself would
+    // wait for Redis instead of failing. The events stay PENDING and free,
+    // and the next poll after the connection is back publishes them.
+    if (!(await this.queueConnected())) {
+      if (!this.waitingForRedis) {
+        this.waitingForRedis = true;
+        this.logger.warn('Redis connection is not ready; outbox publishing paused');
+      }
+      return 0;
+    }
+    if (this.waitingForRedis) {
+      this.waitingForRedis = false;
+      this.logger.info('Redis connection is ready; outbox publishing resumed');
+    }
+
     const isHalfOpen = currentCircuitState === 'HALF_OPEN';
 
     const client = await this.pool.connect();
@@ -178,7 +251,7 @@ export class OutboxPublisher {
         ? await this.claimFairly(client, effectiveBatchSize)
         : await this.claimGlobalFifo(client, effectiveBatchSize);
 
-      for (const row of orderedRows) {
+      for (const [index, row] of orderedRows.entries()) {
         const event: OutboxEvent = {
           id: row.id,
           taskId: row.task_id,
@@ -219,6 +292,17 @@ export class OutboxPublisher {
           }
 
           if (this.getCircuitState() === 'OPEN') {
+            // The rest of the batch was claimed (attempts + 1) but never
+            // tried. Hand it back now, uncharged, instead of leaving it
+            // claimed for 30 s and spending an attempt on a call never made.
+            const untried = orderedRows.slice(index + 1).map((r) => r.id);
+            if (untried.length > 0) {
+              await client.query(
+                `UPDATE outbox_events SET claimed_by = NULL, claimed_at = NULL, attempts = GREATEST(attempts - 1, 0)
+                 WHERE id = ANY($1) AND claimed_by = $2 AND status = 'PENDING'`,
+                [untried, this.publisherId],
+              );
+            }
             break;
           }
           continue;
@@ -407,7 +491,7 @@ export class OutboxPublisher {
 
         const jobTraceContext = injectTraceContext();
 
-        await this.taskQueue.add(
+        await withTimeout(this.taskQueue.add(
           payload.taskName as string,
           {
             taskId: event.taskId,
@@ -426,7 +510,7 @@ export class OutboxPublisher {
               delay: 2000,
             },
           },
-        );
+        ), this.publishTimeoutMs);
 
         this.onBullMQSuccess();
         tracing.setSpanOk(span);

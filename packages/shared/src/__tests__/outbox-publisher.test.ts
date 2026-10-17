@@ -1211,3 +1211,75 @@ describe('Fairness: weighted distribution via processOutbox (requires PostgreSQL
     }
   });
 });
+
+describe('Redis unreachable: publish timeout (requires PostgreSQL)', () => {
+  // A Queue whose add() never settles: what BullMQ does while Redis is down,
+  // because its connection uses maxRetriesPerRequest: null.
+  const hangingQueue = { add: () => new Promise(() => {}) } as unknown as Queue;
+
+  it('turns a hanging queue.add into failures, opens the breaker, and returns promptly', async () => {
+    requireInfra();
+    for (let i = 0; i < 7; i++) {
+      await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: { i }, maxRetries: 3 });
+    }
+    const p = new OutboxPublisher(pool, hangingQueue, 60000, 10, 5, { publishTimeoutMs: 100 });
+
+    const started = Date.now();
+    const processed = await p.processOutbox();
+    const elapsed = Date.now() - started;
+
+    expect(processed).toBe(0);
+    expect(p.getCircuitState()).toBe('OPEN');
+    // 5 timeouts of 100 ms open the breaker; nothing waits for Redis.
+    expect(elapsed).toBeLessThan(2000);
+
+    const rows = (await pool.query(
+      `SELECT status, attempts, claimed_by FROM outbox_events ORDER BY created_at`,
+    )).rows;
+    expect(rows).toHaveLength(7);
+    // Every event is released and still PENDING: nothing lost, nothing stuck claimed.
+    expect(rows.every((r) => r.status === 'PENDING' && r.claimed_by === null)).toBe(true);
+    // The 5 that were tried were charged one attempt; the 2 never tried were not.
+    expect(rows.map((r) => r.attempts).sort()).toEqual([0, 0, 1, 1, 1, 1, 1]);
+  });
+
+  it('claims nothing while the breaker is open', async () => {
+    requireInfra();
+    await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
+    const p = new OutboxPublisher(pool, hangingQueue, 60000, 10, 5, { publishTimeoutMs: 50, failureThreshold: 1 });
+
+    await p.processOutbox();
+    expect(p.getCircuitState()).toBe('OPEN');
+    const before = (await pool.query('SELECT attempts FROM outbox_events')).rows[0].attempts;
+    await p.processOutbox();
+    const after = (await pool.query('SELECT attempts FROM outbox_events')).rows[0].attempts;
+    expect(after).toBe(before);
+  });
+});
+
+describe('Redis connection down: publishing pauses (requires PostgreSQL)', () => {
+  it('claims nothing and charges nothing while the queue connection is not ready', async () => {
+    requireInfra();
+    await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
+    let status = 'reconnecting';
+    const added: string[] = [];
+    const flakyQueue = {
+      getBackend: () => ({ client: Promise.resolve({ get status() { return status; } }) }),
+      add: async (_name: string, _data: unknown, opts: { jobId: string }) => { added.push(opts.jobId); },
+    } as unknown as Queue;
+    const p = new OutboxPublisher(pool, flakyQueue, 60000, 10, 5, { publishTimeoutMs: 100 });
+
+    expect(await p.processOutbox()).toBe(0);
+    expect(p.isWaitingForRedis()).toBe(true);
+    let row = (await pool.query('SELECT status, attempts, claimed_by FROM outbox_events')).rows[0];
+    expect(row).toEqual({ status: 'PENDING', attempts: 0, claimed_by: null });
+    expect(p.getCircuitState()).toBe('CLOSED');
+
+    status = 'ready';
+    expect(await p.processOutbox()).toBe(1);
+    expect(p.isWaitingForRedis()).toBe(false);
+    row = (await pool.query('SELECT status, attempts FROM outbox_events')).rows[0];
+    expect(row).toEqual({ status: 'DELIVERED', attempts: 1 });
+    expect(added).toHaveLength(1);
+  });
+});
