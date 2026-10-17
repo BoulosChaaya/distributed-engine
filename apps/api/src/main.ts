@@ -37,6 +37,7 @@ import {
   ValidationError,
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
+import { checkHealth, settleWithin } from './dependency-check.js';
 import { createOperatorAuth } from './operator-auth.js';
 import { routeId } from './route-params.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
@@ -128,7 +129,7 @@ const schedulerService = new SchedulerService(pgPool, logger.child({ component: 
   executionLeaseDurationMs: config.scheduler?.executionLeaseDurationMs ?? 300000,
 });
 
-const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher);
+const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher, config.health.dependencyTimeoutMs);
 
 const shutdownManager = new ShutdownManager(config.gracefulShutdown.timeoutMs);
 
@@ -156,52 +157,20 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 });
 
 app.get('/health', async (_req: Request, res: Response) => {
-  const outboxCircuitState = outboxPublisher.getCircuitState();
-
-  let pgHealthy = false;
-  try {
-    await pgPool.query('SELECT 1');
-    pgHealthy = true;
-  } catch {
-    // PG unavailable
-  }
-
-  let redisHealthy = false;
-  try {
-    await redisClient.ping();
-    redisHealthy = true;
-  } catch {
-    // Redis unavailable
-  }
-
-  const isReady = pgHealthy;
-  const isDegraded = !redisHealthy || outboxCircuitState !== 'CLOSED';
-
-  const data = {
-    status: isReady ? (isDegraded ? 'degraded' : 'healthy') : 'unhealthy',
-    timestamp: new Date(),
-    outboxCircuitBreaker: outboxCircuitState,
-    dependencies: {
-      postgres: pgHealthy ? 'up' : 'down',
-      redis: redisHealthy ? 'up' : 'down',
-    },
-  };
-
-  res.status(isReady ? 200 : 503).json({ success: isReady, data, timestamp: new Date() });
+  const { httpStatus, data } = await checkHealth({
+    pingPostgres: () => pgPool.query('SELECT 1'),
+    pingRedis: () => redisClient.ping(),
+    circuitState: () => outboxPublisher.getCircuitState(),
+    timeoutMs: config.health.dependencyTimeoutMs,
+  });
+  res.status(httpStatus).json({ success: httpStatus === 200, data, timestamp: new Date() });
 });
 
 app.get('/ready', async (_req: Request, res: Response) => {
-  let pgHealthy = false;
-  try {
-    await pgPool.query('SELECT 1');
-    pgHealthy = true;
-  } catch {
-    // PG unavailable
-  }
-
-  res.status(pgHealthy ? 200 : 503).json({
-    success: pgHealthy,
-    data: { postgres: pgHealthy ? 'up' : 'down' },
+  const pg = await settleWithin(pgPool.query('SELECT 1'), config.health.dependencyTimeoutMs);
+  res.status(pg.ok ? 200 : 503).json({
+    success: pg.ok,
+    data: { postgres: pg.ok ? 'up' : 'down' },
   });
 });
 

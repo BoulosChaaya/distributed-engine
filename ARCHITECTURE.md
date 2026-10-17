@@ -350,7 +350,7 @@ than `TASK_TIMEOUT_MS`, and conditional edges.
 - **Rate limiting middleware**: Per-tenant sliding-window rate limiting with `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` response headers. Fail-open on Redis errors.
 - Runs the outbox publisher, scheduler service and task reconciler as background processes
 - Startup waits for PostgreSQL with capped backoff (no crash-loop when the database starts later). Redis is not awaited: the client reconnects forever, and the BullMQ queue owns its own connection, so publishing resumes by itself when Redis returns
-- Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
+- Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state. Every dependency call made for a probe or for `/metrics` is bounded by `HEALTH_DEPENDENCY_TIMEOUT_MS`: the Redis client waits rather than fails while Redis is down (`maxRetriesPerRequest: null`), so an unbounded probe would hang exactly when it is needed. `/metrics` then reports `queue.available: false` with null counts rather than zeros.
 - `/metrics` returns JSON with task status counts, queue depth, and outbox stats
 - Graceful shutdown: stops accepting connections, stops scheduler, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
 
