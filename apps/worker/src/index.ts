@@ -51,6 +51,9 @@ const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
   .map((h) => h.trim())
   .filter(Boolean);
 const taskHandlers = createBuiltinHandlers({ httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS });
+// Liveness endpoint (/healthz). Configurable so more than one worker can run on
+// one host (local runs, tests); containers keep the default.
+const WORKER_HEALTH_PORT = parseStrictIntInRange(process.env.WORKER_HEALTH_PORT, 9000, 'WORKER_HEALTH_PORT', 1, 65535);
 
 let pgPool: Pool | null = null;
 let redisClient: IORedis | null = null;
@@ -235,9 +238,13 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     }
   });
 
-  await new Promise<void>((resolve) => {
-    healthServer!.listen(9000, () => {
-      logger.info('Health server listening', { port: 9000 });
+  await new Promise<void>((resolve, reject) => {
+    // A taken port (EADDRINUSE) goes through the fatal-init path, which logs
+    // it and closes PG/Redis, instead of an unhandled 'error' event crash.
+    healthServer!.once('error', reject);
+    healthServer!.listen(WORKER_HEALTH_PORT, () => {
+      healthServer!.off('error', reject);
+      logger.info('Health server listening', { port: WORKER_HEALTH_PORT });
       resolve();
     });
   });
