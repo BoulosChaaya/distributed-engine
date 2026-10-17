@@ -997,3 +997,59 @@ describe('Existing immediate task behavior preserved (requires PostgreSQL)', () 
     expect(cancelled.status).toBe('CANCELLED');
   });
 });
+
+describe('Duplicate occurrence inside the scheduler transaction (requires PostgreSQL)', () => {
+  // The scheduler service tests mock the repository, so they cannot see what
+  // PostgreSQL does after a unique violation. This one runs the real thing.
+  const silent = { info() {}, warn() {}, error() {}, debug() {}, child() { return silent; } };
+
+  async function dueSchedule(policy: 'SKIP_MISSED' | 'RUN_ONCE' | 'CATCH_UP_ALL') {
+    const T = new Date(Math.floor((Date.now() - 30_000) / 10_000) * 10_000);
+    const schedule = await scheduleRepo.createSchedule({
+      name: `dup-${policy}`, taskName: 'echo', taskPriority: 'NORMAL', taskPayload: {}, taskMaxRetries: 3,
+      cronExpression: '*/10 * * * * *', timezone: 'UTC', nextRunAt: T, misfirePolicy: policy, overlapPolicy: 'ALLOW_OVERLAP',
+    });
+    // The occurrence for T already exists, but next_run_at still points at T:
+    // what a manual edit, a restore or a clock problem can leave behind.
+    await scheduleRepo.generateOccurrence(schedule.id, T, new Date(T.getTime() + 10_000));
+    await pool.query('UPDATE recurring_schedules SET next_run_at = $2 WHERE id = $1', [schedule.id, T]);
+    return { schedule, T };
+  }
+
+  it.each(['SKIP_MISSED', 'RUN_ONCE', 'CATCH_UP_ALL'] as const)('%s: skips the duplicate and moves next_run_at forward', async (policy) => {
+    const { SchedulerService } = await import('../scheduler/scheduler-service');
+    const { schedule, T } = await dueSchedule(policy);
+    const errors: unknown[] = [];
+    const logger = { ...silent, error: (...a: unknown[]) => errors.push(a) };
+    const scheduler = new SchedulerService(pool, logger as never, { catchUpBatchSize: 10 });
+
+    await scheduler.processRecurringSchedules();
+
+    expect(errors).toEqual([]);
+    const after = await scheduleRepo.getSchedule(schedule.id);
+    expect(after!.nextRunAt.getTime()).toBeGreaterThan(T.getTime());
+    const dupes = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM tasks WHERE schedule_id = $1 AND scheduled_for = $2', [schedule.id, T],
+    );
+    expect(dupes.rows[0].n).toBe(1);
+  });
+
+  it('keeps firing on the next cycle after skipping a duplicate', async () => {
+    const { SchedulerService } = await import('../scheduler/scheduler-service');
+    const { schedule } = await dueSchedule('SKIP_MISSED');
+    const scheduler = new SchedulerService(pool, silent as never, {});
+    await scheduler.processRecurringSchedules();
+    // Make the new next_run_at due and run another cycle: a new occurrence appears.
+    await pool.query(`UPDATE recurring_schedules SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1`, [schedule.id]);
+    const before = (await pool.query('SELECT COUNT(*)::int AS n FROM tasks WHERE schedule_id = $1', [schedule.id])).rows[0].n;
+    await scheduler.processRecurringSchedules();
+    const after = (await pool.query('SELECT COUNT(*)::int AS n FROM tasks WHERE schedule_id = $1', [schedule.id])).rows[0].n;
+    expect(after).toBe(before + 1);
+  });
+
+  it('a standalone generateOccurrence still reports DuplicateOccurrenceError', async () => {
+    const { schedule, T } = await dueSchedule('SKIP_MISSED');
+    await expect(scheduleRepo.generateOccurrence(schedule.id, T, new Date(T.getTime() + 10_000)))
+      .rejects.toBeInstanceOf(DuplicateOccurrenceError);
+  });
+});

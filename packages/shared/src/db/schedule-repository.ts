@@ -410,6 +410,12 @@ export class ScheduleRepository {
       const traceCtx = injectTraceContext();
       const hasTraceContext = Object.keys(traceCtx).length > 0;
 
+      // A unique violation aborts the whole PostgreSQL transaction: every later
+      // statement fails with "current transaction is aborted" until rollback.
+      // When the caller owns the transaction (the scheduler passes its client
+      // and then moves next_run_at forward in the same transaction), the
+      // INSERT must fail on its own. A savepoint scopes the failure to it.
+      await c.query('SAVEPOINT occurrence_insert');
       let taskResult;
       try {
         taskResult = await c.query(
@@ -424,12 +430,15 @@ export class ScheduleRepository {
           ],
         );
       } catch (error: unknown) {
-        if (error instanceof Error && error.message.includes('idx_unique_occurrence')) {
+        await c.query('ROLLBACK TO SAVEPOINT occurrence_insert');
+        const pg = error as { code?: string; constraint?: string; message?: string };
+        if (pg.code === '23505' && (pg.constraint === 'idx_unique_occurrence' || pg.message?.includes('idx_unique_occurrence'))) {
           if (ownClient) await c.query('ROLLBACK');
           throw new DuplicateOccurrenceError(scheduleId, scheduledFor);
         }
         throw error;
       }
+      await c.query('RELEASE SAVEPOINT occurrence_insert');
 
       const outboxPayload = {
         taskId,
