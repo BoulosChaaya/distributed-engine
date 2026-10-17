@@ -175,6 +175,7 @@ They answer 503 if no key is configured.
 | POST | /tasks | Create a task (`scheduledFor` makes it one-time scheduled) |
 | GET | /tasks, /tasks/:id | List (paginated) / get |
 | PUT | /tasks/:id/cancel | Cancel |
+| POST | /tasks/:id/retry | Send a FAILED task back to the queue with a fresh retry budget (not workflow steps) |
 | POST | /workflows | Start a workflow `{ name, steps: [{ key, name, payload, dependsOn }], idempotencyKey? }` |
 | GET | /workflows, /workflows/:id | List with progress / steps with status, level, dependencies, output |
 | PUT | /workflows/:id/cancel | Cancel the workflow and every unfinished step |

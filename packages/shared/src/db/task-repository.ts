@@ -397,6 +397,69 @@ export class TaskRepository {
     }
   }
 
+  /**
+   * Operator redrive of a FAILED task: FAILED → QUEUED with a fresh retry
+   * budget, plus a TASK_REQUEUED outbox event, in one transaction. This is the
+   * one caller of the FAILED → QUEUED transition the state machine allows.
+   *
+   * Workflow steps are refused: when a step failed, its descendants were
+   * cancelled and the workflow became FAILED in the same transaction, so
+   * re-running one step alone would leave a "successful" step inside a failed
+   * workflow with its children still cancelled. Resubmit the workflow instead.
+   *
+   * The last error is kept until the new run ends (completion clears it), so
+   * the operator can still see why it failed while it waits.
+   */
+  async retryFailedTask(taskId: string, tenantId?: string): Promise<Task> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const lockResult = await client.query(
+        'SELECT * FROM tasks WHERE id = $1 AND ($2::text IS NULL OR tenant_id = $2) FOR UPDATE',
+        [taskId, tenantId ?? null],
+      );
+      if (lockResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Task ${taskId} not found`);
+      }
+      const current = rowToTask(lockResult.rows[0]);
+      if (current.status !== 'FAILED') {
+        await client.query('ROLLBACK');
+        throw new TaskNotRetryableError(taskId, `status is ${current.status}; only FAILED tasks can be retried`);
+      }
+      if (lockResult.rows[0].workflow_id) {
+        await client.query('ROLLBACK');
+        throw new TaskNotRetryableError(taskId, 'it is a workflow step; resubmit the workflow instead');
+      }
+      assertValidTransition(current.status, 'QUEUED');
+
+      const updated = await client.query(
+        `UPDATE tasks SET status = 'QUEUED', retries = 0, version = version + 1, updated_at = NOW(),
+           claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL, started_at = NULL, completed_at = NULL
+         WHERE id = $1 RETURNING *`,
+        [taskId],
+      );
+      const row = updated.rows[0];
+      await client.query(
+        `INSERT INTO outbox_events (id, task_id, event_type, payload, status, attempts, created_at, trace_context)
+         VALUES ($1, $2, 'TASK_REQUEUED', $3, 'PENDING', 0, NOW(), $4)`,
+        [
+          generateId(),
+          taskId,
+          JSON.stringify({ taskId, taskName: row.name, priority: row.priority, payload: row.payload, maxRetries: row.max_retries }),
+          JSON.stringify(injectTraceContext()),
+        ],
+      );
+      await client.query('COMMIT');
+      return rowToTask(row);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /** Outputs of a workflow step's direct parents, keyed by step key. */
   async getUpstreamOutputs(taskId: string): Promise<Record<string, unknown>> {
     const result = await this.pool.query(
@@ -616,5 +679,15 @@ export class ClaimNotExpiredError extends Error {
   ) {
     super(`Cannot reclaim task ${taskId}: claim has not expired (expires at ${expiresAt.toISOString()})`);
     this.name = 'ClaimNotExpiredError';
+  }
+}
+
+export class TaskNotRetryableError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly reason: string,
+  ) {
+    super(`Task ${taskId} cannot be retried: ${reason}`);
+    this.name = 'TaskNotRetryableError';
   }
 }

@@ -406,6 +406,7 @@ export class OutboxPublisher {
         }
 
         const jobTraceContext = injectTraceContext();
+        await this.removeDeadJob(event);
 
         await this.taskQueue.add(
           payload.taskName as string,
@@ -438,6 +439,26 @@ export class OutboxPublisher {
         tracing.endSpan(span);
       }
     });
+  }
+
+  /**
+   * jobId = taskId makes a second add() a no-op while a job with that id
+   * exists, and BullMQ keeps failed jobs (removeOnFail: false). A task sent
+   * back to the queue (TASK_REQUEUED: operator retry, reconciler) can
+   * therefore meet its own dead job and never be enqueued. A finished job is
+   * removed first; a live one (waiting, active, delayed) is left alone, so the
+   * add stays a harmless duplicate. The reconciler already removes dead jobs,
+   * so for its events this finds nothing.
+   */
+  private async removeDeadJob(event: OutboxEvent): Promise<void> {
+    if (event.eventType !== 'TASK_REQUEUED') return;
+    const job = await this.taskQueue.getJob(event.taskId);
+    if (!job) return;
+    const state = await job.getState();
+    if (state === 'failed' || state === 'completed') {
+      await job.remove();
+      this.logger.info('Removed finished job before requeue', { taskId: event.taskId, state });
+    }
   }
 
   async getPendingCount(): Promise<number> {

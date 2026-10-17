@@ -50,6 +50,7 @@ describe('engine call allow-list', () => {
     ['GET', 'tasks/abc-123'],
     ['POST', 'tasks'],
     ['PUT', 'tasks/abc-123/cancel'],
+    ['POST', 'tasks/abc-123/retry'],
     ['GET', 'schedules'],
     ['GET', 'schedules/s_1'],
     ['GET', 'plans'],
@@ -67,6 +68,8 @@ describe('engine call allow-list', () => {
 
   it.each([
     ['DELETE', 'tasks/abc'],
+    ['GET', 'tasks/abc/retry'],
+    ['POST', 'tasks/a/b/retry'],
     ['POST', 'schedules'],
     ['PUT', 'schedules/abc/status'],
     ['GET', 'tenant/usage'],

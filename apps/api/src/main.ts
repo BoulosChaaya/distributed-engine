@@ -19,6 +19,7 @@ import {
   runMigrations,
   waitForPostgres,
   InvalidTransitionError,
+  TaskNotRetryableError,
   initTelemetry,
   tracing,
   createLogger,
@@ -394,6 +395,23 @@ app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunct
   } catch (error) {
     if (error instanceof InvalidTransitionError) {
       next(new AppError(400, error.message));
+    } else if (error instanceof Error && error.message.includes('not found')) {
+      next(new AppError(404, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
+// Operator redrive of a FAILED task: back to QUEUED with a fresh retry budget.
+app.post('/tasks/:id/retry', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const task = await taskRepo.retryFailedTask(routeId(req));
+    logger.info('Failed task sent back to the queue', { taskId: task.id });
+    res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
+  } catch (error) {
+    if (error instanceof TaskNotRetryableError) {
+      next(new AppError(409, error.message));
     } else if (error instanceof Error && error.message.includes('not found')) {
       next(new AppError(404, error.message));
     } else {
