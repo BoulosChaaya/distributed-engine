@@ -43,6 +43,17 @@ const SCHEDULE_LEASE_DURATION_MS = parseStrictIntInRange(
   1000,
   86400000,
 );
+// Failure detection. A worker that dies is replaced only after two clocks run
+// out: BullMQ's job lock (WORKER_LOCK_DURATION_MS, found by a stall check every
+// WORKER_STALLED_INTERVAL_MS) hands the job to another worker, and the task's
+// lease in PostgreSQL (TASK_CLAIM_TTL_MS) lets that worker reclaim it. With the
+// defaults (30 s, 5 s, 30 s) that is about 35 s. Lower values detect faster but
+// renew more often, and a lock shorter than the longest event-loop stall marks
+// healthy jobs as stalled. Keep the lock and the claim TTL equal: the job is
+// handed over when the lock expires, and is reclaimable when the lease does.
+const WORKER_LOCK_DURATION_MS = parseStrictIntInRange(process.env.WORKER_LOCK_DURATION_MS, 30000, 'WORKER_LOCK_DURATION_MS', 5000, 600000);
+const WORKER_STALLED_INTERVAL_MS = parseStrictIntInRange(process.env.WORKER_STALLED_INTERVAL_MS, 5000, 'WORKER_STALLED_INTERVAL_MS', 1000, 600000);
+const TASK_CLAIM_TTL_MS = parseStrictIntInRange(process.env.TASK_CLAIM_TTL_MS, 30000, 'TASK_CLAIM_TTL_MS', 3000, 600000);
 const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5, 'QUEUE_CONCURRENCY', 1, 100);
 // Each running job uses at most one PostgreSQL connection at a time, plus a
 // little for lease renewal; the pool waits (it does not fail) when full.
@@ -157,7 +168,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   redisClient.on('error', (err) => logger.error('Redis connection error', { reason: err.message }));
   redisClient.on('connect', () => logger.info('Redis connected'));
 
-  const taskRepo = new TaskRepository(pgPool);
+  const taskRepo = new TaskRepository(pgPool, TASK_CLAIM_TTL_MS);
   const scheduleRepo = new ScheduleRepository(pgPool);
   const tenantRepo = new TenantRepository(pgPool);
   const LEASE_DEFERRAL_MARGIN_MS = 2000;
@@ -170,6 +181,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     taskClaimTtlMs: taskRepo.claimTtl,
     scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
     renewalIntervalMs: RENEWAL_INTERVAL,
+    lockDurationMs: WORKER_LOCK_DURATION_MS,
+    stalledIntervalMs: WORKER_STALLED_INTERVAL_MS,
   });
 
   const workerMetrics = {
@@ -297,7 +310,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
       connection: localRedisClient,
       concurrency: QUEUE_CONCURRENCY,
       maxStalledCount: 2,
-      stalledInterval: 5000,
+      lockDuration: WORKER_LOCK_DURATION_MS,
+      stalledInterval: WORKER_STALLED_INTERVAL_MS,
     },
   );
 
