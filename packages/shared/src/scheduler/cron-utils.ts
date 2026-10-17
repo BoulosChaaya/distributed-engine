@@ -59,3 +59,19 @@ export function getMissedOccurrences(
   }
   return results;
 }
+
+/**
+ * The most recent occurrence at or before `atOrBefore`. Used to tell "due now"
+ * from "missed": the gap between it and now is how late the schedule is.
+ */
+export function getLatestOccurrence(
+  cronExpression: string,
+  timezone: string,
+  atOrBefore: Date,
+): Date {
+  const interval = parseExpression(cronExpression, {
+    currentDate: new Date(atOrBefore.getTime() + 1),
+    tz: timezone,
+  });
+  return interval.prev().toDate();
+}

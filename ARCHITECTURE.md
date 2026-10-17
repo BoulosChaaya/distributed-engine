@@ -210,8 +210,10 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 **Occurrence uniqueness**: A partial unique index `(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL` prevents duplicate task generation for the same schedule at the same time, even across concurrent schedulers.
 
 **Misfire policies** (when the scheduler was down and missed occurrences):
-- `SKIP_MISSED`: Generate one occurrence for the missed `nextRunAt`, advance to next future time
-- `RUN_ONCE`: Same as SKIP_MISSED — generate one catch-up occurrence
+An occurrence counts as missed when it is more than `SCHEDULER_MISFIRE_THRESHOLD_MS` late (default 60 s). Polling alone makes every occurrence a few seconds late, so anything within the threshold simply runs, under every policy.
+
+- `SKIP_MISSED`: Missed occurrences are dropped: nothing runs for them and `next_run_at` jumps to the next future time. If the most recent occurrence is within the threshold, it runs.
+- `RUN_ONCE`: Run one catch-up occurrence for the first missed time, then jump to the next future time.
 - `CATCH_UP_ALL`: Generate all missed occurrences in bounded batches (configurable `catchUpBatchSize`). Remaining missed occurrences are processed on subsequent poll cycles. This provides backpressure without silently discarding missed work.
 
 **Overlap policies**:

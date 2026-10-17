@@ -47,6 +47,7 @@ export interface AppConfig {
     batchSize: number;
     catchUpBatchSize: number;
     executionLeaseDurationMs: number;
+    misfireThresholdMs: number;
   };
 
   logging: {
@@ -112,6 +113,7 @@ export function loadConfig(): AppConfig {
       batchSize: parseNumber(process.env.SCHEDULER_BATCH_SIZE, 50),
       catchUpBatchSize: parseNumber(process.env.SCHEDULER_CATCH_UP_BATCH_SIZE, 10),
       executionLeaseDurationMs: parseNumber(process.env.SCHEDULER_EXECUTION_LEASE_DURATION_MS, 300000),
+      misfireThresholdMs: parseNumber(process.env.SCHEDULER_MISFIRE_THRESHOLD_MS, 60000),
     },
 
     logging: {

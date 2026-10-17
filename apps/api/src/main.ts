@@ -127,6 +127,7 @@ const schedulerService = new SchedulerService(pgPool, logger.child({ component: 
   recurringBatchSize: config.scheduler?.batchSize ?? 20,
   catchUpBatchSize: config.scheduler?.catchUpBatchSize ?? 10,
   executionLeaseDurationMs: config.scheduler?.executionLeaseDurationMs ?? 300000,
+  misfireThresholdMs: config.scheduler?.misfireThresholdMs ?? 60000,
 });
 
 const metrics = new MetricsCollector(taskRepo, taskQueue, outboxPublisher, config.health.dependencyTimeoutMs);
