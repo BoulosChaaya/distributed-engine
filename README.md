@@ -309,7 +309,6 @@ apps/
 packages/
   shared/     state machine, repositories, outbox, reconciler, scheduler,
               workflows (DAG engine), task handlers, tenancy, telemetry, logger
-  ui/         shared React components
 k8s/          Kubernetes manifests (+ istio/ for the ambient mesh layer)
 ci/kind/      kustomize overlay used by CI on kind
 scripts/      smoke, chaos, kind e2e, demo

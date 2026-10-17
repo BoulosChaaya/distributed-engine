@@ -20,8 +20,7 @@
     "ignoreDeprecations": "5.0",
     "baseUrl": ".",
     "paths": {
-      "@repo/shared": ["packages/shared/src"],
-      "@repo/ui": ["packages/ui/src"]
+      "@repo/shared": ["packages/shared/src"]
     }
   },
   "include": [],
@@ -29,7 +28,6 @@
     { "path": "./apps/api" },
     { "path": "./apps/worker" },
     { "path": "./apps/web" },
-    { "path": "./packages/shared" },
-    { "path": "./packages/ui" }
+    { "path": "./packages/shared" }
   ]
 }
