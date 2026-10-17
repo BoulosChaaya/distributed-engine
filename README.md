@@ -193,7 +193,7 @@ rate-limited and quota-checked.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /tenant/tasks | Submit (supports `idempotencyKey`) |
+| POST | /tenant/tasks | Submit (supports `idempotencyKey`; a future `scheduledFor` waits as SCHEDULED) |
 | GET | /tenant/tasks, /tenant/tasks/:id | List / get own tasks |
 | PUT | /tenant/tasks/:id/cancel | Cancel own task |
 | POST/GET | /tenant/workflows, /tenant/workflows/:id | Own workflows (quota: one job per step) |

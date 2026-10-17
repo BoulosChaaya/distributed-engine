@@ -265,6 +265,62 @@ describe('TenantRepository (requires PostgreSQL)', () => {
     });
   });
 
+  describe('acceptTask with scheduledFor', () => {
+    async function accept(tenantId: string, scheduledFor?: string) {
+      const limits = await tenantRepo.getEffectiveLimits(tenantId);
+      const tenant = (await tenantRepo.getTenant(tenantId))!;
+      return taskRepo.acceptTask({
+        tenantId,
+        name: 'echo',
+        priority: 'NORMAL',
+        payload: {},
+        maxRetries: 3,
+        billingPeriodStart: computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date()),
+        maxJobsPerPeriod: limits.maxJobsPerPeriod,
+        scheduledFor,
+      });
+    }
+    const outboxCount = async (taskId: string) =>
+      (await pool.query('SELECT COUNT(*)::int AS n FROM outbox_events WHERE task_id = $1', [taskId])).rows[0].n;
+
+    it('stores a future scheduledFor as SCHEDULED with no outbox event, and still charges quota', async () => {
+      const tenant = await createTestTenant();
+      const when = new Date(Date.now() + 60_000).toISOString();
+
+      const result = await accept(tenant.id, when);
+
+      expect(result.task.status).toBe('SCHEDULED');
+      expect(result.task.scheduledFor?.toISOString()).toBe(when);
+      expect(result.outboxEventId).toBeUndefined();
+      expect(await outboxCount(result.task.id)).toBe(0);
+      const usage = await pool.query('SELECT accepted_jobs FROM tenant_usage WHERE tenant_id = $1', [tenant.id]);
+      expect(usage.rows[0].accepted_jobs).toBe(1);
+    });
+
+    it('queues a past scheduledFor immediately', async () => {
+      const tenant = await createTestTenant();
+      const result = await accept(tenant.id, new Date(Date.now() - 60_000).toISOString());
+
+      expect(result.task.status).toBe('QUEUED');
+      expect(await outboxCount(result.task.id)).toBe(1);
+    });
+
+    it('is released by the scheduler path once due, with its own outbox event', async () => {
+      const { ScheduleRepository } = await import('../db/schedule-repository');
+      const tenant = await createTestTenant();
+      const result = await accept(tenant.id, new Date(Date.now() + 60_000).toISOString());
+      await pool.query(`UPDATE tasks SET scheduled_for = NOW() - INTERVAL '1 second' WHERE id = $1`, [result.task.id]);
+
+      const released = await new ScheduleRepository(pool).releaseDueScheduledTasks(50);
+
+      expect(released.map((r) => r.task.id)).toContain(result.task.id);
+      const row = await pool.query('SELECT status, tenant_id FROM tasks WHERE id = $1', [result.task.id]);
+      expect(row.rows[0]).toEqual({ status: 'QUEUED', tenant_id: tenant.id });
+      const ev = await pool.query('SELECT event_type FROM outbox_events WHERE task_id = $1', [result.task.id]);
+      expect(ev.rows.map((r) => r.event_type)).toEqual(['SCHEDULED_TASK_RELEASED']);
+    });
+  });
+
   describe('tenant-scoped queries', () => {
     it('should only return tasks for the requesting tenant', async () => {
       const tenant1 = await createTestTenant('tenant-1');
