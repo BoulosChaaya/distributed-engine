@@ -57,6 +57,14 @@ export interface ProcessTaskDeps {
   scheduleLeaseDurationMs: number;
   leaseDeferralMarginMs: number;
   renewalIntervalMs: number;
+  /**
+   * How often a running task checks whether it was cancelled (a primary-key
+   * read). On CANCELLED the handler's signal fires so it stops early. 0
+   * disables the check (cancellation is then noticed only when a lease renewal
+   * fails, up to renewalIntervalMs later). Off unless set; the worker process
+   * sets it from CANCEL_CHECK_INTERVAL_MS (default 2 s).
+   */
+  cancelCheckIntervalMs?: number;
   workerMetrics: WorkerMetrics;
   ClaimNotExpiredError: new (...args: any[]) => any;
   DelayedError: new (...args: any[]) => any;
@@ -116,6 +124,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     scheduleLeaseDurationMs,
     leaseDeferralMarginMs,
     renewalIntervalMs,
+    cancelCheckIntervalMs = 0,
     workerMetrics,
     ClaimNotExpiredError,
     DelayedError,
@@ -183,6 +192,8 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     let currentRetries = currentTask.retries;
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
     let ownershipLost = false;
+    let cancelled = false;
+    let cancelTimer: ReturnType<typeof setInterval> | undefined;
     const abort = new AbortController();
     let scheduleLeaseToken: string | undefined;
     let concurrencyLeaseToken: string | undefined;
@@ -338,6 +349,25 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         }
       }, renewalIntervalMs);
 
+      // Cancellation is a status change in PostgreSQL, which the handler cannot
+      // see. Without this check a cancelled task kept running until it finished
+      // or the next renewal failed (up to 10 s), and its result was discarded.
+      if (cancelCheckIntervalMs > 0) {
+        cancelTimer = setInterval(async () => {
+          try {
+            const latest = await taskRepo.getTask(taskId);
+            if (latest?.status === 'CANCELLED' && !cancelled) {
+              cancelled = true;
+              logger.info('Task cancelled while running, stopping handler', { taskId });
+              abort.abort(new Error('task cancelled'));
+              if (cancelTimer) clearInterval(cancelTimer);
+            }
+          } catch {
+            // A failed check is not a cancellation; the next tick tries again.
+          }
+        }, cancelCheckIntervalMs);
+      }
+
       logger.info('Task execution started', { taskId });
 
       const upstream = currentTask.workflowId && taskRepo.getUpstreamOutputs
@@ -351,6 +381,12 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         signal: abort.signal,
         upstream,
       });
+
+      if (cancelled) {
+        // The handler ignored the signal and finished anyway; the row is final.
+        parentSpan.setAttribute('task.skip_reason', 'cancelled');
+        return { status: 'SKIPPED', taskId, reason: 'cancelled' };
+      }
 
       if (ownershipLost) {
         logger.warn('Ownership lost during execution, aborting', { taskId });
@@ -401,6 +437,13 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       logger.info('Task durably completed', { taskId });
       return { status: 'COMPLETED', taskId, completedAt: new Date() };
     } catch (error) {
+      if (cancelled) {
+        // Stopped because the task was cancelled. CANCELLED is final: no retry,
+        // no FAILED write, and BullMQ must not retry the job either.
+        logger.info('Task stopped after cancellation', { taskId });
+        parentSpan.setAttribute('task.skip_reason', 'cancelled');
+        return { status: 'SKIPPED', taskId, reason: 'cancelled' };
+      }
       if (ownershipLost) {
         // Another worker may own the task now; any write from here would be
         // rejected by the claim token anyway, so stand down cleanly.
@@ -466,6 +509,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         clearInterval(renewalTimer);
         renewalTimer = undefined;
       }
+      if (cancelTimer) clearInterval(cancelTimer);
       if (scheduleLeaseToken && currentTask.scheduleId) {
         await scheduleRepo.releaseExecutionLease(currentTask.scheduleId, scheduleLeaseToken).catch(() => {});
       }

@@ -50,6 +50,8 @@ const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
   .split(',')
   .map((h) => h.trim())
   .filter(Boolean);
+// How often a running task checks for cancellation; 0 disables.
+const CANCEL_CHECK_INTERVAL_MS = parseStrictIntInRange(process.env.CANCEL_CHECK_INTERVAL_MS, 2000, 'CANCEL_CHECK_INTERVAL_MS', 0, 60000);
 const taskHandlers = createBuiltinHandlers({ httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS });
 
 let pgPool: Pool | null = null;
@@ -207,6 +209,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     leaseDeferralMarginMs: LEASE_DEFERRAL_MARGIN_MS,
     renewalIntervalMs: RENEWAL_INTERVAL,
     workerMetrics,
+    cancelCheckIntervalMs: CANCEL_CHECK_INTERVAL_MS,
     ClaimNotExpiredError,
     DelayedError,
     UnrecoverableError,
