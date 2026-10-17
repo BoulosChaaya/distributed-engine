@@ -38,6 +38,9 @@ beforeAll(async () => {
       } else if (req.url === '/redirect') {
         res.writeHead(302, { location: 'http://169.254.169.254/latest/meta-data' });
         res.end();
+      } else if (req.url === '/not-modified') {
+        res.writeHead(304);
+        res.end();
       } else if (req.url === '/slow') {
         setTimeout(() => { res.writeHead(200); res.end('late'); }, 2000);
       } else {
@@ -135,10 +138,18 @@ describe('http handler', () => {
     expect(err.message).toMatch(msg);
   });
 
-  it('does not follow redirects off the allow-list', async () => {
-    const out: any = await runTaskHandler(handlers, ctx('http', { url: `${base}/redirect` }), 5000);
-    expect(out.status).toBe(302);
+  it('does not follow redirects, and fails permanently naming the target', async () => {
+    const err = await runTaskHandler(handlers, ctx('http', { url: `${base}/redirect` }), 5000).catch((e) => e);
+    expect(isNonRetryable(err)).toBe(true);
+    expect(err.message).toBe(
+      'upstream responded 302 (redirect to http://169.254.169.254/latest/meta-data); redirects are not followed, update the URL',
+    );
     expect(hits.filter((h) => h.includes('meta-data'))).toHaveLength(0);
+  });
+
+  it('treats 304 Not Modified as success', async () => {
+    const out: any = await runTaskHandler(handlers, ctx('http', { url: `${base}/not-modified` }), 5000);
+    expect(out.status).toBe(304);
   });
 
   it('treats 4xx as permanent and 5xx as retryable', async () => {
