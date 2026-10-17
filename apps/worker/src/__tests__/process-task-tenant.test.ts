@@ -144,19 +144,24 @@ describe('processTask — tenant integration', () => {
     jest.useRealTimers();
   });
 
-  it('should skip task when tenant is SUSPENDED', async () => {
+  it('should defer (not complete) the job when the tenant is SUSPENDED', async () => {
+    jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     const tenantRepo = makeMockTenantRepo({
       getTenant: jest.fn<any>().mockResolvedValue({ id: 'tenant-1', status: 'SUSPENDED' }),
     });
     const taskRepo = makeMockTaskRepo({
       getTask: jest.fn<any>().mockResolvedValue(makeTask()),
     });
-    const deps = makeDeps({ taskRepo, tenantRepo });
+    const deps = makeDeps({ taskRepo, tenantRepo, suspendedTenantRecheckMs: 45_000 });
     const processTask = createProcessTask(deps);
+    const job = makeMockJob();
 
-    const result = await processTask(makeMockJob(), 'task-1', makeMockSpan());
-    expect(result.status).toBe('SKIPPED');
-    expect(result.reason).toBe('tenant_suspended');
+    await expect(processTask(job, 'task-1', makeMockSpan())).rejects.toBeInstanceOf(MockDelayedError);
+    // The job is parked as delayed, so BullMQ keeps it live and the reconciler
+    // leaves the task alone; nothing was claimed or written.
+    expect(job.moveToDelayed).toHaveBeenCalledWith(Date.parse('2026-01-01T00:00:45Z'), 'job-token-1');
+    expect(taskRepo.transitionStatus).not.toHaveBeenCalled();
+    expect(tenantRepo.acquireConcurrencyLease).not.toHaveBeenCalled();
   });
 
   it('should acquire concurrency lease for tenant tasks', async () => {
