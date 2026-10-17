@@ -327,7 +327,10 @@ export function createProcessTask(deps: ProcessTaskDeps) {
           throw new DelayedError();
         }
         tracing.recordError(reclaimSpan, error);
-        logger.warn('Failed to reclaim stalled task', {
+        // The repository already failed the task (lost attempts used up the
+        // retry budget); running it again is exactly what must not happen.
+        const exhausted = (error as Error)?.name === 'RetryBudgetExhaustedError';
+        logger.warn(exhausted ? 'Stalled task failed: retry budget exhausted' : 'Failed to reclaim stalled task', {
           taskId,
           reason: String(error),
         });
@@ -337,7 +340,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         if (concurrencyLeaseToken && tenantRepo) {
           await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
         }
-        return { status: 'SKIPPED', taskId, reason: 'reclaim_failed' };
+        return { status: 'SKIPPED', taskId, reason: exhausted ? 'retry_budget_exhausted' : 'reclaim_failed' };
       } finally {
         tracing.endSpan(reclaimSpan);
       }

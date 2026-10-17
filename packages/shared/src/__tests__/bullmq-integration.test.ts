@@ -162,7 +162,9 @@ describe('Section 5: Lease deferral does not consume execution retry budget (req
       name: 'recoverable-deferral-test',
       priority: 'NORMAL',
       payload: {},
-      maxRetries: 0,
+      // The reclaim charges the crashed worker's lost run, so it needs one
+      // retry left. Deferrals before it are still free (what this checks).
+      maxRetries: 1,
     });
 
     await testRepo.transitionStatus(task.id, task.version, 'PROCESSING', {

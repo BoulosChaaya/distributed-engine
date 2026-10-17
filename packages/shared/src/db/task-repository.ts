@@ -258,10 +258,24 @@ export class TaskRepository {
     }
   }
 
+  /**
+   * Take over a PROCESSING task whose lease expired (its worker died or hung).
+   *
+   * The lost run counts as an attempt and is charged to the retry budget, as
+   * the reconciler already does for the same situation. Without that, a task
+   * whose execution kills its worker (a "poison" task) was reclaimed for free
+   * until BullMQ's own stall limit gave up, then requeued by the reconciler,
+   * which charged only then: three worker crashes per retry. When the budget
+   * is already spent the task is failed here and RetryBudgetExhaustedError
+   * is thrown, so the caller does not run it again.
+   */
   async reclaimStalledTask(taskId: string, expectedVersion: number, workerId?: string): Promise<Task> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Lock order workflow row -> task row, as for every terminal transition:
+      // this reclaim may fail a workflow step.
+      const workflowId = await lockWorkflowForTask(client, taskId);
 
       const lockResult = await client.query(
         'SELECT *, NOW() as db_now FROM tasks WHERE id = $1 FOR UPDATE',
@@ -296,12 +310,28 @@ export class TaskRepository {
         throw new ClaimNotExpiredError(taskId, current.claimExpiresAt);
       }
 
+      const retries = current.retries + 1;
+      if (retries > current.maxRetries) {
+        await client.query(
+          `UPDATE tasks SET status = 'FAILED', retries = $2, error = $3, version = version + 1, updated_at = NOW(),
+             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
+           WHERE id = $1`,
+          [taskId, retries, 'Worker lost the task lease and the retry budget is exhausted'],
+        );
+        if (workflowId) await onTaskTerminal(client, workflowId, taskId, 'FAILED');
+        await client.query('COMMIT');
+        throw new RetryBudgetExhaustedError(taskId, retries);
+      }
+
       const claimToken = generateId();
 
       const updateResult = await client.query(
-        `UPDATE tasks SET version = version + 1, updated_at = NOW(), claimed_by = $2, claim_token = $3, claim_expires_at = NOW() + $4 * INTERVAL '1 millisecond'
+        `UPDATE tasks SET version = version + 1, updated_at = NOW(), retries = $5,
+           error = $6,
+           claimed_by = $2, claim_token = $3, claim_expires_at = NOW() + $4 * INTERVAL '1 millisecond'
          WHERE id = $1 RETURNING *`,
-        [taskId, workerId || null, claimToken, this.claimTtlMs],
+        [taskId, workerId || null, claimToken, this.claimTtlMs, retries,
+          `Worker lost the task lease; attempt ${retries} charged and the task reclaimed`],
       );
 
       await client.query('COMMIT');
@@ -680,6 +710,14 @@ export class ClaimTokenMismatchError extends Error {
   ) {
     super(`Claim token mismatch for task ${taskId}: provided ${provided || 'none'}, expected ${expected}`);
     this.name = 'ClaimTokenMismatchError';
+  }
+}
+
+/** Reclaim found the retry budget spent; the task is now FAILED. */
+export class RetryBudgetExhaustedError extends Error {
+  constructor(public readonly taskId: string, public readonly retries: number) {
+    super(`Task ${taskId} failed: worker lost the lease and the retry budget is exhausted (${retries} attempts)`);
+    this.name = 'RetryBudgetExhaustedError';
   }
 }
 

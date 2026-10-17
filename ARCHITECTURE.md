@@ -146,8 +146,11 @@ If a worker crashes while processing a task:
    - The version matches (optimistic concurrency)
    - The caller is not the same worker (self-reclaim rejection)
    - The previous claim has expired (`claim_expires_at < NOW()`)
-5. On success, a new `claim_token` and `claim_expires_at` are set, and the new worker's ID replaces `claimed_by`
-6. Processing continues from the start
+5. The lost run is charged as an attempt (`retries + 1`, with the reason in `error`). If that exceeds `maxRetries`, the task goes to FAILED instead (a workflow step cancels its downstream as for any failure) and is not run again
+6. Otherwise a new `claim_token` and `claim_expires_at` are set, and the new worker's ID replaces `claimed_by`
+7. Processing continues from the start
+
+Charging the lost run bounds a task that kills its worker every time (a poison task): it fails after `maxRetries + 1` crashes. Before, reclaims were free and only the reconciler charged, after BullMQ's stall limit gave up, so a task with `maxRetries: 2` crashed workers 9 times (recorded). The cost: a task interrupted by a forced kill (OOM, SIGKILL during a rollout) also spends one retry, the same rule the reconciler already applied.
 
 PROCESSING status alone is **not** sufficient evidence that a job stalled. A task in PROCESSING with a non-expired claim is actively being worked on by its owner. Reclaim is only permitted after the claim expires, which provides a bounded recovery window that prevents live-owner theft.
 
