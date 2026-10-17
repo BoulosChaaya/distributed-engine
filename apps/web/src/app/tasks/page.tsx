@@ -38,6 +38,19 @@ export default function TasksPage() {
     }
   }
 
+  async function retry(task: TaskView) {
+    setBusyId(task.id);
+    setActionError(null);
+    try {
+      await engine(`tasks/${task.id}/retry`, { method: 'POST' });
+      await refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Retry failed');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
   return (
@@ -80,6 +93,11 @@ export default function TasksPage() {
                       {CANCELLABLE.has(t.status) && (
                         <button className="secondary" disabled={busyId === t.id} onClick={() => cancel(t)}>
                           {busyId === t.id ? 'Cancelling…' : 'Cancel'}
+                        </button>
+                      )}
+                      {t.status === 'FAILED' && !t.stepKey && (
+                        <button className="secondary" disabled={busyId === t.id} onClick={() => retry(t)}>
+                          {busyId === t.id ? 'Retrying…' : 'Retry'}
                         </button>
                       )}
                     </td>
