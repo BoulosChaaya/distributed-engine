@@ -31,6 +31,10 @@ export interface AppConfig {
     apiKey?: string;
   };
 
+  health: {
+    dependencyTimeoutMs: number;
+  };
+
   reconciler: {
     intervalMs: number;
     queuedGraceMs: number;
@@ -91,6 +95,10 @@ export function loadConfig(): AppConfig {
       apiKey: process.env.OPERATOR_API_KEY || undefined,
     },
 
+    health: {
+      dependencyTimeoutMs: parseNumber(process.env.HEALTH_DEPENDENCY_TIMEOUT_MS, 1000),
+    },
+
     reconciler: {
       intervalMs: parseNumber(process.env.RECONCILER_INTERVAL_MS, 30000),
       queuedGraceMs: parseNumber(process.env.RECONCILER_QUEUED_GRACE_MS, 60000),
@@ -145,6 +153,9 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.reconciler.batchSize < 1) {
     errors.push('RECONCILER_BATCH_SIZE must be at least 1');
+  }
+  if (config.health.dependencyTimeoutMs < 50) {
+    errors.push('HEALTH_DEPENDENCY_TIMEOUT_MS must be at least 50');
   }
   if (config.gracefulShutdown.timeoutMs < 1000) {
     errors.push('GRACEFUL_SHUTDOWN_TIMEOUT_MS must be at least 1000');

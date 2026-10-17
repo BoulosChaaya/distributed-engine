@@ -154,7 +154,7 @@ throwaway kind cluster, exactly as CI does.
 |----------|------|----------------|----------|
 | `/ready` | none | PostgreSQL | PG unreachable |
 | `/live` | none | nothing | never |
-| `/health` | none | PG, Redis, outbox circuit breaker | PG unreachable (`degraded` with 200 if only Redis/breaker) |
+| `/health` | none | PG, Redis, outbox circuit breaker, each within `HEALTH_DEPENDENCY_TIMEOUT_MS` (default 1000) | PG unreachable (`degraded` with 200 if only Redis/breaker) |
 | worker `:9000/healthz` | none | process alive | — |
 | dashboard `:3001/` | Basic | auth proxy up | expects 401 unauthenticated; 503 means credentials not configured |
 

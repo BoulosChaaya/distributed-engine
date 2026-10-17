@@ -59,7 +59,8 @@ export interface TaskPage {
 export interface MetricsView {
   uptime: number;
   tasks: { total: number; byStatus: Partial<Record<TaskStatus, number>> };
-  queue: { total: number; active: number; waiting: number };
+  /** Counts are null when Redis did not answer in time (available: false). */
+  queue: { available?: boolean; total: number | null; active: number | null; waiting: number | null };
   outbox: { pending: number; failed: number };
   requests: { total: number; errors: number; errorRate: string };
 }
