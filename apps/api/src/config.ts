@@ -25,6 +25,7 @@ export interface AppConfig {
     pollIntervalMs: number;
     batchSize: number;
     maxAttempts: number;
+    publishTimeoutMs: number;
   };
 
   operator: {
@@ -85,6 +86,7 @@ export function loadConfig(): AppConfig {
       pollIntervalMs: parseNumber(process.env.OUTBOX_POLL_INTERVAL_MS, 1000),
       batchSize: parseNumber(process.env.OUTBOX_BATCH_SIZE, 10),
       maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
+      publishTimeoutMs: parseNumber(process.env.OUTBOX_PUBLISH_TIMEOUT_MS, 5000),
     },
 
     operator: {
@@ -130,6 +132,9 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.outbox.batchSize < 1) {
     errors.push('OUTBOX_BATCH_SIZE must be at least 1');
+  }
+  if (config.outbox.publishTimeoutMs < 100) {
+    errors.push('OUTBOX_PUBLISH_TIMEOUT_MS must be at least 100');
   }
   if (config.outbox.maxAttempts < 1) {
     errors.push('OUTBOX_MAX_ATTEMPTS must be at least 1');
