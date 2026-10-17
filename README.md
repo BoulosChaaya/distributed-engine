@@ -81,7 +81,8 @@ Full design: [ARCHITECTURE.md](ARCHITECTURE.md). Operations:
   - cancel a whole workflow; idempotency keys; tenants charged one job per step
 - **Task handlers:**
   - `echo`, `sleep`, `flaky` (fails on purpose), and `http` (SSRF-safe
-    allow-list, no redirects)
+    allow-list; a redirect fails the task permanently instead of
+    counting as success)
   - permanent vs transient errors
   - retry budget owned by PostgreSQL
   - per-task timeout

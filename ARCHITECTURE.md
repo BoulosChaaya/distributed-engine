@@ -106,7 +106,10 @@ A task's `name` is its **type**. The worker looks it up in a handler registry
 (`packages/shared/src/task-handlers.ts`) and runs the handler with
 `{ taskId, name, payload, attempt, signal }`. Built-in types: `echo`, `sleep`,
 `flaky` (fails N attempts on purpose) and `http` (allow-listed hosts only;
-disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set, redirects not followed).
+disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set). Redirects are not followed:
+a 3xx response (except 304 Not Modified) fails the task permanently with the
+`Location` in the error, because the request the caller asked for never
+reached its target and retrying would get the same redirect.
 The handler's return value is stored as `result.output` (capped at 64 KB).
 
 Errors fall into two classes:
