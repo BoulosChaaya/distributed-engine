@@ -1,7 +1,7 @@
 import { Pool } from 'pg';
 import { ScheduleRepository, DuplicateOccurrenceError } from '../db/schedule-repository.js';
 import { RecurringSchedule } from '../types.js';
-import { getNextOccurrence, getMissedOccurrences } from './cron-utils.js';
+import { getNextOccurrence, getMissedOccurrences, getLatestOccurrence } from './cron-utils.js';
 import { type Logger } from '../logger/index.js';
 
 export interface SchedulerConfig {
@@ -10,6 +10,12 @@ export interface SchedulerConfig {
   recurringBatchSize: number;
   catchUpBatchSize: number;
   executionLeaseDurationMs: number;
+  /**
+   * How late an occurrence may be and still count as on time. Polling alone
+   * makes every occurrence a few seconds late; beyond this it was missed
+   * (downtime, a pause), and the misfire policy decides what happens.
+   */
+  misfireThresholdMs: number;
 }
 
 const DEFAULT_CONFIG: SchedulerConfig = {
@@ -18,6 +24,7 @@ const DEFAULT_CONFIG: SchedulerConfig = {
   recurringBatchSize: 20,
   catchUpBatchSize: 10,
   executionLeaseDurationMs: 300000,
+  misfireThresholdMs: 60000,
 };
 
 export class SchedulerService {
@@ -166,8 +173,29 @@ export class SchedulerService {
 
     switch (misfirePolicy) {
       case 'SKIP_MISSED': {
+        // Run the most recent occurrence only if it is on time; never make up
+        // for missed ones. Before this, SKIP_MISSED ran the oldest missed
+        // occurrence after any downtime, exactly like RUN_ONCE.
         const nextFuture = getNextOccurrence(schedule.cronExpression, schedule.timezone, dbNow);
-        const scheduledFor = schedule.nextRunAt;
+        const latest = getLatestOccurrence(schedule.cronExpression, schedule.timezone, dbNow);
+        const scheduledFor = latest > schedule.nextRunAt ? latest : schedule.nextRunAt;
+        const lateMs = dbNow.getTime() - scheduledFor.getTime();
+
+        if (lateMs > this.config.misfireThresholdMs) {
+          await client.query(
+            `UPDATE recurring_schedules SET next_run_at = $2, version = version + 1, updated_at = NOW()
+             WHERE id = $1`,
+            [schedule.id, nextFuture],
+          );
+          this.logger.info('Missed occurrences skipped (SKIP_MISSED)', {
+            scheduleId: schedule.id,
+            scheduleName: schedule.name,
+            missedFrom: schedule.nextRunAt.toISOString(),
+            lateMs,
+            nextRunAt: nextFuture.toISOString(),
+          });
+          break;
+        }
 
         try {
           await this.scheduleRepo.generateOccurrence(

@@ -162,8 +162,11 @@ describe('SchedulerService', () => {
 
   describe('FORBID_OVERLAP policy', () => {
     it('should generate occurrences regardless of active occurrences (overlap enforced at worker)', async () => {
+      // RUN_ONCE: pastDate is far beyond the misfire threshold, and this test is
+      // about overlap, not about missed occurrences.
       const schedule = makeSchedule({
         overlapPolicy: 'FORBID_OVERLAP',
+        misfirePolicy: 'RUN_ONCE',
         nextRunAt: pastDate,
       });
       (service as any).scheduleRepo.fetchDueSchedules = jest.fn().mockResolvedValue([schedule]);
@@ -211,37 +214,44 @@ describe('SchedulerService', () => {
   });
 
   describe('Misfire policy: SKIP_MISSED', () => {
-    it('should generate one occurrence and jump to next future time', async () => {
+    it('runs nothing for an occurrence missed beyond the threshold, and jumps to the next future time', async () => {
+      // now is 01:30; the hourly 00:00 and 01:00 occurrences are 90 and 30 minutes late.
       const schedule = makeSchedule({
         misfirePolicy: 'SKIP_MISSED',
         nextRunAt: new Date('2025-01-01T00:00:00Z'),
       });
+      const mockClient = { query: jest.fn() };
+      (service as any).scheduleRepo.generateOccurrence = jest.fn();
 
-      const mockClient = {
-        query: jest.fn(),
-      };
-      (service as any).scheduleRepo.generateOccurrence = jest.fn().mockResolvedValue({
-        task: { id: 't1' },
-        outboxEvent: { id: 'o1' },
+      const generated = await (service as any).applyMisfirePolicy(schedule, now, mockClient);
+
+      expect(generated).toBe(0);
+      expect((service as any).scheduleRepo.generateOccurrence).not.toHaveBeenCalled();
+      const update = mockClient.query.mock.calls.find((c: any[]) => String(c[0]).includes('UPDATE recurring_schedules'));
+      expect(new Date(update[1][1]).toISOString()).toBe('2025-01-01T02:00:00.000Z');
+    });
+
+    it('generates the occurrence when it is only polling-late', async () => {
+      const schedule = makeSchedule({
+        misfirePolicy: 'SKIP_MISSED',
+        nextRunAt: new Date('2025-01-01T01:00:00Z'),
       });
+      const mockClient = { query: jest.fn() };
+      (service as any).scheduleRepo.generateOccurrence = jest.fn().mockResolvedValue({ task: { id: 't1' }, outboxEvent: { id: 'o1' } });
+      const fewSecondsLate = new Date('2025-01-01T01:00:04Z');
 
-      // Call the private method directly via any-cast
-      const generated = await (service as any).applyMisfirePolicy(
-        schedule,
-        now,
-        mockClient,
-      );
+      const generated = await (service as any).applyMisfirePolicy(schedule, fewSecondsLate, mockClient);
+
       expect(generated).toBe(1);
-      expect((service as any).scheduleRepo.generateOccurrence).toHaveBeenCalledTimes(1);
-      // The nextRunAt passed should be a future time (after now)
       const call = (service as any).scheduleRepo.generateOccurrence.mock.calls[0];
-      expect(new Date(call[2]).getTime()).toBeGreaterThan(now.getTime());
+      expect(new Date(call[1]).toISOString()).toBe('2025-01-01T01:00:00.000Z');
+      expect(new Date(call[2]).toISOString()).toBe('2025-01-01T02:00:00.000Z');
     });
 
     it('should handle duplicate occurrence gracefully', async () => {
       const schedule = makeSchedule({
         misfirePolicy: 'SKIP_MISSED',
-        nextRunAt: new Date('2025-01-01T00:00:00Z'),
+        nextRunAt: new Date('2025-01-01T01:00:00Z'),
       });
 
       const mockClient = {
@@ -251,9 +261,10 @@ describe('SchedulerService', () => {
         new DuplicateOccurrenceError('sched-1', new Date('2025-01-01T00:00:00Z')),
       );
 
+      // On time (4 s late), so the occurrence is attempted and turns out to exist.
       const generated = await (service as any).applyMisfirePolicy(
         schedule,
-        now,
+        new Date('2025-01-01T01:00:04Z'),
         mockClient,
       );
       expect(generated).toBe(0);
