@@ -85,6 +85,14 @@ ORDER BY updated_at
 LIMIT 50;
 ```
 
+## How fast it resumes after an outage
+
+The API's Redis connections (the shared client and the BullMQ queue) retry
+every 250 ms, backing off to every 2 s at most. Publishing therefore resumes
+within about 3 s of Redis coming back, however long the outage lasted.
+BullMQ's own default backs off to 20 s between attempts, which delayed
+recovery by ~17 s after a one-minute outage.
+
 ## When an operator is still needed
 
 - **Redis is down, not just emptied.** The reconciler skips its cycles and the
