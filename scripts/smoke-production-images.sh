@@ -210,3 +210,7 @@ case "$(wf_status "$broken_id")" in
   *) echo "FAIL: downstream of a failed step was not cancelled" >&2; exit 1 ;;
 esac
 
+# 6. Operator redrive: a FAILED task can be sent back once; a finished one cannot.
+expect 409 "retry refuses a task that is not FAILED" "${op[@]}" -X POST "http://localhost:3000/tasks/${echo_id}/retry"
+expect 200 "retry sends a FAILED task back to the queue" "${op[@]}" -X POST "http://localhost:3000/tasks/${unknown_id}/retry"
+wait_status "$unknown_id" FAILED

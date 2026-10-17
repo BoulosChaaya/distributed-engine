@@ -12,6 +12,7 @@ const ALLOWED: Array<{ method: string; pattern: RegExp }> = [
   { method: 'GET', pattern: new RegExp(`^tasks/${ID}$`) },
   { method: 'POST', pattern: /^tasks$/ },
   { method: 'PUT', pattern: new RegExp(`^tasks/${ID}/cancel$`) },
+  { method: 'POST', pattern: new RegExp(`^tasks/${ID}/retry$`) },
   { method: 'GET', pattern: /^schedules$/ },
   { method: 'GET', pattern: new RegExp(`^schedules/${ID}$`) },
   { method: 'GET', pattern: /^workflows$/ },
