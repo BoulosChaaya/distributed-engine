@@ -198,6 +198,7 @@ rate-limited and quota-checked.
 | POST | /tenant/tasks | Submit (supports `idempotencyKey`; a future `scheduledFor` waits as SCHEDULED) |
 | GET | /tenant/tasks, /tenant/tasks/:id | List / get own tasks |
 | PUT | /tenant/tasks/:id/cancel | Cancel own task |
+| POST | /tenant/tasks/:id/retry | Re-run own FAILED task; counts as one job against the quota (429 when it is used up) |
 | POST/GET | /tenant/workflows, /tenant/workflows/:id | Own workflows (quota: one job per step) |
 | PUT | /tenant/workflows/:id/cancel | Cancel own workflow |
 | POST/GET | /tenant/schedules, /tenant/schedules/:id | Own schedules |

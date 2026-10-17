@@ -637,6 +637,31 @@ app.put('/tenant/tasks/:id/cancel', tenantAuth, rateLimitMiddleware, async (req:
   }
 });
 
+// A tenant re-runs its own FAILED task. Same rules as the operator route,
+// plus the run counts as one job against the tenant's quota.
+app.post('/tenant/tasks/:id/retry', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tenant = req.tenant!;
+    const limits = await tenantRepo.getEffectiveLimits(tenant.id);
+    const task = await taskRepo.retryFailedTask(routeId(req), tenant.id, {
+      billingPeriodStart: computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date()),
+      maxJobsPerPeriod: limits.maxJobsPerPeriod,
+    });
+    logger.info('Tenant task sent back to the queue', { taskId: task.id, tenantId: tenant.id });
+    res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
+  } catch (error) {
+    if (error instanceof TaskNotRetryableError) {
+      next(new AppError(409, error.message));
+    } else if (error instanceof QuotaExceededError) {
+      next(new AppError(429, error.message));
+    } else if (error instanceof Error && error.message.includes('not found')) {
+      next(new AppError(404, error.message));
+    } else {
+      next(error);
+    }
+  }
+});
+
 app.post('/tenant/schedules', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const tenant = req.tenant!;

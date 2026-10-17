@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types.js';
 import { assertValidTransition } from '../state-machine.js';
 import { generateId } from '../utils.js';
@@ -410,7 +410,18 @@ export class TaskRepository {
    * The last error is kept until the new run ends (completion clears it), so
    * the operator can still see why it failed while it waits.
    */
-  async retryFailedTask(taskId: string, tenantId?: string): Promise<Task> {
+  /**
+   * Send a FAILED task back to QUEUED with a fresh retry budget. With
+   * `tenantId` only that tenant's task is found. With `quota` the run is
+   * charged as one job, in the same transaction, exactly like a new
+   * submission: otherwise a tenant could fail a task on purpose and retry it
+   * forever without touching its quota.
+   */
+  async retryFailedTask(
+    taskId: string,
+    tenantId?: string,
+    quota?: { billingPeriodStart: Date; maxJobsPerPeriod: number },
+  ): Promise<Task> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -432,6 +443,9 @@ export class TaskRepository {
         throw new TaskNotRetryableError(taskId, 'it is a workflow step; resubmit the workflow instead');
       }
       assertValidTransition(current.status, 'QUEUED');
+      if (quota && tenantId) {
+        await chargeTenantJob(client, tenantId, quota.billingPeriodStart, quota.maxJobsPerPeriod);
+      }
 
       const updated = await client.query(
         `UPDATE tasks SET status = 'QUEUED', retries = 0, version = version + 1, updated_at = NOW(),
@@ -510,25 +524,7 @@ export class TaskRepository {
         }
       }
 
-      const usageResult = await client.query(
-        `INSERT INTO tenant_usage (id, tenant_id, billing_period_start, accepted_jobs, compute_units, storage_mb, created_at, updated_at)
-         VALUES ($1, $2, $3, 0, 0, 0, NOW(), NOW())
-         ON CONFLICT (tenant_id, billing_period_start) DO UPDATE SET updated_at = NOW()
-         RETURNING accepted_jobs`,
-        [generateId(), input.tenantId, input.billingPeriodStart],
-      );
-
-      const currentJobs = usageResult.rows[0].accepted_jobs as number;
-      if (currentJobs >= input.maxJobsPerPeriod) {
-        await client.query('ROLLBACK');
-        throw new QuotaExceededError(input.tenantId, input.maxJobsPerPeriod, currentJobs);
-      }
-
-      await client.query(
-        `UPDATE tenant_usage SET accepted_jobs = accepted_jobs + 1, updated_at = NOW()
-         WHERE tenant_id = $1 AND billing_period_start = $2`,
-        [input.tenantId, input.billingPeriodStart],
-      );
+      await chargeTenantJob(client, input.tenantId, input.billingPeriodStart, input.maxJobsPerPeriod);
 
       const taskId = generateId();
       const outboxId = generateId();
@@ -701,4 +697,33 @@ export class TaskNotRetryableError extends Error {
     super(`Task ${taskId} cannot be retried: ${reason}`);
     this.name = 'TaskNotRetryableError';
   }
+}
+
+/**
+ * Count one job against a tenant's quota for the billing period, inside the
+ * caller's transaction. Throws QuotaExceededError when the period is full;
+ * the caller's catch rolls the transaction back.
+ */
+async function chargeTenantJob(
+  client: PoolClient,
+  tenantId: string,
+  billingPeriodStart: Date,
+  maxJobsPerPeriod: number,
+): Promise<void> {
+  const usageResult = await client.query(
+    `INSERT INTO tenant_usage (id, tenant_id, billing_period_start, accepted_jobs, compute_units, storage_mb, created_at, updated_at)
+     VALUES ($1, $2, $3, 0, 0, 0, NOW(), NOW())
+     ON CONFLICT (tenant_id, billing_period_start) DO UPDATE SET updated_at = NOW()
+     RETURNING accepted_jobs`,
+    [generateId(), tenantId, billingPeriodStart],
+  );
+  const currentJobs = usageResult.rows[0].accepted_jobs as number;
+  if (currentJobs >= maxJobsPerPeriod) {
+    throw new QuotaExceededError(tenantId, maxJobsPerPeriod, currentJobs);
+  }
+  await client.query(
+    `UPDATE tenant_usage SET accepted_jobs = accepted_jobs + 1, updated_at = NOW()
+     WHERE tenant_id = $1 AND billing_period_start = $2`,
+    [tenantId, billingPeriodStart],
+  );
 }
