@@ -1003,11 +1003,11 @@ describe('Duplicate occurrence inside the scheduler transaction (requires Postgr
   // PostgreSQL does after a unique violation. This one runs the real thing.
   const silent = { info() {}, warn() {}, error() {}, debug() {}, child() { return silent; } };
 
-  async function dueSchedule(policy: 'SKIP_MISSED' | 'RUN_ONCE' | 'CATCH_UP_ALL') {
+  async function dueSchedule(policy: 'SKIP_MISSED' | 'RUN_ONCE' | 'CATCH_UP_ALL', cronExpression = '*/10 * * * * *') {
     const T = new Date(Math.floor((Date.now() - 30_000) / 10_000) * 10_000);
     const schedule = await scheduleRepo.createSchedule({
       name: `dup-${policy}`, taskName: 'echo', taskPriority: 'NORMAL', taskPayload: {}, taskMaxRetries: 3,
-      cronExpression: '*/10 * * * * *', timezone: 'UTC', nextRunAt: T, misfirePolicy: policy, overlapPolicy: 'ALLOW_OVERLAP',
+      cronExpression, timezone: 'UTC', nextRunAt: T, misfirePolicy: policy, overlapPolicy: 'ALLOW_OVERLAP',
     });
     // The occurrence for T already exists, but next_run_at still points at T:
     // what a manual edit, a restore or a clock problem can leave behind.
@@ -1036,9 +1036,16 @@ describe('Duplicate occurrence inside the scheduler transaction (requires Postgr
 
   it('keeps firing on the next cycle after skipping a duplicate', async () => {
     const { SchedulerService } = await import('../scheduler/scheduler-service');
-    const { schedule } = await dueSchedule('SKIP_MISSED');
+    // Every second, and a pause of 1.1 s, so the second cycle always has an
+    // occurrence the first did not create. With '*/10' and no pause, SKIP_MISSED
+    // fires max(latest occurrence <= now, next_run_at): when a 10 s boundary
+    // fell inside the last second, that was the boundary cycle one had just
+    // created, so cycle two correctly created nothing and the test failed
+    // (about 1 run in 10; it failed main's CI after #52).
+    const { schedule } = await dueSchedule('SKIP_MISSED', '* * * * * *');
     const scheduler = new SchedulerService(pool, silent as never, {});
     await scheduler.processRecurringSchedules();
+    await new Promise((r) => setTimeout(r, 1100));
     // Make the new next_run_at due and run another cycle: a new occurrence appears.
     await pool.query(`UPDATE recurring_schedules SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1`, [schedule.id]);
     const before = (await pool.query('SELECT COUNT(*)::int AS n FROM tasks WHERE schedule_id = $1', [schedule.id])).rows[0].n;
