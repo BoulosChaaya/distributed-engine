@@ -90,7 +90,11 @@ LIMIT 50;
 - **Redis is down, not just emptied.** The reconciler skips its cycles and the
   outbox circuit breaker opens. Nothing is lost: tasks wait in PostgreSQL.
   Restore Redis and both resume on their own. `/health` shows
-  `redis: down` and the breaker state.
+  `redis: down` and the breaker state. The API retries the connection every
+  250 ms, backing off to every 2 s at most, so publishing resumes within about
+  3 s of Redis coming back, however long the outage lasted (BullMQ's own
+  default backs off to 20 s, which delayed recovery by ~17 s after a
+  one-minute outage).
 - **Outbox events marked `FAILED`** (publishing exhausted `OUTBOX_MAX_ATTEMPTS`,
   e.g. a long Redis outage). Their tasks are still `QUEUED`, so the reconciler
   picks them up after the grace period. No manual reset is needed. The FAILED
