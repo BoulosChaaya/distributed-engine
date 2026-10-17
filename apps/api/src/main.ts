@@ -38,6 +38,7 @@ import {
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
 import { createOperatorAuth } from './operator-auth.js';
+import { routeId } from './route-params.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
 import { createWorkflowRouter } from './workflow-routes.js';
 import { MetricsCollector } from './metrics.js';
@@ -344,9 +345,9 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
 
 app.get('/tasks/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const task = await taskRepo.getTask(req.params.id);
+    const task = await taskRepo.getTask(routeId(req));
     if (!task) {
-      throw new AppError(404, `Task ${req.params.id} not found`);
+      throw new AppError(404, `Task ${routeId(req)} not found`);
     }
     res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
   } catch (error) {
@@ -377,15 +378,15 @@ app.get('/tasks', async (req: Request, res: Response, next: NextFunction) => {
 
 app.put('/tasks/:id/cancel', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const task = await taskRepo.cancelTask(req.params.id);
+    const task = await taskRepo.cancelTask(routeId(req));
 
     try {
-      const job = await taskQueue.getJob(req.params.id);
+      const job = await taskQueue.getJob(routeId(req));
       if (job) {
         await job.remove();
       }
     } catch (queueError) {
-      logger.warn('Failed to remove cancelled job from queue', { taskId: req.params.id });
+      logger.warn('Failed to remove cancelled job from queue', { taskId: routeId(req) });
     }
 
     logger.info('Task cancelled', { taskId: task.id });
@@ -475,9 +476,9 @@ app.get('/schedules', async (req: Request, res: Response, next: NextFunction) =>
 
 app.get('/schedules/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const schedule = await scheduleRepo.getSchedule(req.params.id);
+    const schedule = await scheduleRepo.getSchedule(routeId(req));
     if (!schedule) {
-      throw new AppError(404, `Schedule ${req.params.id} not found`);
+      throw new AppError(404, `Schedule ${routeId(req)} not found`);
     }
     res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
   } catch (error) {
@@ -492,9 +493,9 @@ app.put('/schedules/:id', async (req: Request, res: Response, next: NextFunction
 
     let nextRunAt: Date | undefined;
     if (updateFields.cronExpression || updateFields.timezone) {
-      const schedule = await scheduleRepo.getSchedule(req.params.id);
+      const schedule = await scheduleRepo.getSchedule(routeId(req));
       if (!schedule) {
-        throw new AppError(404, `Schedule ${req.params.id} not found`);
+        throw new AppError(404, `Schedule ${routeId(req)} not found`);
       }
       nextRunAt = getNextOccurrence(
         updateFields.cronExpression ?? schedule.cronExpression,
@@ -503,7 +504,7 @@ app.put('/schedules/:id', async (req: Request, res: Response, next: NextFunction
       );
     }
 
-    const schedule = await scheduleRepo.updateSchedule(req.params.id, version, {
+    const schedule = await scheduleRepo.updateSchedule(routeId(req), version, {
       ...updateFields,
       nextRunAt,
     });
@@ -529,7 +530,7 @@ app.put('/schedules/:id/status', async (req: Request, res: Response, next: NextF
     const validatedData = SetScheduleStatusSchema.parse(req.body);
 
     const schedule = await scheduleRepo.setScheduleStatus(
-      req.params.id,
+      routeId(req),
       validatedData.version,
       validatedData.status,
     );
@@ -625,9 +626,9 @@ app.get('/tenant/tasks', tenantAuth, rateLimitMiddleware, async (req: Request, r
 app.get('/tenant/tasks/:id', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const tenant = req.tenant!;
-    const task = await taskRepo.getTaskForTenant(req.params.id, tenant.id);
+    const task = await taskRepo.getTaskForTenant(routeId(req), tenant.id);
     if (!task) {
-      throw new AppError(404, `Task ${req.params.id} not found`);
+      throw new AppError(404, `Task ${routeId(req)} not found`);
     }
     res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
   } catch (error) {
@@ -638,7 +639,7 @@ app.get('/tenant/tasks/:id', tenantAuth, rateLimitMiddleware, async (req: Reques
 app.put('/tenant/tasks/:id/cancel', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const tenant = req.tenant!;
-    const task = await taskRepo.cancelTaskForTenant(req.params.id, tenant.id);
+    const task = await taskRepo.cancelTaskForTenant(routeId(req), tenant.id);
     logger.info('Tenant task cancelled', { taskId: task.id, tenantId: tenant.id });
     res.json({ success: true, data: task, timestamp: new Date() } as ApiResponse<Task>);
   } catch (error) {
@@ -721,9 +722,9 @@ app.get('/tenant/schedules', tenantAuth, rateLimitMiddleware, async (req: Reques
 app.get('/tenant/schedules/:id', tenantAuth, rateLimitMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const tenant = req.tenant!;
-    const schedule = await scheduleRepo.getScheduleForTenant(req.params.id, tenant.id);
+    const schedule = await scheduleRepo.getScheduleForTenant(routeId(req), tenant.id);
     if (!schedule) {
-      throw new AppError(404, `Schedule ${req.params.id} not found`);
+      throw new AppError(404, `Schedule ${routeId(req)} not found`);
     }
     res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
   } catch (error) {
@@ -760,6 +761,12 @@ app.get('/tenant/usage', tenantAuth, rateLimitMiddleware, async (req: Request, r
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   metrics.recordError();
+
+  // Any route that let a ZodError through (e.g. bad query strings on list
+  // routes) is still a client error, never a 500.
+  if (err instanceof Error && err.name === 'ZodError') {
+    err = new ValidationError(err as any);
+  }
 
   if (err instanceof ValidationError) {
     return res.status(422).json({

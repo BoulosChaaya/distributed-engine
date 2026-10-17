@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto';
 import { AppError, TenantRepository, computeBillingPeriodStart } from '@repo/shared';
 import { CreateTenantSchema, SetTenantStatusSchema, ValidationError } from './validation.js';
 import { hashApiKey } from './tenant-middleware.js';
+import { routeId } from './route-params.js';
 
 /**
  * Operator-only tenant provisioning (mounted behind operator auth).
@@ -61,8 +62,8 @@ export function createTenantAdminRouter(tenantRepo: TenantRepository): Router {
   }));
 
   router.get('/tenants/:id', wrap(async (req, res) => {
-    const tenant = await tenantRepo.getTenant(req.params.id);
-    if (!tenant) throw new AppError(404, `Tenant ${req.params.id} not found`);
+    const tenant = await tenantRepo.getTenant(routeId(req));
+    if (!tenant) throw new AppError(404, `Tenant ${routeId(req)} not found`);
     const limits = await tenantRepo.getEffectiveLimits(tenant.id);
     const periodStart = computeBillingPeriodStart(tenant.createdAt, limits.billingPeriodDays, new Date());
     const usage = await tenantRepo.getUsage(tenant.id, periodStart);
@@ -83,13 +84,13 @@ export function createTenantAdminRouter(tenantRepo: TenantRepository): Router {
 
   router.put('/tenants/:id/status', wrap(async (req, res) => {
     const { status } = SetTenantStatusSchema.parse(req.body);
-    const tenant = await tenantRepo.setTenantStatus(req.params.id, status);
+    const tenant = await tenantRepo.setTenantStatus(routeId(req), status);
     res.json({ success: true, data: tenant, timestamp: new Date() });
   }));
 
   router.post('/tenants/:id/api-key', wrap(async (req, res) => {
     const apiKey = generateTenantApiKey();
-    const tenant = await tenantRepo.rotateApiKey(req.params.id, hashApiKey(apiKey));
+    const tenant = await tenantRepo.rotateApiKey(routeId(req), hashApiKey(apiKey));
     res.json({
       success: true,
       data: { tenant, apiKey, note: 'The previous key no longer works. Store this one now.' },
