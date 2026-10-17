@@ -5,6 +5,9 @@ import {
   TenantRepoLike,
 } from '../process-task';
 
+// Stand-in handler with the timing the orchestration tests were written against.
+const sleepExecute = () => new Promise<unknown>((resolve) => setTimeout(() => resolve({ slept: 2000 }), 2000));
+
 class MockDelayedError extends Error {
   constructor() {
     super('DelayedError');
@@ -127,6 +130,7 @@ function makeDeps(overrides: Partial<ProcessTaskDeps> = {}): ProcessTaskDeps {
     workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
     ClaimNotExpiredError: MockClaimNotExpiredError,
     DelayedError: MockDelayedError,
+      execute: sleepExecute,
     ...overrides,
   };
 }

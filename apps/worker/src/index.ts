@@ -14,6 +14,8 @@ import {
   extractTraceContext,
   TRACE_CONTEXT_KEY,
   createLogger,
+  createBuiltinHandlers,
+  runTaskHandler,
 } from '@repo/shared';
 import { randomUUID } from 'crypto';
 import { createProcessTask, computeRenewalInterval, validateScheduleLeaseDuration } from './process-task.js';
@@ -41,6 +43,13 @@ const SCHEDULE_LEASE_DURATION_MS = parseStrictIntInRange(
   86400000,
 );
 const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5, 'QUEUE_CONCURRENCY', 1, 100);
+const TASK_TIMEOUT_MS = parseStrictIntInRange(process.env.TASK_TIMEOUT_MS, 300000, 'TASK_TIMEOUT_MS', 1000, 3600000);
+// Hosts the `http` task type may call; empty disables it (no open SSRF from inside the cluster).
+const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter(Boolean);
+const taskHandlers = createBuiltinHandlers({ httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS });
 
 let pgPool: Pool | null = null;
 let redisClient: IORedis | null = null;
@@ -200,6 +209,13 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     ClaimNotExpiredError,
     DelayedError,
     UnrecoverableError,
+    execute: (ctx) => runTaskHandler(taskHandlers, ctx, TASK_TIMEOUT_MS),
+  });
+
+  logger.info('Task handlers registered', {
+    types: [...taskHandlers.keys()].sort(),
+    httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS,
+    taskTimeoutMs: TASK_TIMEOUT_MS,
   });
 
   await runMigrations(pgPool);
