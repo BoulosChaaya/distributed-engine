@@ -37,11 +37,11 @@ import {
   ValidationError,
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
-import { buildRedisOptions } from './redis-options.js';
 import { createOperatorAuth } from './operator-auth.js';
 import { routeId } from './route-params.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
 import { createWorkflowRouter } from './workflow-routes.js';
+import { buildRedisOptions } from './redis-options.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { config } from './config.js';
