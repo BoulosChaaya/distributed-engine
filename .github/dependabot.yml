@@ -6,6 +6,10 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # Types must match the oldest Node we support (engines: >=22), not the newest release.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       dev-minor-and-patch:
         dependency-type: development
@@ -23,3 +27,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # Node majors are moved by hand, LTS to LTS (even numbers). Dependabot proposes
+      # odd "Current" releases (e.g. 25) that are unsupported within months.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]

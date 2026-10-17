@@ -1,6 +1,9 @@
-import cronParser from 'cron-parser';
+import { CronExpressionParser } from 'cron-parser';
 
-const { parseExpression } = cronParser;
+// cron-parser v5: CronExpressionParser.parse replaces v4's parseExpression;
+// the options used here (currentDate, endDate, tz) keep their meaning.
+const parseExpression = (expression: string, options: { currentDate: Date; endDate?: Date; tz: string }) =>
+  CronExpressionParser.parse(expression, options);
 
 export function getNextOccurrence(
   cronExpression: string,

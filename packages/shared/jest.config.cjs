@@ -12,7 +12,6 @@ const config = {
     '^(\\.{1,2}/.*)\\.js$': '$1',
   },
   moduleFileExtensions: ['ts', 'js', 'json'],
-  maxWorkers: 1,
 };
 
 module.exports = config;

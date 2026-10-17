@@ -1,6 +1,6 @@
 # Operator dashboard (Next.js standalone output).
 # Stage 1: install and build only the web workspace.
-FROM node:22-alpine AS builder
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -13,7 +13,7 @@ RUN npm install -g pnpm@10.34.7 \
   && pnpm --filter @distributed-engine/web build
 
 # Stage 2: the standalone server needs no node_modules install and no pnpm.
-FROM node:22-alpine
+FROM node:24-alpine
 
 WORKDIR /app
 ENV NODE_ENV=production \
