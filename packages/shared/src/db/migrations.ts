@@ -259,6 +259,16 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_recurring_schedules_tenant_id ON recurring_schedules(tenant_id);
     `,
   },
+  {
+    version: 17,
+    name: 'add_reconciler_indexes',
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_tasks_inflight_updated_at
+        ON tasks(updated_at) WHERE status IN ('QUEUED', 'PROCESSING');
+      CREATE INDEX IF NOT EXISTS idx_outbox_events_pending_task
+        ON outbox_events(task_id) WHERE status = 'PENDING';
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

@@ -202,6 +202,9 @@ All configuration is via environment variables with sensible defaults for local 
 | OUTBOX_POLL_INTERVAL_MS | 1000 | Outbox polling frequency |
 | OUTBOX_BATCH_SIZE | 10 | Events per outbox poll |
 | OUTBOX_MAX_ATTEMPTS | 5 | Max outbox publish attempts |
+| RECONCILER_INTERVAL_MS | 30000 | How often the API checks PostgreSQL against Redis for lost tasks |
+| RECONCILER_QUEUED_GRACE_MS | 60000 | How long a QUEUED task may sit untouched before its BullMQ job is checked |
+| RECONCILER_BATCH_SIZE | 100 | Tasks checked per reconcile cycle |
 | GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Shutdown drain timeout |
 | LOG_LEVEL | INFO | Logging level |
 

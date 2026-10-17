@@ -1,4 +1,4 @@
-import { Worker, DelayedError } from 'bullmq';
+import { Worker, DelayedError, UnrecoverableError } from 'bullmq';
 import { Redis as IORedis } from 'ioredis';
 import { Pool } from 'pg';
 import http from 'http';
@@ -199,6 +199,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     workerMetrics,
     ClaimNotExpiredError,
     DelayedError,
+    UnrecoverableError,
   });
 
   await runMigrations(pgPool);

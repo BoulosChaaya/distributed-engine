@@ -27,6 +27,12 @@ export interface AppConfig {
     maxAttempts: number;
   };
 
+  reconciler: {
+    intervalMs: number;
+    queuedGraceMs: number;
+    batchSize: number;
+  };
+
   scheduler?: {
     pollIntervalMs: number;
     batchSize: number;
@@ -77,6 +83,12 @@ export function loadConfig(): AppConfig {
       maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
     },
 
+    reconciler: {
+      intervalMs: parseNumber(process.env.RECONCILER_INTERVAL_MS, 30000),
+      queuedGraceMs: parseNumber(process.env.RECONCILER_QUEUED_GRACE_MS, 60000),
+      batchSize: parseNumber(process.env.RECONCILER_BATCH_SIZE, 100),
+    },
+
     scheduler: {
       pollIntervalMs: parseNumber(process.env.SCHEDULER_POLL_INTERVAL_MS, 5000),
       batchSize: parseNumber(process.env.SCHEDULER_BATCH_SIZE, 50),
@@ -113,6 +125,15 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.outbox.maxAttempts < 1) {
     errors.push('OUTBOX_MAX_ATTEMPTS must be at least 1');
+  }
+  if (config.reconciler.intervalMs < 1000) {
+    errors.push('RECONCILER_INTERVAL_MS must be at least 1000');
+  }
+  if (config.reconciler.queuedGraceMs < 5000) {
+    errors.push('RECONCILER_QUEUED_GRACE_MS must be at least 5000');
+  }
+  if (config.reconciler.batchSize < 1) {
+    errors.push('RECONCILER_BATCH_SIZE must be at least 1');
   }
   if (config.gracefulShutdown.timeoutMs < 1000) {
     errors.push('GRACEFUL_SHUTDOWN_TIMEOUT_MS must be at least 1000');
