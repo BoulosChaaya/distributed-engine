@@ -43,6 +43,7 @@ import { createOperatorAuth } from './operator-auth.js';
 import { routeId } from './route-params.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
 import { createWorkflowRouter } from './workflow-routes.js';
+import { buildRedisOptions } from './redis-options.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { config } from './config.js';
@@ -70,15 +71,10 @@ const pgPool = new Pool({
 
 pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { errorType: err.name, reason: err.message }));
 
-const redisOptions = {
-  host: config.redis.host,
-  port: config.redis.port,
-  password: config.redis.password,
-  maxRetriesPerRequest: null,
-};
+const redisOptions = buildRedisOptions(config.redis);
 
-// Connects in the background and keeps reconnecting forever (ioredis default
-// retry strategy). It used to be lazyConnect + an explicit connect() at
+// Connects in the background and keeps reconnecting forever (redisRetryStrategy:
+// 250 ms steps, capped at 2 s). It used to be lazyConnect + an explicit connect() at
 // startup: if Redis was not reachable at that moment, the BullMQ Queue sharing
 // this client failed its own initialisation and stayed broken
 // ("Connection is closed") even after Redis came up.
