@@ -34,7 +34,7 @@
     "@opentelemetry/sdk-trace-node": "2.12.0",
     "@opentelemetry/semantic-conventions": "1.43.0",
     "bullmq": "^6.3.14",
-    "ioredis": "^5.11.1",
+    "ioredis": "^6.0.0",
     "pg": "^8.23.1",
     "pino": "^10.4.0",
     "cron-parser": "^5.10.2"
