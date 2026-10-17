@@ -8,7 +8,12 @@ and the few cases that still need an operator.
 
 - Redis restarts without persistence, or the AOF is lost or corrupted
 - `FLUSHALL` / `FLUSHDB` (operator error)
-- Eviction under memory pressure (the k8s Redis uses `noeviction` to prevent this)
+- Eviction under memory pressure (the k8s Redis uses `noeviction` to prevent this).
+  With `noeviction` a full Redis refuses writes instead, so nothing that
+  accumulates may grow without bound: completed jobs are capped at 100, and
+  failed jobs at `QUEUE_FAILED_JOB_MAX_COUNT` (default 1000) and
+  `QUEUE_FAILED_JOB_RETENTION_SECONDS` (default 86400). PostgreSQL keeps every
+  task's outcome; the kept jobs are only for inspection.
 - Failover to a replica that never received the write
 - BullMQ itself giving up on a job: after `maxStalledCount` stalls the job is
   moved to `failed` without running the worker's failure handler

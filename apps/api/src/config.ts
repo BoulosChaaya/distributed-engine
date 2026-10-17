@@ -36,6 +36,11 @@ export interface AppConfig {
     dependencyTimeoutMs: number;
   };
 
+  queue: {
+    failedJobRetentionSeconds: number;
+    failedJobMaxCount: number;
+  };
+
   reconciler: {
     intervalMs: number;
     queuedGraceMs: number;
@@ -102,6 +107,11 @@ export function loadConfig(): AppConfig {
       dependencyTimeoutMs: parseNumber(process.env.HEALTH_DEPENDENCY_TIMEOUT_MS, 1000),
     },
 
+    queue: {
+      failedJobRetentionSeconds: parseNumber(process.env.QUEUE_FAILED_JOB_RETENTION_SECONDS, 86400),
+      failedJobMaxCount: parseNumber(process.env.QUEUE_FAILED_JOB_MAX_COUNT, 1000),
+    },
+
     reconciler: {
       intervalMs: parseNumber(process.env.RECONCILER_INTERVAL_MS, 30000),
       queuedGraceMs: parseNumber(process.env.RECONCILER_QUEUED_GRACE_MS, 60000),
@@ -151,6 +161,12 @@ export function validateConfig(config: AppConfig): void {
   }
   if (config.operator.apiKey !== undefined && config.operator.apiKey.length < 32) {
     errors.push('OPERATOR_API_KEY must be at least 32 characters (generate one with: openssl rand -hex 32)');
+  }
+  if (config.queue.failedJobRetentionSeconds < 60) {
+    errors.push('QUEUE_FAILED_JOB_RETENTION_SECONDS must be at least 60');
+  }
+  if (config.queue.failedJobMaxCount < 1) {
+    errors.push('QUEUE_FAILED_JOB_MAX_COUNT must be at least 1');
   }
   if (config.reconciler.intervalMs < 1000) {
     errors.push('RECONCILER_INTERVAL_MS must be at least 1000');

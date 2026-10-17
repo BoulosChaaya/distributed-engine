@@ -527,7 +527,7 @@ export class OutboxPublisher {
 
   /**
    * jobId = taskId makes a second add() a no-op while a job with that id
-   * exists, and BullMQ keeps failed jobs (removeOnFail: false). A task sent
+   * exists, and BullMQ keeps failed jobs for a while (removeOnFail retention). A task sent
    * back to the queue (TASK_REQUEUED: operator retry, reconciler) can
    * therefore meet its own dead job and never be enqueued. A finished job is
    * removed first; a live one (waiting, active, delayed) is left alone, so the
