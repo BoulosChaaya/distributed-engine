@@ -203,6 +203,13 @@ PostgreSQL), and a lock shorter than the longest event-loop pause marks a
 healthy job as stalled, so keep the lock well above any synchronous work in a
 handler. Keep the lock and the claim TTL equal.
 
+The Kubernetes manifests set 15000 / 2000 / 15000 (`k8s/worker.yaml`):
+about 16 s from a crash to the reclaim (recorded three times: a 4 s task
+finished 19.5, 20.0 and 19.6 s after its worker was killed). The cost is a
+claim renewal every 5 s per running task and a stall scan every 2 s per
+worker, which is small next to task traffic. Local runs and docker compose
+keep the defaults.
+
 ## Scaling
 
 - API: stateless; HPA 3–10 replicas on CPU/memory. Only one replica runs the
