@@ -45,6 +45,8 @@ const SCHEDULE_LEASE_DURATION_MS = parseStrictIntInRange(
 );
 const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5, 'QUEUE_CONCURRENCY', 1, 100);
 const TASK_TIMEOUT_MS = parseStrictIntInRange(process.env.TASK_TIMEOUT_MS, 300000, 'TASK_TIMEOUT_MS', 1000, 3600000);
+// A job of a suspended tenant is parked this long before the worker checks again.
+const TENANT_SUSPENDED_RECHECK_MS = parseStrictIntInRange(process.env.TENANT_SUSPENDED_RECHECK_MS, 60000, 'TENANT_SUSPENDED_RECHECK_MS', 1000, 3600000);
 // Hosts the `http` task type may call; empty disables it (no open SSRF from inside the cluster).
 const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
   .split(',')
@@ -205,6 +207,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     workerId: WORKER_ID,
     scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
     leaseDeferralMarginMs: LEASE_DEFERRAL_MARGIN_MS,
+    suspendedTenantRecheckMs: TENANT_SUSPENDED_RECHECK_MS,
     renewalIntervalMs: RENEWAL_INTERVAL,
     workerMetrics,
     ClaimNotExpiredError,

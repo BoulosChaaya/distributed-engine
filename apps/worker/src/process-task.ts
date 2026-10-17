@@ -56,6 +56,12 @@ export interface ProcessTaskDeps {
   workerId: string;
   scheduleLeaseDurationMs: number;
   leaseDeferralMarginMs: number;
+  /**
+   * How long a job of a suspended tenant waits before the worker looks again.
+   * The job is delayed, not completed, so it stays alive in BullMQ and the
+   * reconciler leaves it alone. Default 60 s.
+   */
+  suspendedTenantRecheckMs?: number;
   renewalIntervalMs: number;
   workerMetrics: WorkerMetrics;
   ClaimNotExpiredError: new (...args: any[]) => any;
@@ -115,6 +121,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     workerId,
     scheduleLeaseDurationMs,
     leaseDeferralMarginMs,
+    suspendedTenantRecheckMs = 60_000,
     renewalIntervalMs,
     workerMetrics,
     ClaimNotExpiredError,
@@ -171,10 +178,21 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     if (tenantRepo && currentTask.tenantId) {
       const tenant = await tenantRepo.getTenant(currentTask.tenantId);
       if (tenant?.status === 'SUSPENDED') {
-        logger.info('Tenant suspended, skipping task', { taskId, tenantId: currentTask.tenantId });
-        parentSpan.setAttribute('task.skipped', true);
-        parentSpan.setAttribute('task.skip_reason', 'tenant_suspended');
-        return { status: 'SKIPPED', taskId, reason: 'tenant_suspended' };
+        // Park the job instead of finishing it. A "skipped" job is completed in
+        // BullMQ while the row stays QUEUED; the reconciler then sees a dead job,
+        // requeues the task, and the cycle repeats for as long as the tenant is
+        // suspended (one extra outbox event per cycle). A delayed job is live:
+        // the reconciler ignores it, and the task runs once the tenant is active.
+        const recheckAt = Date.now() + suspendedTenantRecheckMs;
+        logger.info('Tenant suspended, deferring task', {
+          taskId,
+          tenantId: currentTask.tenantId,
+          recheckAt: new Date(recheckAt).toISOString(),
+        });
+        parentSpan.setAttribute('task.deferred', true);
+        parentSpan.setAttribute('task.defer_reason', 'tenant_suspended');
+        await job.moveToDelayed(recheckAt, job.token);
+        throw new DelayedError();
       }
     }
 
