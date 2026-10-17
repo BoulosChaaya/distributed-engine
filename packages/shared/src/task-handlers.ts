@@ -185,6 +185,17 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
     if (response.status === 429 || response.status >= 500) {
       throw new Error(`upstream responded ${response.status}`);
     }
+    // Redirects are never followed (a Location could point outside the
+    // allow-list), so a 3xx means the task did not get what it asked for.
+    // Reporting it as success hid that. Retrying returns the same redirect,
+    // so it fails permanently and names the target so the URL can be fixed.
+    // 304 Not Modified is the success answer to a conditional request.
+    if (response.status >= 300 && response.status < 400 && response.status !== 304) {
+      const location = (response.headers.get('location') ?? 'no Location header').slice(0, 200);
+      throw new NonRetryableTaskError(
+        `upstream responded ${response.status} (redirect to ${location}); redirects are not followed, update the URL`,
+      );
+    }
     if (response.status >= 400) {
       throw new NonRetryableTaskError(`upstream responded ${response.status}`);
     }
