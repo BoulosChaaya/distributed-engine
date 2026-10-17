@@ -21,7 +21,10 @@ spec:
         ports:
         - containerPort: 5432
           name: postgres
-        args: ["postgres", "-c", "max_connections=150"]
+        # 260 = api 10 pods x 10 + worker 20 pods x 7 (= 240) + 20 headroom for
+        # superuser-reserved slots, psql and backups. Raise it together with
+        # memory if HPA maximums or pool sizes grow; CI enforces the sum.
+        args: ["postgres", "-c", "max_connections=260"]
         env:
         # A subdirectory, so initdb never trips over lost+found on a fresh volume.
         - name: PGDATA
@@ -37,10 +40,10 @@ spec:
               key: password
         resources:
           requests:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "250m"
           limits:
-            memory: "512Mi"
+            memory: "1Gi"
             cpu: "500m"
         securityContext:
           allowPrivilegeEscalation: false

@@ -59,6 +59,8 @@ jobs:
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      - name: PostgreSQL connection budget fits at full scale
+        run: node scripts/check-db-connection-budget.mjs
 
       - name: Configure Redis authentication
         run: docker exec ${{ job.services.redis.id }} redis-cli CONFIG SET requirepass testpassword123

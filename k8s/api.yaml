@@ -72,6 +72,10 @@ spec:
           value: "distributed_engine"
         - name: POSTGRES_USER
           value: "postgres"
+        # Connection budget: maxReplicas (10) x this must fit max_connections
+        # together with the workers. Checked in CI by scripts/check-db-connection-budget.mjs.
+        - name: POSTGRES_MAX_CONNECTIONS
+          value: "10"
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:

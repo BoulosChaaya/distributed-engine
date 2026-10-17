@@ -44,6 +44,11 @@ const SCHEDULE_LEASE_DURATION_MS = parseStrictIntInRange(
   86400000,
 );
 const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5, 'QUEUE_CONCURRENCY', 1, 100);
+// Each running job uses at most one PostgreSQL connection at a time, plus a
+// little for lease renewal; the pool waits (it does not fail) when full.
+// Sized per pod in k8s so the fleet stays inside max_connections
+// (scripts/check-db-connection-budget.mjs).
+const POSTGRES_MAX_CONNECTIONS = parseStrictIntInRange(process.env.POSTGRES_MAX_CONNECTIONS, 10, 'POSTGRES_MAX_CONNECTIONS', 1, 200);
 const TASK_TIMEOUT_MS = parseStrictIntInRange(process.env.TASK_TIMEOUT_MS, 300000, 'TASK_TIMEOUT_MS', 1000, 3600000);
 // Hosts the `http` task type may call; empty disables it (no open SSRF from inside the cluster).
 const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
@@ -133,7 +138,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     database: process.env.POSTGRES_DB || 'distributed_engine',
     user: process.env.POSTGRES_USER || 'postgres',
     password: process.env.POSTGRES_PASSWORD,
-    max: 10,
+    max: POSTGRES_MAX_CONNECTIONS,
   });
 
   pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { reason: err.message }));
