@@ -7,6 +7,7 @@ import {
   TaskRepository,
   OutboxPublisher,
   TaskReconciler,
+  WorkflowRepository,
   ScheduleRepository,
   ScheduleStaleVersionError,
   TenantRepository,
@@ -38,6 +39,7 @@ import {
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
 import { createOperatorAuth } from './operator-auth.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
+import { createWorkflowRouter } from './workflow-routes.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { config } from './config.js';
@@ -95,6 +97,7 @@ const taskQueue = new Queue('tasks', {
 const taskRepo = new TaskRepository(pgPool);
 const scheduleRepo = new ScheduleRepository(pgPool);
 const tenantRepo = new TenantRepository(pgPool);
+const workflowRepo = new WorkflowRepository(pgPool);
 const rateLimiter = new RedisRateLimiter(redisClient);
 
 const tenantAuth = createTenantAuth(tenantRepo);
@@ -208,8 +211,13 @@ app.get('/live', (_req: Request, res: Response) => {
 // Everything below that is not /tenant/* or a health probe is operator-only.
 // app.use with a path prefix matches '/tasks' and '/tasks/...', never '/tenant/tasks'.
 const operatorAuth = createOperatorAuth(config.operator.apiKey);
-app.use(['/metrics', '/workers', '/tasks', '/schedules', '/tenants', '/plans'], operatorAuth);
+app.use(['/metrics', '/workers', '/tasks', '/schedules', '/tenants', '/plans', '/workflows'], operatorAuth);
 app.use(createTenantAdminRouter(tenantRepo));
+
+const workflowRouter = createWorkflowRouter(workflowRepo, tenantRepo, taskQueue, (taskId) =>
+  logger.warn('Failed to remove cancelled workflow job from queue', { taskId }));
+app.use('/workflows', workflowRouter);
+app.use('/tenant/workflows', tenantAuth, rateLimitMiddleware, workflowRouter);
 
 app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => {
   try {

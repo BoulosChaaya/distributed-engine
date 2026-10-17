@@ -61,6 +61,18 @@ for i in $(seq 1 "$TASKS"); do
   api -X POST -d "$body" http://localhost:3000/tasks >/dev/null
 done
 
+echo "== Submitting 5 workflows (fan-out to 4 sleeps, fan-in to a join)"
+WORKFLOW='{"name":"chaos-wf","steps":[{"key":"start","name":"echo"},'\
+'{"key":"s1","name":"sleep","payload":{"ms":2000},"dependsOn":["start"]},'\
+'{"key":"s2","name":"sleep","payload":{"ms":2000},"dependsOn":["start"]},'\
+'{"key":"s3","name":"flaky","payload":{"failTimes":1},"dependsOn":["start"]},'\
+'{"key":"s4","name":"sleep","payload":{"ms":2000},"dependsOn":["start"]},'\
+'{"key":"join","name":"echo","dependsOn":["s1","s2","s3","s4"]}]}'
+for _ in 1 2 3 4 5; do
+  api -X POST -d "$WORKFLOW" http://localhost:3000/workflows >/dev/null
+done
+TASKS=$((TASKS + 5 * 6))
+
 echo "== Waiting for work to be in flight"
 for _ in $(seq 1 60); do
   processing=$(sql "SELECT COUNT(*) FROM tasks WHERE status = 'PROCESSING'")
@@ -94,12 +106,15 @@ no_result=$(sql "SELECT COUNT(*) FROM tasks WHERE status = 'COMPLETED' AND (resu
 outbox_bad=$(sql "SELECT COUNT(*) FROM outbox_events WHERE status <> 'DELIVERED'")
 requeued=$(sql "SELECT COUNT(DISTINCT task_id) FROM outbox_events WHERE event_type = 'TASK_REQUEUED'")
 retried=$(sql "SELECT COUNT(*) FROM tasks WHERE retries > 0")
+wf_completed=$(sql "SELECT COUNT(*) FROM workflows WHERE status = 'COMPLETED'")
+wf_total=$(sql "SELECT COUNT(*) FROM workflows")
 workers_used=$(sql "SELECT COUNT(DISTINCT result->>'processedBy') FROM tasks WHERE status = 'COMPLETED'")
 reclaims=$("${compose[@]}" logs --no-color worker 2>/dev/null | grep -c 'Reclaimed stalled task' || true)
 
 echo
 echo "== Result"
-echo "   tasks submitted:                 ${TASKS}"
+echo "   tasks submitted (incl. steps):   ${TASKS}"
+echo "   workflows COMPLETED:             ${wf_completed}/${wf_total}"
 echo "   COMPLETED:                       ${completed}"
 echo "   FAILED:                          ${failed}"
 echo "   not finished:                    ${stuck}"
@@ -112,10 +127,11 @@ echo "   distinct workers that completed: ${workers_used}"
 
 ok=true
 [ "$completed" -eq "$TASKS" ] || { echo "FAIL: expected ${TASKS} COMPLETED" >&2; ok=false; }
+[ "$wf_completed" -eq "$wf_total" ] || { echo "FAIL: only ${wf_completed}/${wf_total} workflows completed" >&2; ok=false; }
 [ "$failed" -eq 0 ] || { echo "FAIL: ${failed} tasks FAILED" >&2; ok=false; }
 [ "$stuck" -eq 0 ] || { echo "FAIL: ${stuck} tasks never finished" >&2; ok=false; }
 [ "$no_result" -eq 0 ] || { echo "FAIL: ${no_result} completed tasks have no recorded result" >&2; ok=false; }
 [ "$outbox_bad" -eq 0 ] || { echo "FAIL: ${outbox_bad} outbox events not delivered" >&2; ok=false; }
 [ "$requeued" -gt 0 ] || { echo "FAIL: Redis was flushed but the reconciler requeued nothing (the test did not exercise recovery)" >&2; ok=false; }
 $ok
-echo "== PASS: every task completed exactly once in PostgreSQL despite a killed worker and a flushed Redis"
+echo "== PASS: every task and workflow completed, each recorded once in PostgreSQL, despite a killed worker and a flushed Redis"

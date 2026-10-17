@@ -92,6 +92,8 @@ tr:last-child td { border-bottom: none; }
 .badge-completed, .badge-active { background: #d3f3df; color: #145c30; }
 .badge-failed { background: #fde0dc; color: #8c1d13; }
 .badge-cancelled { background: #e5e7eb; color: #374151; }
+.badge-blocked { background: #ede4ff; color: #4b2a8f; }
+.badge-running { background: #d6e4ff; color: #173a8a; }
 
 .pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
 
@@ -103,3 +105,27 @@ tr:last-child td { border-bottom: none; }
 .key-panel { border-color: var(--accent); display: grid; gap: 8px; }
 .key { display: block; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
+
+/* Workflows */
+tr.clickable { cursor: pointer; }
+tr.selected td { background: var(--bg); }
+button.link { background: none; border: none; padding: 0; color: var(--accent); font-weight: 600; text-align: left; }
+button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+.progress { display: grid; gap: 4px; min-width: 120px; }
+.progress .bar { height: 6px; background: var(--border); border-radius: 999px; overflow: hidden; }
+.progress .bar span { display: block; height: 100%; background: var(--ok); }
+.detail-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.detail-head h2 { margin: 0 0 4px; }
+/* Levels left to right on wide screens; stacked on phones so nothing scrolls sideways. */
+.dag { display: grid; gap: 12px; }
+@media (min-width: 720px) {
+  .dag { grid-auto-flow: column; grid-auto-columns: minmax(180px, 1fr); overflow-x: auto; }
+}
+.dag-level { display: grid; gap: 8px; align-content: start; }
+.level-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.step { border: 1px solid var(--border); border-left-width: 4px; border-radius: 8px; padding: 10px; background: var(--surface); display: grid; gap: 2px; }
+.step-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.step-completed { border-left-color: var(--ok); }
+.step-failed, .step-cancelled { border-left-color: var(--error); }
+.step-processing, .step-queued { border-left-color: var(--accent); }
+.step-blocked { border-left-color: #8b6fd6; }

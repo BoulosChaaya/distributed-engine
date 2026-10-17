@@ -267,6 +267,75 @@ during a cycle, the cycle is abandoned, because "missing" cannot be told apart
 from "unreachable". CI proves it with a chaos run: a worker SIGKILLed and Redis
 FLUSHALLed mid-run, and all 60 tasks still complete.
 
+### 9. Workflows (DAG)
+
+A workflow is a set of tasks plus dependency edges. `POST /workflows` (or
+`/tenant/workflows`) takes `{ name, steps: [{ key, name, payload, priority,
+maxRetries, dependsOn }] }`.
+
+**Validation, before anything is written.**
+`validateWorkflowDefinition` runs Kahn's algorithm and returns the steps in
+topological order. It rejects:
+- duplicate or malformed keys;
+- unknown, repeated or self dependencies;
+- more than 200 steps;
+- cycles. A DFS reports the actual cycle (`a -> b -> c -> a`), not just
+  "invalid".
+
+**Creation, one transaction.** Written together:
+- the `workflows` row;
+- one `tasks` row per step (`workflow_id`, `step_key`);
+- the `task_dependencies` edges;
+- outbox events for the root steps only.
+
+Steps with parents are created **BLOCKED**, with `pending_dependencies` set to
+their parent count. A BLOCKED step has no outbox event and no queue job, so no
+worker can run it early. Tenants are charged one job per step against their
+quota under the same row lock single tasks use.
+
+**Progress, in the parent's transaction.** Every terminal transition of a
+workflow task (`transitionStatus`, `cancelTask`, the reconciler's FAILED path)
+calls `onTaskTerminal` inside the transaction that records it:
+
+```
+parent COMPLETED   UPDATE children SET pending_dependencies = pending_dependencies - 1
+                   child reaching 0 → QUEUED + WORKFLOW_STEP_READY outbox event
+parent FAILED or   recursive CTE over the edges → every BLOCKED descendant
+CANCELLED          becomes CANCELLED ("Upstream step "x" failed")
+then               no unfinished steps left → workflow COMPLETED / FAILED / CANCELLED
+```
+
+Why it is safe:
+
+- **No lost release.** "Parent done" and "child released" commit together.
+  The release is an outbox row, so a crash right after commit loses nothing.
+  The publisher delivers it, and the reconciler covers Redis losing it.
+- **Fan-in fires once.** The decrement is a single `UPDATE … RETURNING`.
+  Concurrent parents serialise on the workflow row lock, so exactly one of
+  them sees the counter reach 0 and writes the one outbox event. Tested with
+  parallel completions.
+- **No deadlock.** Every terminal path locks the **workflow row first**, then
+  task rows (`lockWorkflowForTask`). A parent completing (task → children)
+  and a child being cancelled (child → workflow) take locks in the same
+  order. The same lock serialises the "is everything finished?" check.
+- **Partial failure is contained.** Only descendants of a failed step are
+  cancelled; independent branches run to completion. The workflow ends FAILED
+  once nothing can still change.
+- **Data along edges.** The worker passes each step `upstream`: its direct
+  parents' outputs keyed by step key (`getUpstreamOutputs`). `echo` returns it,
+  which makes the flow visible.
+- **Belt and braces.** The worker refuses any job whose task is not QUEUED or
+  PROCESSING. A stray job for a BLOCKED step is skipped (`not_runnable`) rather
+  than executed without a claim.
+
+`PUT /workflows/:id/cancel` locks the workflow and marks it CANCELLED. In the
+same transaction it cancels every unfinished step, including one a worker
+holds; that worker loses on its next write through the claim token. It then
+drops queued jobs best-effort.
+
+Not included: workflows started by cron schedules, per-step timeouts other
+than `TASK_TIMEOUT_MS`, and conditional edges.
+
 ## Component Details
 
 ### API Server (`apps/api/`)
@@ -307,11 +376,12 @@ FLUSHALLed mid-run, and all 60 tasks still complete.
 - **Cron utilities**: Wraps `cron-parser` for IANA-timezone-aware cron evaluation. `getNextOccurrence`, `getNextOccurrences`, and `getMissedOccurrences` (bounded) handle DST transitions.
 - **Task handlers**: registry, built-in types, permanent vs transient error contract, result bounding (see Data Flow §4).
 - **Task reconciler**: finds tasks Redis lost and requeues them through the outbox (see Data Flow §8).
+- **Workflow engine / repository**: DAG validation, atomic creation, in-transaction release and failure propagation, cancellation (see Data Flow §9).
 - **Outbox publisher**: Polls PG for pending events (including `SCHEDULED_TASK_RELEASED` events), publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
 - **Tenant repository**: PG-backed tenant CRUD, plan management, effective limits (plan defaults + tenant overrides via `COALESCE`), concurrency lease management (acquire/renew/release with expiry), billing period computation, and idempotency hash generation.
 - **Rate limiter**: Redis sliding-window sorted set rate limiter with fail-open semantics. On any Redis error, requests are allowed through with full remaining count.
 - **Fair scheduler**: Deficit-based weighted round-robin scheduler. Each tenant accumulates a deficit proportional to the inverse of its weight; the tenant with the lowest deficit is selected next. Guarantees bounded gap between selections for any eligible tenant, preventing starvation.
-- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index. Migrations 11–16 add multi-tenancy: plans (with seed data), tenants, tenant_overrides, tenant_usage, tenant_concurrency_leases, and tenant_id columns on tasks/schedules. Migration 17 adds partial indexes for the reconciler's candidate query.
+- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index. Migrations 11–16 add multi-tenancy: plans (with seed data), tenants, tenant_overrides, tenant_usage, tenant_concurrency_leases, and tenant_id columns on tasks/schedules. Migration 17 adds partial indexes for the reconciler's candidate query. Migration 18 adds `workflows`, `task_dependencies`, the `workflow_id`/`step_key`/`pending_dependencies` task columns and the BLOCKED status.
 - **Types**: Task, OutboxEvent, WorkerStatus, RecurringSchedule, ScheduleStatus, MisfirePolicy, OverlapPolicy, Plan, Tenant, TenantOverride, TenantUsage, TenantConcurrencyLease, EffectiveLimits interfaces
 
 ### Dashboard (`apps/web/`)

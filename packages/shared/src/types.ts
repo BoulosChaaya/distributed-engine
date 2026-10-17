@@ -1,4 +1,8 @@
-export type TaskStatus = 'SCHEDULED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+/**
+ * BLOCKED: a workflow step waiting for its dependencies. It has no outbox
+ * event and no queue job until its last dependency completes.
+ */
+export type TaskStatus = 'SCHEDULED' | 'BLOCKED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type TaskPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface Task {
@@ -24,6 +28,32 @@ export interface Task {
   claimExpiresAt?: Date;
   idempotencyKey?: string;
   idempotencyHash?: string;
+  /** Set when the task is a step of a workflow (DAG). */
+  workflowId?: string;
+  stepKey?: string;
+  pendingDependencies?: number;
+}
+
+export type WorkflowStatus = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export interface Workflow {
+  id: string;
+  tenantId?: string;
+  name: string;
+  status: WorkflowStatus;
+  idempotencyKey?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+}
+
+export interface WorkflowStepInput {
+  key: string;
+  name: string;
+  payload?: Record<string, unknown>;
+  priority?: TaskPriority;
+  maxRetries?: number;
+  dependsOn?: string[];
 }
 
 export type ScheduleStatus = 'ACTIVE' | 'PAUSED' | 'DISABLED';
@@ -155,7 +185,7 @@ export interface EffectiveLimits {
   weight: number;
 }
 
-export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED' | 'TASK_REQUEUED';
+export type OutboxEventType = 'TASK_CREATED' | 'SCHEDULED_TASK_RELEASED' | 'TASK_REQUEUED' | 'WORKFLOW_STEP_READY';
 
 export interface OutboxEvent {
   id: string;

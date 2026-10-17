@@ -168,3 +168,37 @@ tenant_task=$(curl -sf "${tk[@]}" -H 'Content-Type: application/json' -X POST \
 wait_status "$tenant_task" COMPLETED
 expect 200 "tenant reads its usage" "${tk[@]}" http://localhost:3000/tenant/usage
 
+# 5. Workflows (DAG): a diamond submitted through the dashboard must complete,
+#    and a step that fails must cancel what depends on it.
+wf_status() {
+  curl -s "${op[@]}" "http://localhost:3000/workflows/$1" \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s).data;console.log(d.workflow.status+" "+d.steps.map(x=>x.key+"="+x.status).join(","))})'
+}
+wait_workflow() {
+  local id=$1 want=$2 got=""
+  for _ in $(seq 1 90); do
+    got=$(wf_status "$id")
+    if [ "${got%% *}" = "$want" ]; then
+      echo "ok: workflow ${id} ${got}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: workflow ${id} did not reach ${want} (last: ${got})" >&2
+  exit 1
+}
+diamond_id=$(curl -sf "${dash[@]}" -X POST -H 'Sec-Fetch-Site: same-origin' -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-diamond","steps":[{"key":"a","name":"echo"},{"key":"b","name":"flaky","payload":{"failTimes":1},"dependsOn":["a"]},{"key":"c","name":"echo","dependsOn":["a"]},{"key":"d","name":"echo","dependsOn":["b","c"]}]}' \
+  http://localhost:3001/api/engine/workflows \
+  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.workflow.id))')
+wait_workflow "$diamond_id" COMPLETED
+broken_id=$(curl -sf "${op[@]}" -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-broken","steps":[{"key":"a","name":"echo"},{"key":"b","name":"no-such-type","dependsOn":["a"]},{"key":"c","name":"echo","dependsOn":["b"]}]}' \
+  http://localhost:3000/workflows \
+  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.workflow.id))')
+wait_workflow "$broken_id" FAILED
+case "$(wf_status "$broken_id")" in
+  *"c=CANCELLED"*) echo "ok: downstream of the failed step was cancelled" ;;
+  *) echo "FAIL: downstream of a failed step was not cancelled" >&2; exit 1 ;;
+esac
+

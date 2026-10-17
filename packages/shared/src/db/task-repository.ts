@@ -4,6 +4,7 @@ import { assertValidTransition } from '../state-machine.js';
 import { generateId } from '../utils.js';
 import { injectTraceContext } from '../telemetry/propagation.js';
 import { computeIdempotencyHash, IdempotencyConflictError, QuotaExceededError } from './tenant-repository.js';
+import { TERMINAL_STATUSES, lockWorkflowForTask, onTaskTerminal } from './workflow-engine.js';
 
 export interface CreateTaskInput {
   name: string;
@@ -60,6 +61,9 @@ export function rowToTask(row: Record<string, unknown>): Task {
     claimExpiresAt: row.claim_expires_at ? new Date(row.claim_expires_at as string) : undefined,
     idempotencyKey: (row.idempotency_key as string) || undefined,
     idempotencyHash: (row.idempotency_hash as string) || undefined,
+    workflowId: (row.workflow_id as string) || undefined,
+    stepKey: (row.step_key as string) || undefined,
+    pendingDependencies: row.pending_dependencies === undefined ? undefined : (row.pending_dependencies as number),
   };
 }
 
@@ -151,6 +155,9 @@ export class TaskRepository {
     try {
       await client.query('BEGIN');
 
+      // Workflow row before task row (lock order, see workflow-engine.ts).
+      const workflowId = TERMINAL_STATUSES.has(toStatus) ? await lockWorkflowForTask(client, taskId) : null;
+
       const lockResult = await client.query(
         'SELECT * FROM tasks WHERE id = $1 FOR UPDATE',
         [taskId],
@@ -236,6 +243,10 @@ export class TaskRepository {
         `UPDATE tasks SET ${setClauses.join(', ')} WHERE id = $1 RETURNING *`,
         values,
       );
+
+      if (workflowId) {
+        await onTaskTerminal(client, workflowId, taskId, toStatus);
+      }
 
       await client.query('COMMIT');
       return rowToTask(updateResult.rows[0]);
@@ -354,6 +365,7 @@ export class TaskRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      const workflowId = await lockWorkflowForTask(client, taskId);
 
       const lockResult = await client.query(
         'SELECT * FROM tasks WHERE id = $1 FOR UPDATE',
@@ -373,6 +385,7 @@ export class TaskRepository {
          WHERE id = $1 RETURNING *`,
         [taskId],
       );
+      if (workflowId) await onTaskTerminal(client, workflowId, taskId, 'CANCELLED');
 
       await client.query('COMMIT');
       return rowToTask(updateResult.rows[0]);
@@ -384,12 +397,23 @@ export class TaskRepository {
     }
   }
 
+  /** Outputs of a workflow step's direct parents, keyed by step key. */
+  async getUpstreamOutputs(taskId: string): Promise<Record<string, unknown>> {
+    const result = await this.pool.query(
+      `SELECT p.step_key, p.result -> 'output' AS output
+       FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on
+       WHERE d.task_id = $1`,
+      [taskId],
+    );
+    return Object.fromEntries(result.rows.map((r) => [r.step_key as string, r.output ?? null]));
+  }
+
   async getTaskStatusCounts(): Promise<Record<TaskStatus, number>> {
     const result = await this.pool.query(
       `SELECT status, COUNT(*)::int as count FROM tasks GROUP BY status`,
     );
     const counts: Record<string, number> = {
-      QUEUED: 0, PROCESSING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0,
+      SCHEDULED: 0, BLOCKED: 0, QUEUED: 0, PROCESSING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0,
     };
     for (const row of result.rows) {
       counts[row.status] = row.count;
@@ -529,6 +553,7 @@ export class TaskRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      const workflowId = await lockWorkflowForTask(client, taskId);
 
       const lockResult = await client.query(
         'SELECT * FROM tasks WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
@@ -549,6 +574,7 @@ export class TaskRepository {
          WHERE id = $1 RETURNING *`,
         [taskId],
       );
+      if (workflowId) await onTaskTerminal(client, workflowId, taskId, 'CANCELLED');
 
       await client.query('COMMIT');
       return rowToTask(updateResult.rows[0]);

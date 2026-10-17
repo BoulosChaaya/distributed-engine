@@ -658,6 +658,33 @@ describe('Worker orchestration', () => {
       expect(transitions[transitions.length - 1].status).toBe('QUEUED');
     });
 
+    it('never runs a BLOCKED or SCHEDULED task, even if a job for it shows up', async () => {
+      for (const status of ['BLOCKED', 'SCHEDULED']) {
+        const execute = jest.fn<any>();
+        const transitionStatus = jest.fn<any>();
+        const { processTask } = build(execute, {
+          getTask: jest.fn<any>().mockResolvedValue(makeTask({ status })),
+          transitionStatus,
+        });
+        const result = await processTask(makeMockJob(), 'task-1', makeMockSpan());
+        expect(result).toMatchObject({ status: 'SKIPPED', reason: 'not_runnable' });
+        expect(execute).not.toHaveBeenCalled();
+        expect(transitionStatus).not.toHaveBeenCalled();
+      }
+    });
+
+    it('gives a workflow step its parents\' outputs', async () => {
+      const execute = jest.fn<any>().mockResolvedValue({ ok: true });
+      const getUpstreamOutputs = jest.fn<any>().mockResolvedValue({ left: 1, right: 2 });
+      const { processTask } = build(execute, {
+        getTask: jest.fn<any>().mockResolvedValue(makeTask({ name: 'echo', workflowId: 'wf-1', stepKey: 'join', maxRetries: 3 })),
+        getUpstreamOutputs,
+      });
+      await processTask(makeMockJob(), 'task-1', makeMockSpan());
+      expect(getUpstreamOutputs).toHaveBeenCalledWith('task-1');
+      expect((execute.mock.calls[0][0] as any).upstream).toEqual({ left: 1, right: 2 });
+    });
+
     it('aborts the handler and writes nothing when the lease is lost mid-run', async () => {
       let seenSignal: AbortSignal | undefined;
       const execute = jest.fn<any>().mockImplementation((ctx: any) => {

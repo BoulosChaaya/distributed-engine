@@ -3,7 +3,7 @@
 import { engine, type MetricsView } from '@/lib/client';
 import { usePoll } from '@/lib/use-poll';
 
-const STATUSES = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED', 'SCHEDULED'] as const;
+const STATUSES = ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED', 'SCHEDULED', 'BLOCKED'] as const;
 
 export default function Overview() {
   const { data, error } = usePoll(() => engine<MetricsView>('metrics'), 5000);

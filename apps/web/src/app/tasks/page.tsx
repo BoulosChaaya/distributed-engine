@@ -14,7 +14,7 @@ const TASK_TYPES: Record<string, string> = {
   flaky: '{ "failTimes": 1 }',
   http: '{ "url": "https://example.com/", "method": "GET" }',
 };
-const CANCELLABLE = new Set(['SCHEDULED', 'QUEUED', 'PROCESSING']);
+const CANCELLABLE = new Set(['SCHEDULED', 'BLOCKED', 'QUEUED', 'PROCESSING']);
 
 export default function TasksPage() {
   const [page, setPage] = useState(1);
@@ -69,6 +69,7 @@ export default function TasksPage() {
                     <td className="mono" title={t.id}>{t.id.slice(0, 8)}</td>
                     <td>
                       {t.name}
+                      {t.stepKey && <div className="muted mono">step {t.stepKey}</div>}
                       {t.error && <div className="row-error" title={t.error}>{t.error}</div>}
                     </td>
                     <td><span className={`badge badge-${t.status.toLowerCase()}`}>{t.status}</span></td>
