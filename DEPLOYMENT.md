@@ -183,6 +183,25 @@ it returns.
 
 `terminationGracePeriodSeconds: 40` on both.
 
+## Failure detection timing
+
+A worker that dies (crash, OOM kill, node loss) is replaced after two clocks
+run out: BullMQ's job lock, checked by a stall scan, hands the job to another
+worker, and the task's lease in PostgreSQL lets that worker reclaim it. The
+handler then starts again from the beginning.
+
+| Variable (worker) | Default | Meaning |
+|---|---|---|
+| `WORKER_LOCK_DURATION_MS` | 30000 | BullMQ job lock; renewed by the live worker every half of it |
+| `WORKER_STALLED_INTERVAL_MS` | 5000 | How often each worker scans for expired locks |
+| `TASK_CLAIM_TTL_MS` | 30000 | Lease on the task row; renewed every third of it |
+
+Defaults give about 35 s from a crash to the reclaim. Recorded with 10 s /
+2 s / 10 s: 10 s. Lower values cost more renewal writes (Redis and
+PostgreSQL), and a lock shorter than the longest event-loop pause marks a
+healthy job as stalled, so keep the lock well above any synchronous work in a
+handler. Keep the lock and the claim TTL equal.
+
 ## Scaling
 
 - API: stateless; HPA 3–10 replicas on CPU/memory. Only one replica runs the
