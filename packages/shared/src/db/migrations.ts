@@ -314,3 +314,31 @@ export async function runMigrations(pool: Pool): Promise<void> {
     client.release();
   }
 }
+
+/**
+ * Waits for PostgreSQL to accept connections before startup continues.
+ * In Kubernetes and docker compose the database often comes up after the
+ * services that depend on it. Without this, the first query fails, the process
+ * exits, and the orchestrator restarts it in a crash loop until the database
+ * is ready. Retries with capped exponential backoff, then gives up and lets
+ * the orchestrator decide.
+ */
+export async function waitForPostgres(
+  pool: Pool,
+  options: { timeoutMs?: number; onRetry?: (attempt: number, error: unknown) => void } = {},
+): Promise<void> {
+  const deadline = Date.now() + (options.timeoutMs ?? 60_000);
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    try {
+      await pool.query('SELECT 1');
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      options.onRetry?.(attempt, error);
+      const delay = Math.min(250 * 2 ** (attempt - 1), 5000);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}

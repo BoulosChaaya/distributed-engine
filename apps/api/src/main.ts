@@ -16,6 +16,7 @@ import {
   SchedulerService,
   RedisRateLimiter,
   runMigrations,
+  waitForPostgres,
   InvalidTransitionError,
   initTelemetry,
   tracing,
@@ -63,19 +64,27 @@ const pgPool = new Pool({
 
 pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { errorType: err.name, reason: err.message }));
 
-const redisClient = new IORedis({
+const redisOptions = {
   host: config.redis.host,
   port: config.redis.port,
   password: config.redis.password,
   maxRetriesPerRequest: null,
-  lazyConnect: true,
-});
+};
+
+// Connects in the background and keeps reconnecting forever (ioredis default
+// retry strategy). It used to be lazyConnect + an explicit connect() at
+// startup: if Redis was not reachable at that moment, the BullMQ Queue sharing
+// this client failed its own initialisation and stayed broken
+// ("Connection is closed") even after Redis came up.
+const redisClient = new IORedis(redisOptions);
 
 redisClient.on('error', (err) => logger.error('Redis connection error', { errorType: err.name, reason: err.message }));
 redisClient.on('connect', () => logger.info('Redis connected'));
 
+// The queue gets connection options, not the shared client, so BullMQ owns
+// its connection lifecycle and recovers on its own when Redis returns.
 const taskQueue = new Queue('tasks', {
-  connection: redisClient,
+  connection: redisOptions,
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: false,
@@ -771,15 +780,11 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 async function start() {
-  try {
-    await redisClient.connect();
-    logger.info('Redis connection established');
-  } catch (error) {
-    logger.warn('Redis not available at startup, outbox will retry', {
-      reason: error instanceof Error ? error.message : String(error),
-    });
-  }
-
+  // Redis is not awaited: the API serves health and reads from PostgreSQL
+  // without it, and the outbox delivers everything once Redis is reachable.
+  await waitForPostgres(pgPool, {
+    onRetry: (attempt, error) => logger.warn('PostgreSQL not ready, retrying', { attempt, reason: String(error) }),
+  });
   await runMigrations(pgPool);
   logger.info('Database migrations complete');
 

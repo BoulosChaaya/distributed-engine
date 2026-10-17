@@ -1,0 +1,12 @@
+# Core workloads. Secrets are created out of band (see k8s/README.md);
+# redis-secret.yaml is only a template and is deliberately not listed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - istio/service-accounts.yaml
+  - postgres.yaml
+  - redis.yaml
+  - api.yaml
+  - worker.yaml
+  - web.yaml

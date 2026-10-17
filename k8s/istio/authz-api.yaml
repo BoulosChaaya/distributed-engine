@@ -13,6 +13,8 @@ spec:
     - source:
         principals:
         - "cluster.local/ns/distributed-engine/sa/engine-gateway-istio"
+        # The dashboard calls the API server-side with the operator key.
+        - "cluster.local/ns/distributed-engine/sa/web-sa"
     to:
     - operation:
         ports: ["3000"]

@@ -1,0 +1,100 @@
+# Operator dashboard. Internal only (ClusterIP): reach it with
+#   kubectl -n distributed-engine port-forward svc/web 3001:80
+# Needs two secrets:
+#   operator-secret  (api-key)            - same key the API uses
+#   dashboard-secret (username, password) - Basic auth login
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: distributed-engine
+  labels:
+    app: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      serviceAccountName: web-sa
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: next-cache
+        emptyDir: {}
+      containers:
+      - name: web
+        image: distributed-engine-web:0.1.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3001
+          name: http
+        env:
+        - name: ENGINE_API_URL
+          value: "http://api.distributed-engine.svc.cluster.local"
+        - name: OPERATOR_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: operator-secret
+              key: api-key
+        - name: DASHBOARD_USER
+          valueFrom:
+            secretKeyRef:
+              name: dashboard-secret
+              key: username
+        - name: DASHBOARD_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: dashboard-secret
+              key: password
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: next-cache
+          mountPath: /app/apps/web/.next/cache
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        # Every HTTP path requires Basic auth, so probe the socket.
+        readinessProbe:
+          tcpSocket:
+            port: 3001
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: 3001
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      terminationGracePeriodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: distributed-engine
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 3001
+    protocol: TCP
+    name: http
