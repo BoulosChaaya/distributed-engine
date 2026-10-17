@@ -5,6 +5,13 @@ Frozen after architecture assessment, corrections, adversarial review, and closu
 
 Base commit: `6f62776325d9e3c8356868001c20f493d81f1a1f`
 
+> **Historical record.** This is the contract as it was frozen for Topic 17.
+> Several items it lists as out of scope or manual have since been built:
+> automated Redis-loss reconciliation, operator authentication, the dashboard
+> deployment, and CI that deploys these manifests to Kubernetes with Istio
+> ambient. For the current system see [../DEPLOYMENT.md](../DEPLOYMENT.md) and
+> [../ARCHITECTURE.md](../ARCHITECTURE.md).
+
 ---
 
 ## 1. Scope

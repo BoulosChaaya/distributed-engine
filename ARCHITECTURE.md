@@ -5,30 +5,35 @@ Technical architecture of the distributed task execution engine.
 ## System Overview
 
 ```
-┌──────────┐     ┌──────────────────┐     ┌──────────────┐
-│  Client  │────▶│  API Server      │────▶│  PostgreSQL   │
-└──────────┘     │  (Express)       │     │  (source of   │
-                 │                  │     │   truth)      │
-                 │  - Validates     │     └──────┬───────┘
-                 │  - Creates task  │            │
-                 │    + outbox in   │     ┌──────▼───────┐
-                 │    one PG txn    │     │  Outbox      │
-                 └──────────────────┘     │  Publisher   │
-                                          │  (polls PG)  │
-                                          └──────┬───────┘
-                                                 │ BullMQ.add()
-                                          ┌──────▼───────┐
-                                          │    Redis     │
-                                          │  (BullMQ     │
-                                          │   queue)     │
-                                          └──────┬───────┘
-                                                 │
-                                          ┌──────▼───────┐
-                                          │   Workers    │
-                                          │  (BullMQ     │
-                                          │   consumers) │
-                                          └──────────────┘
+ Operator browser                         Tenant client
+       │ Basic auth                            │ Bearer te_… (tenant key)
+┌──────▼──────────────┐  Bearer operator key  │
+│ Dashboard (Next.js) │──────────────┐        │
+│ /api/engine/* proxy │              │        │
+└─────────────────────┘        ┌─────▼────────▼──────────────────────┐
+                               │ API (Express)                       │
+                               │  operator routes  /tasks /schedules │
+                               │                   /tenants /metrics │
+                               │  tenant routes    /tenant/*         │
+                               │  background: outbox publisher,      │
+                               │  scheduler, task reconciler         │
+                               └──────┬───────────────────┬──────────┘
+                 task + outbox in one │                   │ BullMQ.add(jobId = taskId)
+                 transaction          ▼                   ▼
+                        ┌──────────────────┐     ┌─────────────────┐
+                        │ PostgreSQL       │     │ Redis (BullMQ)  │
+                        │ source of truth  │     │ delivery only   │
+                        └────────▲─────────┘     └────────┬────────┘
+                                 │ claim / renew /        │ consume
+                                 │ complete (claim token) │
+                        ┌────────┴────────────────────────▼────────┐
+                        │ Workers: handler registry (echo, sleep,  │
+                        │ flaky, http), leases, retries            │
+                        └──────────────────────────────────────────┘
 ```
+
+PostgreSQL decides what is true; Redis only moves work. Anything Redis loses,
+the reconciler re-derives from PostgreSQL (§8).
 
 ## Data Flow
 
@@ -56,8 +61,8 @@ Outbox Publisher            PostgreSQL              BullMQ/Redis
       │   UPDATE SKIP LOCKED)   │                       │
       │◀── claimed events ─────│                       │
       │                         │                       │
-      │── SELECT task FOR ─────▶│                       │
-      │   UPDATE (check cancel) │                       │
+      │── SELECT task status ──▶│                       │
+      │   (check cancel)        │                       │
       │                         │                       │
       │── BullMQ.add(jobId = ──────────────────────────▶│
       │   taskId, attempts =    │                       │
@@ -88,20 +93,43 @@ Worker                  PostgreSQL              BullMQ/Redis
   │   (SELECT FOR UPDATE +   │                       │
   │    version check)        │                       │
   │                         │                       │
-  │── [do work] ───────────▶│                       │
+  │── run handler for ─────▶│  (lease renewed every │
+  │   task.name             │   TTL/3 meanwhile)    │
   │                         │                       │
   │── transition to ───────▶│  PROCESSING → COMPLETED│
   │   COMPLETED              │  version + 1          │
 ```
 
-### 4. Failure and Retry
+### 4. Task Handlers, Failure and Retry
 
-On task failure, the worker checks whether BullMQ has remaining retry attempts:
+A task's `name` is its **type**. The worker looks it up in a handler registry
+(`packages/shared/src/task-handlers.ts`) and runs the handler with
+`{ taskId, name, payload, attempt, signal }`. Built-in types: `echo`, `sleep`,
+`flaky` (fails N attempts on purpose) and `http` (allow-listed hosts only;
+disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set, redirects not followed).
+The handler's return value is stored as `result.output` (capped at 64 KB).
 
-- **Intermediate failure** (more BullMQ attempts available): Transitions task PROCESSING → QUEUED in PG, then throws to let BullMQ retry with exponential backoff.
-- **Final failure** (no more BullMQ attempts): Transitions task PROCESSING → FAILED in PG.
+Errors fall into two classes:
 
-This keeps PG and BullMQ states synchronized. The PG state always reflects the actual task lifecycle.
+- **Permanent** (`NonRetryableTaskError`: unknown task type, invalid payload,
+  HTTP 4xx). The task goes PROCESSING → FAILED on this attempt, and the worker
+  throws BullMQ's `UnrecoverableError` so BullMQ stops retrying too.
+- **Transient** (timeout, HTTP 5xx/429, network, anything else). The task goes
+  PROCESSING → QUEUED with `retries + 1` and BullMQ retries with exponential
+  backoff. When the budget is spent it goes PROCESSING → FAILED.
+
+**PostgreSQL owns the retry budget.** "Final attempt" is true if either
+BullMQ's `attemptsMade` or PostgreSQL's `retries/max_retries` says so. BullMQ's
+counter is per job, and a job re-published by the reconciler (§8) starts again
+at zero, so it cannot be the only authority. `attempt` passed to handlers is
+`retries + 1` from PostgreSQL for the same reason. On COMPLETED the `error`
+column is cleared; earlier failures stay visible through `retries`.
+
+**Cancellation of running work.** Every handler receives an `AbortSignal`. It
+fires when lease renewal fails (another worker may own the task now), and when
+`TASK_TIMEOUT_MS` (default 5 min) is exceeded. A handler that stops because the
+lease was lost makes the worker return `SKIPPED/ownership_lost` without
+writing. Any write would be rejected by the claim token anyway.
 
 ### 5. Stalled Job Recovery
 
@@ -128,7 +156,7 @@ PROCESSING status alone is **not** sufficient evidence that a job stalled. A tas
 
 **Failure handler safety**: The worker's failure handler uses the stored `taskVersion` and `claimToken` from the initial claim — it does **not** re-read the latest task state. If ownership has transferred (version or claim token changed), the transition is rejected harmlessly. This prevents the scenario where a stale worker re-reads the latest version and mutates a task now owned by another execution.
 
-BullMQ's `maxStalledCount` (default 2) limits how many times a single job can be reclaimed. After that limit, BullMQ marks the job as failed and the worker transitions the task to FAILED.
+BullMQ's `maxStalledCount` (2 in this worker) limits how many times a single job can be redelivered after stalling. After that, BullMQ moves the job to `failed` **without running the processor**, so the worker's failure handler never runs and the task is left in PROCESSING. The reconciler (§8) recovers that case. It finds the expired lease and the dead job, charges one retry, and requeues the task, or marks it FAILED if the budget is spent. That bounds poison tasks that crash every worker.
 
 ### 6. One-Time Scheduled Tasks
 
@@ -204,17 +232,55 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 
 **Pause/resume/disable**: PAUSED schedules retain their `next_run_at` but the scheduler skips them. DISABLED schedules also stop generating occurrences. Neither status retroactively erases already-created occurrences.
 
+### 8. Redis Loss and Orphan Reconciliation
+
+The outbox guarantees a task reaches Redis at least once. It cannot guarantee
+the job stays there: Redis restarts without persistence, FLUSHALL, eviction,
+or failover to a replica that missed the write all drop jobs silently. Before
+the reconciler existed, a measured run lost 24 of 30 in-flight tasks for good
+when the queue was wiped.
+
+`TaskReconciler` (`packages/shared/src/db/task-reconciler.ts`) runs in the API
+every `RECONCILER_INTERVAL_MS` (30s):
+
+```
+Reconciler            PostgreSQL                 BullMQ/Redis
+    │── pg_try_advisory_lock ─▶│  one API replica only
+    │── candidates ───────────▶│  QUEUED idle > grace (60s), or
+    │                          │  PROCESSING with an expired lease,
+    │                          │  and no PENDING outbox event
+    │── getJob(taskId) ──────────────────────────────────▶│
+    │   waiting/delayed/active → leave it (BullMQ owns it)
+    │   missing/completed/failed → orphan (finished job removed,
+    │                                because add() with that jobId would no-op)
+    │── per orphan, own txn: lock row, version unchanged? ─▶│
+    │   QUEUED     → TASK_REQUEUED outbox event
+    │   PROCESSING → retries+1, claim cleared, QUEUED + event
+    │                (or FAILED when the budget is spent)
+```
+
+Delivery still goes through the normal outbox publisher (circuit breaker,
+fairness, tracing). It cannot double-queue: live jobs are never touched, the
+version check skips anything that moved, `NOT EXISTS` stops two cycles stacking
+events, and `jobId = taskId` makes a redundant publish a no-op. If Redis errors
+during a cycle, the cycle is abandoned, because "missing" cannot be told apart
+from "unreachable". CI proves it with a chaos run: a worker SIGKILLed and Redis
+FLUSHALLed mid-run, and all 60 tasks still complete.
+
 ## Component Details
 
 ### API Server (`apps/api/`)
 
 - Express HTTP server with Zod input validation
+- **Operator authentication**: `/tasks`, `/schedules`, `/workers`, `/metrics`, `/tenants`, `/plans` require `Authorization: Bearer $OPERATOR_API_KEY` (SHA-256 + `timingSafeEqual`). With no key configured these routes answer 503 (fail closed). A key under 32 characters stops startup. Health probes are open.
+- **Tenant provisioning** (operator): create tenants with a generated `te_` key (shown once, only the hash stored), list, inspect limits/usage, suspend/activate, rotate keys (old key revoked immediately)
 - Creates tasks atomically with outbox events in a single PG transaction
 - Supports one-time scheduled tasks via `scheduledFor` parameter on `POST /tasks`
 - CRUD for recurring schedules: `POST/GET/PUT /schedules`, `PUT /schedules/:id/status`
 - **Tenant-scoped endpoints** (`/tenant/*`): 7 routes behind Bearer token authentication middleware. Tenant identity is derived from the API key hash — never from a client-supplied tenant_id in the request body. Includes task submission with atomic quota + idempotency enforcement, task listing/retrieval/cancellation, schedule creation/listing/retrieval, and usage reporting.
 - **Rate limiting middleware**: Per-tenant sliding-window rate limiting with `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` response headers. Fail-open on Redis errors.
-- Runs the outbox publisher and scheduler service as background processes
+- Runs the outbox publisher, scheduler service and task reconciler as background processes
+- Startup waits for PostgreSQL with capped backoff (no crash-loop when the database starts later). Redis is not awaited: the client reconnects forever, and the BullMQ queue owns its own connection, so publishing resumes by itself when Redis returns
 - Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state
 - `/metrics` returns JSON with task status counts, queue depth, and outbox stats
 - Graceful shutdown: stops accepting connections, stops scheduler, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
@@ -222,6 +288,7 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 ### Worker (`apps/worker/`)
 
 - BullMQ Worker consuming from the "tasks" queue
+- Runs the handler registered for the task's type with a per-task timeout (`TASK_TIMEOUT_MS`) and an abort signal tied to lease ownership; see Data Flow §4
 - Publishes heartbeat to Redis every 10 seconds (`worker:{id}` key with 30s TTL)
 - Validates task state in PG before processing (skips cancelled/completed/failed/missing tasks)
 - Reclaims stalled PROCESSING tasks when BullMQ redelivers them after a worker crash, but only after the previous execution claim has expired (`claim_expires_at < NOW()`). Reclaim generates a new `claim_token` and sets a new expiry.
@@ -238,18 +305,22 @@ A recurring schedule is a separate durable object in `recurring_schedules` that 
 - **Schedule repository**: PG-backed CRUD for recurring schedules with optimistic concurrency (version column). Handles one-time scheduled task creation, batch release of due scheduled tasks, occurrence generation (atomic task + outbox + next_run_at advance), execution lease management for overlap prevention, and `FOR UPDATE SKIP LOCKED` multi-scheduler concurrency.
 - **Scheduler service**: Polls PG on a configurable interval. Each poll cycle: (1) releases due one-time scheduled tasks in batch, (2) fetches due recurring schedules and processes each with a `FOR UPDATE SKIP LOCKED` row lock, applying the schedule's misfire policy to generate occurrences. Supports graceful shutdown by draining in-progress polls.
 - **Cron utilities**: Wraps `cron-parser` for IANA-timezone-aware cron evaluation. `getNextOccurrence`, `getNextOccurrences`, and `getMissedOccurrences` (bounded) handle DST transitions.
+- **Task handlers**: registry, built-in types, permanent vs transient error contract, result bounding (see Data Flow §4).
+- **Task reconciler**: finds tasks Redis lost and requeues them through the outbox (see Data Flow §8).
 - **Outbox publisher**: Polls PG for pending events (including `SCHEDULED_TASK_RELEASED` events), publishes to BullMQ with circuit breaker protection. Best-effort cancellation check (plain SELECT, not atomic with BullMQ publish — see Data Flow §2). Stops cleanly by draining in-progress polls.
 - **Tenant repository**: PG-backed tenant CRUD, plan management, effective limits (plan defaults + tenant overrides via `COALESCE`), concurrency lease management (acquire/renew/release with expiry), billing period computation, and idempotency hash generation.
 - **Rate limiter**: Redis sliding-window sorted set rate limiter with fail-open semantics. On any Redis error, requests are allowed through with full remaining count.
 - **Fair scheduler**: Deficit-based weighted round-robin scheduler. Each tenant accumulates a deficit proportional to the inverse of its weight; the tenant with the lowest deficit is selected next. Guarantees bounded gap between selections for any eligible tenant, preventing starvation.
-- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index. Migrations 11–16 add multi-tenancy: plans (with seed data), tenants, tenant_overrides, tenant_usage, tenant_concurrency_leases, and tenant_id columns on tasks/schedules.
+- **Migrations**: Schema versioning with advisory lock for concurrent startup safety. Migrations 8–10 add SCHEDULED status, `scheduled_for`/`schedule_id` columns, the `recurring_schedules` table, and the occurrence uniqueness index. Migrations 11–16 add multi-tenancy: plans (with seed data), tenants, tenant_overrides, tenant_usage, tenant_concurrency_leases, and tenant_id columns on tasks/schedules. Migration 17 adds partial indexes for the reconciler's candidate query.
 - **Types**: Task, OutboxEvent, WorkerStatus, RecurringSchedule, ScheduleStatus, MisfirePolicy, OverlapPolicy, Plan, Tenant, TenantOverride, TenantUsage, TenantConcurrencyLease, EffectiveLimits interfaces
 
 ### Dashboard (`apps/web/`)
 
-- Next.js app for viewing system state
-- Fetches global task counts from `/metrics` endpoint (not from a single page of `/tasks`)
-- Workers page shows live data from `/workers` endpoint (Redis heartbeats)
+- Next.js 16 / React 19 operator dashboard: overview (task counts, queue, outbox), tasks (submit by type with payload, page, cancel, see retries and last error), workers (heartbeats), tenants (create, suspend, rotate keys)
+- **The browser never talks to the engine API.** Pages call `/api/engine/*` on the dashboard's own origin. That route handler re-checks Basic auth, allows only a fixed list of method+path pairs, refuses cross-site writes (Fetch Metadata / Origin check), and forwards with `OPERATOR_API_KEY` from server-side env
+- Every page and route requires HTTP Basic auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`) through `proxy.ts`; with no credentials configured it answers 503
+- Strict CSP (`connect-src 'self'`), `frame-ancestors 'none'`, no-referrer; mobile-first layout
+- Shipped as a standalone Next build (`Dockerfile.web`), non-root
 
 ## Concurrency and Safety
 
@@ -274,7 +345,7 @@ The system guarantees at-least-once delivery, not exactly-once. Duplicate proces
 - Worker completes work but crashes before writing COMPLETED to PG
 - BullMQ retries a job that was already processed
 
-Task handlers should be idempotent to handle these cases safely.
+Task handlers should be idempotent to handle these cases safely. What *is* exactly-once is the recorded outcome: COMPLETED is terminal in the state machine, and every transition out of PROCESSING needs the current claim token. A duplicate execution can never record a second result.
 
 ## Multi-Tenancy
 
@@ -316,6 +387,13 @@ Client                    API                          PostgreSQL
 ```
 
 Tenant identity is **never** supplied in the request body. The API key header is the sole source of tenant identity, preventing cross-tenant impersonation.
+
+**Provisioning.** Operators create tenants with `POST /tenants { name, planId }`
+(operator key). The API generates the key (`te_` + 32 random bytes, base64url),
+stores only its SHA-256, and returns the plaintext once. `POST
+/tenants/:id/api-key` rotates it, and the old key stops working in the same
+UPDATE. `PUT /tenants/:id/status` suspends or reactivates. The operator key is
+not a tenant key: `/tenant/*` rejects it.
 
 ### Task Acceptance (Atomic Transaction)
 
@@ -402,8 +480,8 @@ The engine optionally runs under Istio Ambient mode, which provides transport se
                                        ▼
                               ┌──────────────────────────┐
                               │ API (api-sa)             │
-                              │ AuthzPolicy: gateway     │
-                              │ only on :3000            │
+                              │ AuthzPolicy: gateway,    │
+                              │ web-sa on :3000          │
                               └────┬──────────┬──────────┘
                                    │          │
                     ┌──────────────▼──┐  ┌────▼──────────────┐
@@ -438,6 +516,7 @@ Each workload's SPIFFE identity is derived from its Kubernetes ServiceAccount:
 | PostgreSQL | postgres-sa            | `cluster.local/ns/distributed-engine/sa/postgres-sa` |
 | Redis      | redis-sa               | `cluster.local/ns/distributed-engine/sa/redis-sa` |
 | Gateway    | engine-gateway-istio   | `cluster.local/ns/distributed-engine/sa/engine-gateway-istio` |
+| Dashboard  | web-sa                 | `cluster.local/ns/distributed-engine/sa/web-sa` |
 
 Istio CA issues X.509 SVIDs to ztunnel for each identity. The certificates are never exposed to the application containers.
 
@@ -449,13 +528,13 @@ AuthorizationPolicies use `selector.matchLabels` to target pods (not `targetRef`
 |--------|--------|-----------------|------|
 | authz-postgres | `app: postgres` | api-sa, worker-sa | 5432 |
 | authz-redis | `app: redis` | api-sa, worker-sa | 6379 |
-| authz-api | `app: api` | engine-gateway-istio | 3000 |
+| authz-api | `app: api` | engine-gateway-istio, web-sa | 3000 |
 
 Workers have no inbound AuthorizationPolicy — they consume from Redis (outbound), not receive inbound connections.
 
 ### Gateway Ingress
 
-The Kubernetes Gateway API (`gatewayClassName: istio`) creates a mesh-aware ingress point. Istio's controller generates a Deployment, Service, and ServiceAccount for the Gateway, named `<gateway-name>-<gateway-class-name>` (i.e., `engine-gateway-istio`). An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`.
+The Kubernetes Gateway API (`gatewayClassName: istio`) creates a mesh-aware ingress point. Istio's controller generates a Deployment, Service, and ServiceAccount for the Gateway, named `<gateway-name>-<gateway-class-name>` (i.e., `engine-gateway-istio`). An HTTPRoute forwards HTTP traffic from the Gateway to the `api` Service on port 80 (a Gateway API backendRef names the Service port; the Service maps 80 → container port 3000).
 
 The `engine-gateway-istio` ServiceAccount is pre-created in `service-accounts.yaml`. Whether Istio adopts a pre-existing SA or always creates its own is not explicitly guaranteed by Istio's documentation — the supported mechanism for controlling Gateway infrastructure is `spec.infrastructure.parametersRef`. The runtime verification script (`verify-runtime.sh gateway-identity`) confirms at runtime that the actual Gateway pod uses the expected ServiceAccount before any authorization policy references it. Static YAML alone does not guarantee the runtime identity.
 
@@ -468,6 +547,17 @@ PostgreSQL and Redis use headless services (`clusterIP: None`), where DNS resolv
 ### Kubelet Probe Exemption
 
 ztunnel rewrites kubelet probe packets to use source address 169.254.7.127, which is exempted from AuthorizationPolicy evaluation. Liveness and readiness probes continue to work on API pods even with an ALLOW policy restricting port 3000.
+
+### Verified in CI
+
+`.github/workflows/full-stack.yml` (kind-istio job) deploys these manifests to
+a kind cluster with Istio 1.30 in ambient mode and runs
+`k8s/istio/verify-runtime.sh`. It checks enrollment, ztunnel mTLS
+certificates, the Gateway identity against the policy principal, allowed paths,
+denied paths (an unauthorized identity cannot reach PostgreSQL, Redis or the
+API), and a task completed through the Gateway. kind has no cloud load
+balancer, so CI reaches the Gateway Service through `kubectl port-forward`
+(overlay `ci/kind`).
 
 ### Delivery Semantics
 
@@ -488,7 +578,7 @@ Istio Ambient mode does not change the engine's delivery semantics. The system p
 - **PostgreSQL**: Single instance (StatefulSet). For higher throughput, consider read replicas or connection pooling (PgBouncer).
 - **Redis**: Single instance (StatefulSet) with AOF persistence. BullMQ supports Redis Cluster for higher throughput, but this is not configured.
 
-HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling would require a custom metrics adapter (Prometheus + KEDA or similar), which is not included.
+HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling would require a Prometheus-format metrics endpoint plus a metrics adapter (KEDA or similar). `/metrics` is JSON today, so this is not included.
 
 ## Distributed Tracing (OpenTelemetry)
 

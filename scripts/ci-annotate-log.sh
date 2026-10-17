@@ -25,7 +25,7 @@ emit() {
 }
 
 sed -e 's/\x1b\[[0-9;]*m//g' "$file" > "$tmp/clean"
-grep -E '^(==|===)|PASS|FAIL|SKIP|^ok:|RESULT|Error|error:' "$tmp/clean" | head -180 > "$tmp/summary" || true
+grep -E '(^|\s)(==|===) |PASS|FAIL|SKIP|^ok:|RESULT|Error|error:|^  ' "$tmp/clean" | head -180 > "$tmp/summary" || true
 tail -n "$lines" "$tmp/clean" > "$tmp/tail"
 emit summary "$tmp/summary"
 emit tail "$tmp/tail"

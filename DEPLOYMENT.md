@@ -1,280 +1,237 @@
 # Deployment & Operations
 
-Guide for deploying and operating the distributed task execution engine.
+How to run the engine locally, with docker compose, and on Kubernetes (with or
+without Istio ambient), and how to operate it.
 
-## Prerequisites
+Two of these paths are exercised on every pull request: the compose stack
+(`full-stack.yml` → `compose-chaos`) and the Kubernetes + Istio manifests
+(`full-stack.yml` → `kind-istio`). The commands below are the same ones CI runs.
 
-- Kubernetes cluster (1.24+)
-- Docker registry access
-- `kubectl` configured
-- PostgreSQL password stored in a Kubernetes Secret named `postgres-secret`
+## Credentials
 
-## Local Development
+| Secret | Used by | How to create |
+|---|---|---|
+| `OPERATOR_API_KEY` | API (operator routes), dashboard | `openssl rand -hex 32` (32+ characters) |
+| `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | dashboard Basic auth | any user; a long random password |
+| PostgreSQL password | API, worker, PostgreSQL | `openssl rand -hex 16` |
+| Redis password | API, worker, Redis (k8s) | `openssl rand -hex 16` |
+| Tenant keys (`te_…`) | tenants | issued by `POST /tenants`, shown once |
+
+Without `OPERATOR_API_KEY`, operator routes answer 503. Without dashboard
+credentials, the dashboard answers 503. Nothing falls back to open access.
+Never commit real values: `.env` is git-ignored, and `k8s/redis-secret.yaml`
+is a template only.
+
+## Local Development (processes)
 
 ```bash
 pnpm install
+docker compose up -d postgres redis
 
-# Start infrastructure
-docker-compose up -d postgres redis
+export OPERATOR_API_KEY="$(openssl rand -hex 32)"
+pnpm -F @distributed-engine/api run dev        # :3000
+pnpm -F @distributed-engine/worker run dev     # health :9000
 
-# Run API + worker
-pnpm -F @distributed-engine/api run dev
-pnpm -F @distributed-engine/worker run dev
-
-# Verify
 curl http://localhost:3000/health
-curl http://localhost:3000/ready
+curl -H "Authorization: Bearer $OPERATOR_API_KEY" http://localhost:3000/metrics
 ```
 
-## Docker Build
+## Docker Compose (whole stack)
 
 ```bash
-# Build images
-docker build -f Dockerfile.api -t distributed-engine-api:0.1.0 .
+cp .env.example .env            # fill OPERATOR_API_KEY, DASHBOARD_USER, DASHBOARD_PASSWORD
+docker compose up -d --build --scale worker=3 postgres redis api worker web
+open http://localhost:3001      # dashboard (Basic auth)
+```
+
+Optional profiles: `--profile tracing` (OTel collector + Jaeger on :16686),
+`--profile logging` (Alloy + Loki + Grafana), `--profile observability` (both).
+
+Chaos run (kills a worker and flushes Redis mid-run, then checks every task
+completed): `bash scripts/chaos-compose.sh`.
+
+## Images
+
+CI builds all three images on every PR and runs them in
+`scripts/smoke-production-images.sh`. On every push to `main` it publishes
+them to GHCR:
+
+```
+ghcr.io/<owner>/distributed-engine-api:<git sha>
+ghcr.io/<owner>/distributed-engine-worker:<git sha>
+ghcr.io/<owner>/distributed-engine-web:<git sha>
+```
+
+To build them yourself:
+
+```bash
+docker build -f Dockerfile.api    -t distributed-engine-api:0.1.0 .
 docker build -f Dockerfile.worker -t distributed-engine-worker:0.1.0 .
-
-# Tag for your registry
-docker tag distributed-engine-api:0.1.0 <registry>/distributed-engine-api:0.1.0
-docker tag distributed-engine-worker:0.1.0 <registry>/distributed-engine-worker:0.1.0
-
-# Push
-docker push <registry>/distributed-engine-api:0.1.0
-docker push <registry>/distributed-engine-worker:0.1.0
+docker build -f Dockerfile.web    -t distributed-engine-web:0.1.0 .
 ```
 
-## Kubernetes Deployment
+All three run as a non-root user (uid 1001) under `dumb-init`.
 
-### 1. Create the namespace and secrets
+## Kubernetes
+
+Manifests are plain YAML with kustomizations:
+
+- `k8s/`: namespace, ServiceAccounts, PostgreSQL, Redis, API, worker, web
+- `k8s/istio/`: Gateway, HTTPRoute, L4 AuthorizationPolicies (needs Istio ambient)
+- `ci/kind/`: the overlay CI uses on a single kind node (fewer replicas, `:ci` tags, ClusterIP)
+
+### 1. Namespace and secrets
 
 ```bash
-# Apply the declarative namespace (includes Istio ambient label if Istio is installed)
 kubectl apply -f k8s/namespace.yaml
-
-kubectl create secret generic postgres-secret \
-  --namespace distributed-engine \
-  --from-literal=password=<your-password>
+NS=distributed-engine
+kubectl -n $NS create secret generic postgres-secret --from-literal=password="$(openssl rand -hex 16)"
+kubectl -n $NS create secret generic redis-secret    --from-literal=password="$(openssl rand -hex 16)"
+kubectl -n $NS create secret generic operator-secret --from-literal=api-key="$(openssl rand -hex 32)"
+kubectl -n $NS create secret generic dashboard-secret \
+  --from-literal=username=ops --from-literal=password="$(openssl rand -hex 16)"
 ```
 
-### 2. Deploy infrastructure
+### 2. Point at your images
 
 ```bash
-kubectl apply -f k8s/postgres.yaml
-kubectl apply -f k8s/redis.yaml
-
-# Wait for readiness
-kubectl -n distributed-engine wait --for=condition=ready pod -l app=postgres --timeout=120s
-kubectl -n distributed-engine wait --for=condition=ready pod -l app=redis --timeout=120s
+cd k8s
+kustomize edit set image \
+  distributed-engine-api=ghcr.io/<owner>/distributed-engine-api:<sha> \
+  distributed-engine-worker=ghcr.io/<owner>/distributed-engine-worker:<sha> \
+  distributed-engine-web=ghcr.io/<owner>/distributed-engine-web:<sha>
+cd ..
 ```
 
-### 3. Update image references
+(Or write your own overlay next to `ci/kind/`. A kustomize overlay cannot live
+inside the `k8s/` base directory.)
 
-Edit `k8s/api.yaml` and `k8s/worker.yaml` to point to your registry images.
-
-### 4. Deploy application
+### 3. Deploy
 
 ```bash
-kubectl apply -f k8s/api.yaml
-kubectl apply -f k8s/worker.yaml
-
-# Verify
-kubectl -n distributed-engine get pods
-kubectl -n distributed-engine logs -l app=api --tail=20
+kubectl apply -k k8s
+for w in statefulset/postgres statefulset/redis deployment/api deployment/worker deployment/web; do
+  kubectl -n $NS rollout status $w --timeout=300s
+done
 ```
 
-### 5. Verify deployment
+API and worker wait up to 60s for PostgreSQL at startup, so apply order does
+not matter and they do not crash-loop while the database starts. They also
+reconnect to Redis on their own.
+
+### 4. Verify
 
 ```bash
-# Port-forward to test
-kubectl -n distributed-engine port-forward svc/api 3000:80
-
-# Health check
+KEY=$(kubectl -n $NS get secret operator-secret -o jsonpath='{.data.api-key}' | base64 -d)
+kubectl -n $NS port-forward svc/api 3000:80 &
 curl http://localhost:3000/health
-curl http://localhost:3000/ready
+curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"echo","payload":{"hello":"k8s"}}' http://localhost:3000/tasks
 
-# Submit a test task
-curl -X POST http://localhost:3000/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"name":"deploy-test","priority":"NORMAL"}'
+kubectl -n $NS port-forward svc/web 3001:80 &   # dashboard
 ```
+
+### 5. Istio ambient (optional)
+
+Requires Istio installed with `--set profile=ambient` and the Gateway API CRDs.
+The namespace already carries `istio.io/dataplane-mode: ambient`.
+
+```bash
+kubectl apply -k k8s/istio
+kubectl -n $NS wait gateway/engine-gateway --for=condition=Programmed --timeout=180s
+GW_ADDR=<gateway address> OPERATOR_API_KEY=$KEY ./k8s/istio/verify-runtime.sh all
+```
+
+The verifier exits 0 only when every critical check ran and passed: enrollment,
+mTLS certificates, Gateway identity, allowed and denied paths, and a task
+through the Gateway. `k8s/istio/README.md` has the staged rollout with
+rollback steps. `scripts/k8s-kind-e2e.sh` runs the whole sequence on a
+throwaway kind cluster, exactly as CI does.
 
 ## Health Probes
 
-| Endpoint | What it checks | When it returns 503 |
-|----------|---------------|---------------------|
-| `/ready` | PostgreSQL connectivity | PG unreachable |
-| `/live` | Nothing (always 200) | Never |
-| `/health` | PG + Redis + outbox circuit breaker state | PG unreachable |
+| Endpoint | Auth | What it checks | 503 when |
+|----------|------|----------------|----------|
+| `/ready` | none | PostgreSQL | PG unreachable |
+| `/live` | none | nothing | never |
+| `/health` | none | PG, Redis, outbox circuit breaker | PG unreachable (`degraded` with 200 if only Redis/breaker) |
+| worker `:9000/healthz` | none | process alive | — |
+| dashboard `:3001/` | Basic | auth proxy up | expects 401 unauthenticated; 503 means credentials not configured |
 
-`/ready` only requires PostgreSQL because task submission (the core API function) writes to PG only. Redis unavailability degrades the outbox publisher but does not prevent task creation. `/health` returns 200 with `status: "degraded"` when Redis is down or the circuit breaker is not CLOSED, and 503 only when PostgreSQL is unreachable.
+`/ready` needs only PostgreSQL because accepting a task only writes to
+PostgreSQL. With Redis down, tasks wait in the outbox and are delivered when
+it returns.
 
 ## Graceful Shutdown
 
-### API Server
+### API
 
-1. K8s sends SIGTERM
-2. `preStop` hook sleeps 5 seconds (lets load balancer stop routing)
-3. Server stops accepting new connections
-4. Outbox publisher stops (waits for any in-progress poll to complete)
-5. In-flight requests drain (up to GRACEFUL_SHUTDOWN_TIMEOUT_MS)
-6. Connections close (BullMQ queue, Redis, PG pool)
-7. Process exits with code 0 (clean drain) or code 1 (timeout with active requests still pending)
-
-`terminationGracePeriodSeconds: 40` = 5s preStop + 30s drain + 5s buffer.
+1. SIGTERM; `preStop` sleeps 5s so the Service stops routing.
+2. Server stops accepting connections.
+3. Scheduler and task reconciler stop (each waits for an in-progress cycle).
+4. Outbox publisher stops (waits for an in-progress poll).
+5. In-flight requests drain (up to `GRACEFUL_SHUTDOWN_TIMEOUT_MS`).
+6. Queue, Redis and PG connections close. Exit 0, or 1 if the drain timed out.
 
 ### Worker
 
-1. K8s sends SIGTERM
-2. `preStop` hook sleeps 5 seconds
-3. Worker stops consuming new jobs
-4. In-flight jobs complete (up to 30s timeout)
-5. Worker heartbeat key removed from Redis
-6. Connections close
-7. Process exits
+1. SIGTERM: the worker stops taking new jobs.
+2. In-flight jobs finish (up to 30s). A job cut off by the timeout keeps its
+   lease until it expires, then is reclaimed by another worker or the
+   reconciler.
+3. Heartbeat key removed; connections close.
 
-`terminationGracePeriodSeconds: 40` = 5s preStop + 30s worker shutdown + 5s buffer.
+`terminationGracePeriodSeconds: 40` on both.
 
 ## Scaling
 
-### Manual Scaling
-
-```bash
-kubectl -n distributed-engine scale deployment/worker --replicas=10
-kubectl -n distributed-engine scale deployment/api --replicas=5
-```
-
-### HPA (Automatic)
-
-Both API and worker deployments have HPA configured:
-
-- **API**: 3-10 replicas, scales on CPU (70%) and memory (80%)
-- **Workers**: 5-20 replicas, scales on CPU (75%) and memory (80%)
-
-HPA uses CPU and memory utilization. Queue-depth-based scaling is not configured — it would require a custom metrics adapter (e.g., Prometheus Adapter or KEDA with a Redis scaler).
+- API: stateless; HPA 3–10 replicas on CPU/memory. Only one replica runs the
+  reconciler at a time (advisory lock). Scheduler instances share work via
+  `FOR UPDATE SKIP LOCKED`.
+- Workers: stateless; HPA 5–20 replicas; `QUEUE_CONCURRENCY` jobs each.
+- Queue-depth autoscaling is not configured. It needs Prometheus-format
+  metrics and an adapter such as KEDA, and `/metrics` is JSON today.
 
 ## Operations
 
-### Viewing Metrics
-
 ```bash
-curl http://localhost:3000/metrics | jq
+H="Authorization: Bearer $OPERATOR_API_KEY"
+curl -H "$H" http://localhost:3000/metrics | jq     # task counts, queue depth, outbox
+curl -H "$H" http://localhost:3000/workers | jq     # live workers (heartbeats, 30s TTL)
+curl -H "$H" http://localhost:3000/tenants | jq     # tenants
+curl -H "$H" -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"Acme","planId":"plan_starter"}' http://localhost:3000/tenants   # returns the key once
 ```
 
-Returns JSON with:
-- `tasks.total`, `tasks.byStatus` — task counts from PostgreSQL
-- `queue.total`, `queue.active`, `queue.waiting` — BullMQ queue depth
-- `outbox.pending`, `outbox.failed` — outbox event counts
-- `requests.total`, `requests.errors`, `requests.errorRate`
+Rolling update: `kubectl -n $NS set image deployment/api api=<image>` (and the
+same for `worker` and `web`), then `kubectl -n $NS rollout status
+deployment/api`. Deployments use `maxSurge: 1, maxUnavailable: 0`. Roll back
+with `kubectl -n $NS rollout undo deployment/<name>`.
 
-Note: The `/metrics` endpoint returns JSON, not Prometheus exposition format. To scrape with Prometheus, you would need to add a Prometheus client library (e.g., `prom-client`) and expose a `/metrics/prometheus` endpoint.
-
-### Checking Worker Status
-
-```bash
-curl http://localhost:3000/workers | jq
-```
-
-Shows live workers (from Redis heartbeats with 30s TTL). A worker that hasn't sent a heartbeat in 30 seconds is not listed.
-
-### Viewing Logs
-
-```bash
-kubectl -n distributed-engine logs -l app=api --tail=50 -f
-kubectl -n distributed-engine logs -l app=worker --tail=50 -f
-```
-
-Logs are structured JSON with ISO timestamps, level, message, and context fields.
-
-### Rolling Update
-
-```bash
-# Build and push new image
-docker build -f Dockerfile.api -t <registry>/distributed-engine-api:0.2.0 .
-docker push <registry>/distributed-engine-api:0.2.0
-
-# Update deployment
-kubectl -n distributed-engine set image deployment/api api=<registry>/distributed-engine-api:0.2.0
-
-# Watch rollout
-kubectl -n distributed-engine rollout status deployment/api
-```
-
-Rolling updates are configured with `maxSurge: 1, maxUnavailable: 0` for zero-downtime deploys.
-
-### Rollback
-
-```bash
-kubectl -n distributed-engine rollout undo deployment/api
-kubectl -n distributed-engine rollout undo deployment/worker
-```
+Logs are structured JSON (Pino). See ARCHITECTURE.md for the schema and the
+Loki/Grafana setup.
 
 ## Troubleshooting
 
 | Symptom | Check | Action |
 |---------|-------|--------|
-| `/ready` returns 503 | PG connectivity | Check PG pod logs, verify PG Secret |
-| `/health` shows degraded | Redis or circuit breaker | Check Redis pod, check outbox circuit state |
-| Tasks stuck in QUEUED | Worker pods, Redis connectivity | Verify workers are running, check Redis |
-| Outbox events piling up | Outbox circuit breaker | Check `/health` for circuit state, check Redis |
-| Workers not listed | Redis heartbeat | Check worker logs for heartbeat errors |
-| Stale version errors | Concurrent processing | Normal under contention, only one wins |
-
-## Istio Ambient Mesh (Optional)
-
-The engine supports Istio Ambient mode for mTLS, workload identity, and L4 authorization without sidecars. This is an optional overlay — the engine operates identically without Istio.
-
-### What Istio Ambient Adds
-
-- Transparent mTLS between all pods (ztunnel, no sidecars)
-- SPIFFE workload identities derived from ServiceAccounts
-- L4 AuthorizationPolicies restricting which identities can reach data stores and the API
-- Kubernetes Gateway API for mesh-aware ingress
-
-### Deployment
-
-The Istio rollout is staged. See `k8s/istio/README.md` for the complete 6-stage rollout guide with per-stage verification, rollback, and GO/NO-GO criteria.
-
-Quick summary:
-```bash
-# Stage 1: Namespace + ServiceAccounts
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/istio/service-accounts.yaml
-
-# Stage 2: Bind SAs to workloads
-kubectl apply -f k8s/postgres.yaml -f k8s/redis.yaml -f k8s/api.yaml -f k8s/worker.yaml
-
-# Stage 3: Gateway
-kubectl apply -f k8s/istio/gateway.yaml
-
-# Stage 4: Data store authorization
-kubectl apply -f k8s/istio/authz-postgres.yaml -f k8s/istio/authz-redis.yaml
-
-# Stage 5: API authorization
-kubectl apply -f k8s/istio/authz-api.yaml
-
-# Verify
-./k8s/istio/verify-runtime.sh all
-```
-
-### API Service Transition
-
-During rollout, the API retains its `type: LoadBalancer` service so external access is not disrupted. After verifying the Gateway path (Stage 3), external traffic can be transitioned to the Gateway and the API service changed to `ClusterIP`. See Stage 6 in `k8s/istio/README.md`.
-
-### Runtime Verification
-
-`k8s/istio/verify-runtime.sh` runs automated checks for mesh enrollment, Gateway identity, positive authorization (authorized workloads reach destinations), negative authorization (unauthorized identities are denied), and end-to-end task lifecycle. The script exits with code 1 if any check fails.
+| `/tasks` returns 503 | `OPERATOR_API_KEY` set on the API? | Create `operator-secret` / set the env var |
+| `/tasks` returns 401 | Bearer key matches? | Use the operator key; tenant keys only work on `/tenant/*` |
+| Dashboard returns 503 | `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | Create `dashboard-secret` |
+| Dashboard "not connected to the engine" | `ENGINE_API_URL`, `OPERATOR_API_KEY` on web | Set both; key must equal the API's |
+| `/health` degraded | Redis or circuit breaker | Restore Redis; delivery resumes on its own |
+| Tasks sit in QUEUED | Workers running? Redis reachable? | If Redis lost jobs, the reconciler requeues them after the grace period ([docs/redis-loss-recovery.md](docs/redis-loss-recovery.md)) |
+| Task FAILED at once with "No handler registered" | Task `name` | Use a registered type (`echo`, `sleep`, `flaky`, `http`) |
+| `http` task FAILED "not in HTTP_TASK_ALLOWED_HOSTS" | Worker env | Add the host to `HTTP_TASK_ALLOWED_HOSTS` |
+| StaleVersion / ClaimTokenMismatch in logs | — | Expected under contention or after a lease loss; only one writer wins |
 
 ## Backup
 
-### PostgreSQL
-
 ```bash
-# Manual backup
-kubectl -n distributed-engine exec postgres-0 -- pg_dump -U postgres distributed_engine > backup.sql
-
-# Restore
-kubectl -n distributed-engine exec -i postgres-0 -- psql -U postgres distributed_engine < backup.sql
+kubectl -n $NS exec postgres-0 -- pg_dump -U postgres distributed_engine > backup.sql
+kubectl -n $NS exec -i postgres-0 -- psql -U postgres distributed_engine < backup.sql
 ```
 
-### Redis
-
-Redis is configured with AOF persistence (`appendonly yes`, `appendfsync everysec`). Data loss window is at most 1 second. However, Redis is not the source of truth — if Redis data is lost, the outbox publisher will re-publish pending events from PostgreSQL.
+See [docs/backup-restore.md](docs/backup-restore.md). Redis needs no backup:
+it holds no state PostgreSQL cannot rebuild. AOF (`everysec`) limits churn
+after a restart, and the reconciler requeues anything that was lost.

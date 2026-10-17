@@ -31,10 +31,10 @@ Staged rollout of Istio Ambient mode for the distributed task execution engine.
 |------|---------|
 | `k8s/namespace.yaml` | Namespace with `istio.io/dataplane-mode: ambient` label |
 | `k8s/istio/service-accounts.yaml` | ServiceAccounts for all workloads + Gateway |
-| `k8s/istio/gateway.yaml` | Gateway (HTTP :80) + HTTPRoute → api:3000 |
+| `k8s/istio/gateway.yaml` | Gateway (HTTP :80) + HTTPRoute → `api` Service port 80 (→ container 3000) |
 | `k8s/istio/authz-postgres.yaml` | ALLOW policy: api-sa, worker-sa → postgres:5432 |
 | `k8s/istio/authz-redis.yaml` | ALLOW policy: api-sa, worker-sa → redis:6379 |
-| `k8s/istio/authz-api.yaml` | ALLOW policy: engine-gateway-istio → api:3000 |
+| `k8s/istio/authz-api.yaml` | ALLOW policy: engine-gateway-istio and web-sa (dashboard) → api:3000 |
 | `k8s/istio/verify-runtime.sh` | Runtime verification script |
 
 ## Staged Rollout
@@ -130,7 +130,7 @@ Run automated enrollment verification:
 kubectl apply -f k8s/istio/gateway.yaml
 ```
 
-**Expected behavior**: Istio creates a Gateway Deployment and Service. The generated resources are named `engine-gateway-istio` (convention: `<gateway-name>-<gateway-class-name>`). The Gateway pod uses the `engine-gateway-istio` ServiceAccount. An HTTPRoute forwards HTTP traffic from the Gateway to `api:3000`.
+**Expected behavior**: Istio creates a Gateway Deployment and Service. The generated resources are named `engine-gateway-istio` (convention: `<gateway-name>-<gateway-class-name>`). The Gateway pod uses the `engine-gateway-istio` ServiceAccount. An HTTPRoute forwards HTTP traffic from the Gateway to the `api` Service on port 80. A Gateway API backendRef names the *Service* port; pointing it at 3000 (the container port) never routes.
 
 **Positive verification**:
 ```bash
@@ -200,9 +200,11 @@ kubectl exec -n distributed-engine deploy/api -- wget -qO- http://localhost:3000
 
 # Submit a task to verify Worker → PG and Worker → Redis paths
 # (Schema: name is required; payload, priority, maxRetries are optional)
+KEY=$(kubectl -n distributed-engine get secret operator-secret -o jsonpath='{.data.api-key}' | base64 -d)
 kubectl exec -n distributed-engine deploy/api -- \
-  wget -qO- --post-data='{"name":"authz-verify"}' \
-  --header='Content-Type: application/json' http://localhost:3000/tasks
+  wget -qO- --post-data='{"name":"echo","payload":{"from":"authz-verify"}}' \
+  --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+  http://localhost:3000/tasks
 # Task should reach COMPLETED status
 ```
 
@@ -264,7 +266,7 @@ Run automated authorization verification:
 kubectl apply -f k8s/istio/authz-api.yaml
 ```
 
-**Expected behavior**: API port 3000 accepts connections only from the Gateway's `engine-gateway-istio` identity. Kubelet probes continue to work — ztunnel rewrites kubelet probe packets to a link-local address (169.254.7.127), exempting them from policy enforcement.
+**Expected behavior**: API port 3000 accepts connections only from the Gateway's `engine-gateway-istio` identity and the dashboard's `web-sa`. Kubelet probes continue to work — ztunnel rewrites kubelet probe packets to a link-local address (169.254.7.127), exempting them from policy enforcement.
 
 **Positive verification** (Gateway-path tests):
 ```bash
@@ -299,15 +301,15 @@ curl http://${GW_ADDR}/live
 # Then: unauthorized identity should be denied
 kubectl create sa test-unauthorized -n distributed-engine
 kubectl run api-test -n distributed-engine \
-  --image=busybox:latest \
+  --image=busybox:1.37 \
   --overrides='{"spec":{"serviceAccountName":"test-unauthorized"}}' \
   --rm -i --restart=Never --timeout=20s \
-  -- sh -c "timeout 5 wget -qO- http://api:3000/live; echo EXIT_CODE:\$?"
+  -- sh -c "timeout 5 wget -qO- http://api/live; echo EXIT_CODE:\$?"
 # Expected: non-zero EXIT_CODE (connection refused/timeout)
 kubectl delete sa test-unauthorized -n distributed-engine
 ```
 
-The API negative test establishes a valid control: the authorized Gateway identity succeeds, then the unauthorized workload identity is denied.
+Use the Service port (`http://api/live`, port 80). A port the Service does not expose fails whether or not the policy works, which would make the test meaningless. The API negative test establishes a valid control: the authorized Gateway identity succeeds, then the unauthorized workload identity is denied.
 
 **Rollback**:
 ```bash
@@ -349,7 +351,7 @@ This stage transitions external traffic from the direct API LoadBalancer to the 
 5. Verify no disruption:
    ```bash
    curl http://${GW_ADDR}/health
-   curl http://${GW_ADDR}/tasks
+   curl -H "Authorization: Bearer $KEY" http://${GW_ADDR}/tasks
    ```
 
 **Rollback**: Change API service back to `type: LoadBalancer` and re-apply.
@@ -358,10 +360,14 @@ This stage transitions external traffic from the direct API LoadBalancer to the 
 
 ## Full Automated Verification
 
-Run all stages:
+Run all stages (the e2e stage submits a task with the operator key):
 ```bash
-./k8s/istio/verify-runtime.sh all
+OPERATOR_API_KEY=$KEY GW_ADDR=<gateway address> ./k8s/istio/verify-runtime.sh all
 ```
+
+This exact run happens on every pull request (`.github/workflows/full-stack.yml`,
+job `kind-istio`, via `scripts/k8s-kind-e2e.sh`) on kind with Istio 1.30
+ambient, and must end in RUNTIME ACCEPTANCE PASS.
 
 ### Exit Codes
 
@@ -383,7 +389,7 @@ kubectl -n distributed-engine port-forward svc/$(kubectl get svc -n distributed-
   -l gateway.networking.k8s.io/gateway-name=engine-gateway -o name | head -1) 8080:80
 
 # In another terminal:
-GW_ADDR=localhost:8080 ./k8s/istio/verify-runtime.sh e2e
+GW_ADDR=localhost:8080 OPERATOR_API_KEY=$KEY ./k8s/istio/verify-runtime.sh e2e
 ```
 
 The `GW_ADDR` environment variable overrides the auto-detected address. The request still traverses the Gateway proxy and HTTPRoute.

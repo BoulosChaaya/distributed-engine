@@ -28,10 +28,26 @@ kubectl create secret generic redis-secret \
   --from-literal=password='<REDIS_PASSWORD>'
 ```
 
+### Operator key and dashboard login
+
+```bash
+kubectl create secret generic operator-secret \
+  --namespace distributed-engine \
+  --from-literal=api-key="$(openssl rand -hex 32)"
+
+kubectl create secret generic dashboard-secret \
+  --namespace distributed-engine \
+  --from-literal=username=ops --from-literal=password="$(openssl rand -hex 16)"
+```
+
+Without `operator-secret` the API still runs, but `/tasks`, `/schedules`,
+`/workers`, `/metrics`, `/tenants` and `/plans` answer 503. The dashboard
+needs both secrets.
+
 Verify secrets exist before deploying workloads:
 
 ```bash
-kubectl get secrets -n distributed-engine postgres-secret redis-secret
+kubectl get secrets -n distributed-engine postgres-secret redis-secret operator-secret dashboard-secret
 ```
 
 ## Image Publication
@@ -42,6 +58,7 @@ Git commit SHA:
 ```
 ghcr.io/bouloschaaya/distributed-engine-api:<full-git-sha>
 ghcr.io/bouloschaaya/distributed-engine-worker:<full-git-sha>
+ghcr.io/bouloschaaya/distributed-engine-web:<full-git-sha>
 ```
 
 No `latest` tag is published. Each deployment references a specific commit SHA.
@@ -61,28 +78,24 @@ DEPLOY_SHA=$(git rev-parse main)
 echo "Deploying: $DEPLOY_SHA"
 ```
 
-### 2. Update manifests with the target image
-
-Edit both `k8s/api.yaml` and `k8s/worker.yaml`:
+### 2. Pin the target images
 
 ```bash
-# api.yaml
-image: ghcr.io/bouloschaaya/distributed-engine-api:${DEPLOY_SHA}
-
-# worker.yaml
-image: ghcr.io/bouloschaaya/distributed-engine-worker:${DEPLOY_SHA}
+(cd k8s && kustomize edit set image \
+  distributed-engine-api=ghcr.io/bouloschaaya/distributed-engine-api:${DEPLOY_SHA} \
+  distributed-engine-worker=ghcr.io/bouloschaaya/distributed-engine-worker:${DEPLOY_SHA} \
+  distributed-engine-web=ghcr.io/bouloschaaya/distributed-engine-web:${DEPLOY_SHA})
 ```
 
-API and Worker from one commit are **one release unit**. Both must reference
-the same commit SHA.
+API, worker and web from one commit are **one release unit**. All three must
+reference the same commit SHA.
 
 ### 3. Apply manifests
 
 ```bash
-kubectl apply -f k8s/postgres.yaml
-kubectl apply -f k8s/redis.yaml
-kubectl apply -f k8s/api.yaml
-kubectl apply -f k8s/worker.yaml
+kubectl apply -k k8s
+# with Istio ambient installed:
+kubectl apply -k k8s/istio
 ```
 
 ### 4. Wait for rollout
@@ -156,17 +169,17 @@ Identify the previous known-good SHA and its verified OCI digest:
 ROLLBACK_SHA=<previous-known-good-sha>
 ```
 
-Update both `k8s/api.yaml` and `k8s/worker.yaml` to the rollback SHA, then:
+Set all three images to the rollback SHA (step 2 above), then:
 
 ```bash
-kubectl apply -f k8s/api.yaml
-kubectl apply -f k8s/worker.yaml
-kubectl rollout status deployment/api -n distributed-engine --timeout=120s
-kubectl rollout status deployment/worker -n distributed-engine --timeout=120s
+kubectl apply -k k8s
+for d in api worker web; do
+  kubectl rollout status deployment/$d -n distributed-engine --timeout=120s
+done
 ```
 
 Verify both deployments show the intended previous image SHA/digest.
-API and Worker must be rolled back together — the system must not run
+API, worker and web must be rolled back together; the system must not run
 mismatched versions.
 
 ### Method 2: kubectl rollout undo (emergency)
