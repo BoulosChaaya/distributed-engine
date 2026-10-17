@@ -168,6 +168,13 @@ tenant_task=$(curl -sf "${tk[@]}" -H 'Content-Type: application/json' -X POST \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.id))')
 wait_status "$tenant_task" COMPLETED
 expect 200 "tenant reads its usage" "${tk[@]}" http://localhost:3000/tenant/usage
+# A tenant task scheduled for later must wait: SCHEDULED, no job, not run early.
+later=$(node -e 'console.log(new Date(Date.now() + 3600e3).toISOString())')
+scheduled_status=$(curl -sf "${tk[@]}" -H 'Content-Type: application/json' -X POST \
+  -d "{\"name\":\"echo\",\"scheduledFor\":\"${later}\"}" http://localhost:3000/tenant/tasks \
+  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).data.status))')
+[ "$scheduled_status" = SCHEDULED ] || { echo "FAIL: tenant scheduledFor stored as ${scheduled_status}, expected SCHEDULED" >&2; exit 1; }
+echo "ok: tenant task with a future scheduledFor is SCHEDULED"
 
 # 5. Workflows (DAG): a diamond submitted through the dashboard must complete,
 #    and a step that fails must cancel what depends on it.

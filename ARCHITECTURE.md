@@ -478,7 +478,8 @@ BEGIN
   │
   ├── INCREMENT accepted_jobs
   ├── INSERT task (with tenant_id, idempotency_key, idempotency_hash)
-  ├── INSERT outbox_event
+  │     status SCHEDULED if scheduledFor is in the future (database clock), else QUEUED
+  ├── INSERT outbox_event   (QUEUED only; a SCHEDULED task gets its event when the scheduler releases it)
 COMMIT
 ```
 

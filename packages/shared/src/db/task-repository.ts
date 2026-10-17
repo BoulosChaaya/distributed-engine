@@ -475,15 +475,26 @@ export class TaskRepository {
         ? computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.payload, input.scheduledFor, input.scheduleId)
         : null;
 
+      // A future scheduledFor is stored SCHEDULED with no outbox event, exactly
+      // like the operator route: the scheduler releases it when it is due, and
+      // until then there is no job, so no worker can run it early. "Future" is
+      // decided by the database clock, the same clock the scheduler uses.
       const taskResult = await client.query(
         `INSERT INTO tasks (id, tenant_id, name, status, priority, payload, max_retries, retries, version,
-           idempotency_key, idempotency_hash, created_at, updated_at)
-         VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, 0, 1, $7, $8, NOW(), NOW())
+           idempotency_key, idempotency_hash, scheduled_for, created_at, updated_at)
+         VALUES ($1, $2, $3,
+                 CASE WHEN $9::timestamptz > NOW() THEN 'SCHEDULED' ELSE 'QUEUED' END,
+                 $4, $5, $6, 0, 1, $7, $8, $9::timestamptz, NOW(), NOW())
          RETURNING *`,
         [taskId, input.tenantId, input.name, input.priority,
          JSON.stringify(input.payload), input.maxRetries,
-         input.idempotencyKey ?? null, idempotencyHash],
+         input.idempotencyKey ?? null, idempotencyHash, input.scheduledFor ?? null],
       );
+
+      if (taskResult.rows[0].status === 'SCHEDULED') {
+        await client.query('COMMIT');
+        return { task: rowToTask(taskResult.rows[0]), idempotent: false };
+      }
 
       const outboxPayload = {
         taskId,
