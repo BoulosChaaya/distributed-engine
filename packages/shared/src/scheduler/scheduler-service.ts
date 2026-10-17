@@ -20,6 +20,11 @@ const DEFAULT_CONFIG: SchedulerConfig = {
   executionLeaseDurationMs: 300000,
 };
 
+/** Shortest sleep before a future due time (timer granularity margin). */
+const MIN_WAKE_DELAY_MS = 50;
+/** Sleep when work is still overdue right after a poll. */
+const OVERDUE_RETRY_DELAY_MS = 1000;
+
 export class SchedulerService {
   private running = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -68,7 +73,7 @@ export class SchedulerService {
     this.logger.info('Scheduler stopped');
   }
 
-  private schedulePoll(): void {
+  private schedulePoll(delayMs: number = this.config.pollIntervalMs): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
       const poll = this.poll();
@@ -79,8 +84,31 @@ export class SchedulerService {
         this.logger.error('Scheduler poll error', { reason: String(error) });
       }
       this.activePoll = null;
-      this.schedulePoll();
-    }, this.config.pollIntervalMs);
+      this.schedulePoll(await this.nextPollDelay());
+    }, delayMs);
+  }
+
+  /**
+   * Sleep until the next known due time instead of always the full interval.
+   * With a fixed 5 s poll, a task could start up to 5 s after its time (4.8 s
+   * was recorded). After each poll the scheduler now asks PostgreSQL how long
+   * until the earliest SCHEDULED task or ACTIVE schedule is due, on the
+   * database clock, and wakes then (at least MIN_WAKE_DELAY_MS, at most the
+   * poll interval). Work created during the sleep for a time inside it is
+   * still picked up by the regular interval, so the interval stays the bound.
+   */
+  private async nextPollDelay(): Promise<number> {
+    try {
+      const msUntilDue = await this.scheduleRepo.msUntilNextDue();
+      if (msUntilDue === null) return this.config.pollIntervalMs;
+      // Still overdue right after a poll: a batch limit left work behind, or a
+      // schedule keeps failing or is held by another replica. Come back soon,
+      // but not in a tight loop.
+      if (msUntilDue <= 0) return Math.min(this.config.pollIntervalMs, OVERDUE_RETRY_DELAY_MS);
+      return Math.max(MIN_WAKE_DELAY_MS, Math.min(this.config.pollIntervalMs, msUntilDue));
+    } catch {
+      return this.config.pollIntervalMs;
+    }
   }
 
   async poll(): Promise<void> {

@@ -581,6 +581,22 @@ export class ScheduleRepository {
     return result.rows.length > 0;
   }
 
+  /**
+   * Milliseconds until the earliest one-off SCHEDULED task or ACTIVE recurring
+   * schedule is due, by the database clock (negative if already due), or null
+   * when nothing is waiting. Both lookups use the existing partial indexes.
+   */
+  async msUntilNextDue(): Promise<number | null> {
+    const result = await this.pool.query(
+      `SELECT EXTRACT(EPOCH FROM (LEAST(
+                (SELECT MIN(scheduled_for) FROM tasks WHERE status = 'SCHEDULED' AND schedule_id IS NULL),
+                (SELECT MIN(next_run_at) FROM recurring_schedules WHERE status = 'ACTIVE')
+              ) - NOW())) * 1000 AS ms`,
+    );
+    const ms = result.rows[0].ms;
+    return ms === null ? null : Math.round(Number(ms));
+  }
+
   async getScheduleForTenant(scheduleId: string, tenantId: string): Promise<RecurringSchedule | null> {
     const result = await this.pool.query(
       'SELECT * FROM recurring_schedules WHERE id = $1 AND tenant_id = $2',
