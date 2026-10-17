@@ -30,7 +30,8 @@ docker compose up -d postgres redis
 
 export OPERATOR_API_KEY="$(openssl rand -hex 32)"
 pnpm -F @distributed-engine/api run dev        # :3000
-pnpm -F @distributed-engine/worker run dev     # health :9000
+pnpm -F @distributed-engine/worker run dev     # health :9000 (WORKER_HEALTH_PORT)
+WORKER_HEALTH_PORT=9001 pnpm -F @distributed-engine/worker run dev   # a second worker on the same host
 
 curl http://localhost:3000/health
 curl -H "Authorization: Bearer $OPERATOR_API_KEY" http://localhost:3000/metrics
@@ -155,7 +156,7 @@ throwaway kind cluster, exactly as CI does.
 | `/ready` | none | PostgreSQL | PG unreachable |
 | `/live` | none | nothing | never |
 | `/health` | none | PG, Redis, outbox circuit breaker | PG unreachable (`degraded` with 200 if only Redis/breaker) |
-| worker `:9000/healthz` | none | process alive | — |
+| worker `:9000/healthz` (`WORKER_HEALTH_PORT`) | none | process alive | — |
 | dashboard `:3001/` | Basic | auth proxy up | expects 401 unauthenticated; 503 means credentials not configured |
 
 `/ready` needs only PostgreSQL because accepting a task only writes to
