@@ -204,6 +204,53 @@ describe('publisher wake-ups (requires PostgreSQL + Redis)', () => {
     expect(await waitForPublished(['first', 'second'], 1000)).toEqual(['first']);
   });
 
+  it('notices a LISTEN connection that stopped answering and reconnects', async () => {
+    // The first connection goes half-open after LISTEN: SELECT 1 never
+    // returns and notifications never arrive, with no error and no 'end',
+    // which is what a dead peer that never closed the socket looks like.
+    class HalfOpen extends Client {
+      query(...args: unknown[]): any {
+        if (args[0] === 'SELECT 1') return new Promise(() => {});
+        return (Client.prototype.query as (...a: unknown[]) => unknown).apply(this, args);
+      }
+      emit(event: string | symbol, ...args: unknown[]): boolean {
+        return event === 'notification' ? false : super.emit(event, ...args);
+      }
+    }
+    let made = 0;
+    const pub = new OutboxPublisher(pool, queue, 60000, 10, 5, {
+      fairScheduler: new WeightedFairScheduler(), tenantAdmission: true, logger: silent,
+      listenerHeartbeatMs: 100, listenerTimeoutMs: 100,
+    });
+    pub.listenForWakeups(() => (made++ === 0 ? new HalfOpen({ connectionString: TEST_PG_URL }) : new Client({ connectionString: TEST_PG_URL })));
+    running.push(pub);
+    pub.start();
+
+    // Heartbeat after 100 ms, no answer for 100 ms, reconnect after the 1 s backoff.
+    for (let i = 0; i < 150 && made < 2; i++) await sleep(20);
+    expect(made).toBe(2);
+    for (let i = 0; i < 100 && !pub.isListening(); i++) await sleep(20);
+    expect(pub.isListening()).toBe(true);
+
+    const { submit } = await tenantWithLimit(5);
+    await submit('after-reconnect', 'NORMAL');
+    expect(await waitForPublished(['after-reconnect'], 1000)).toEqual(['after-reconnect']);
+  });
+
+  it('gives up connecting to an address that drops packets, and tries again', async () => {
+    let made = 0;
+    const pub = new OutboxPublisher(pool, queue, 60000, 10, 5, {
+      fairScheduler: new WeightedFairScheduler(), tenantAdmission: true, logger: silent,
+      listenerTimeoutMs: 200,
+    });
+    pub.listenForWakeups(() => { made++; return new Client({ host: '10.255.255.1', port: 5432, user: 'x', password: 'x', database: 'x' }); });
+    running.push(pub);
+    pub.start();
+    await sleep(1600); // 200 ms timeout, 1 s backoff, second attempt
+    expect(made).toBeGreaterThanOrEqual(2);
+    expect(pub.isListening()).toBe(false);
+  });
+
   it('keeps working by polling when the LISTEN connection cannot be opened', async () => {
     const pub = new OutboxPublisher(pool, queue, 200, 10, 5, {
       fairScheduler: new WeightedFairScheduler(), tenantAdmission: true, logger: silent,

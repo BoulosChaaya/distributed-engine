@@ -125,6 +125,9 @@ if (config.outbox.listen) {
     database: config.postgres.database,
     user: config.postgres.user,
     password: config.postgres.password,
+    // TCP keepalive as a second line; the publisher's own SELECT 1 heartbeat
+    // is what notices a dead peer within seconds.
+    keepAlive: true,
   }));
 }
 
