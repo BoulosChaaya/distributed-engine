@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Queue } from 'bullmq';
 import { Redis as IORedis } from 'ioredis';
-import { Pool } from 'pg';
+import { Pool, Client as PgClient } from 'pg';
 import {
   AppError,
   TaskRepository,
@@ -114,6 +114,18 @@ const outboxPublisher = new OutboxPublisher(
     tenantAdmission: config.outbox.tenantAdmission,
   },
 );
+
+if (config.outbox.listen) {
+  // Not from pgPool: held for the life of the process. Counted in the
+  // connection budget (scripts/check-db-connection-budget.mjs).
+  outboxPublisher.listenForWakeups(() => new PgClient({
+    host: config.postgres.host,
+    port: config.postgres.port,
+    database: config.postgres.database,
+    user: config.postgres.user,
+    password: config.postgres.password,
+  }));
+}
 
 const taskReconciler = new TaskReconciler(pgPool, taskQueue, {
   intervalMs: config.reconciler.intervalMs,

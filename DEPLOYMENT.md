@@ -223,13 +223,16 @@ keep the defaults.
   (`engine_queue_jobs` on `/metrics/prometheus`); an in-cluster Prometheus
   and an adapter such as KEDA do not.
 - PostgreSQL connections: every pod has its own pool, so the worst case is
-  `HPA maxReplicas × POSTGRES_MAX_CONNECTIONS` per service. The manifests set
-  api 10 × 10 and worker 20 × 7 (`QUEUE_CONCURRENCY` + 2) = 240, and
+  `HPA maxReplicas × POSTGRES_MAX_CONNECTIONS` per service, plus one
+  dedicated connection per API pod for outbox wake-ups (`LISTEN`). The
+  manifests set api 10 × (9 + 1) and worker 20 × 7 (`QUEUE_CONCURRENCY` + 2)
+  = 240, and
   PostgreSQL `max_connections` = 260 (20 headroom), with 1 Gi of memory. CI
   runs `node scripts/check-db-connection-budget.mjs`, which fails if a change
   to replicas, pools or `max_connections` breaks that sum. PgBouncer in
   transaction mode is not a drop-in alternative: the reconciler and the
-  migration runner rely on session-level advisory locks.
+  migration runner rely on session-level advisory locks, and the wake-up
+  connection on session-level `LISTEN`.
 
 ## Operations
 

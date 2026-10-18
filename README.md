@@ -265,7 +265,8 @@ claim token, so a worker that lost its lease can never record an outcome.
 |----------|---------|-------------|
 | PORT | 3000 | HTTP port |
 | POSTGRES_HOST / PORT / DB / USER / PASSWORD | localhost / 5432 / distributed_engine / postgres / — | PostgreSQL |
-| POSTGRES_MAX_CONNECTIONS | 20 | Pool size |
+| POSTGRES_MAX_CONNECTIONS | 20 | Pool size (the API holds one more connection outside it for outbox wake-ups) |
+| OUTBOX_LISTEN | true | Publish as soon as PostgreSQL signals new work or a freed tenant slot (LISTEN/NOTIFY); polling stays as the fallback |
 | REDIS_HOST / PORT / PASSWORD | localhost / 6379 / — | Redis |
 | OPERATOR_API_KEY | — | Operator Bearer key, 32+ chars; unset = operator routes 503 |
 | OUTBOX_POLL_INTERVAL_MS / BATCH_SIZE / MAX_ATTEMPTS | 1000 / 10 / 5 | Outbox publisher. The interval is the idle delay: a full batch is followed by the next poll at once |

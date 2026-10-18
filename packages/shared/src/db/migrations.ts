@@ -320,6 +320,33 @@ const MIGRATIONS = [
         ON outbox_events(processed_at) WHERE status = 'DELIVERED';
     `,
   },
+  {
+    version: 20,
+    name: 'add_outbox_wakeup_notifications',
+    // See OutboxPublisher.listenForWakeups. pg_notify is delivered at commit
+    // and identical notifications in one transaction are sent once, so a
+    // batch insert or a workflow finishing many steps costs one wake-up.
+    sql: `
+      CREATE OR REPLACE FUNCTION notify_outbox_wakeup() RETURNS trigger AS $$
+      BEGIN
+        PERFORM pg_notify('outbox_wakeup', '');
+        RETURN NULL;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS outbox_event_inserted_wakeup ON outbox_events;
+      CREATE TRIGGER outbox_event_inserted_wakeup
+        AFTER INSERT ON outbox_events
+        FOR EACH STATEMENT EXECUTE FUNCTION notify_outbox_wakeup();
+
+      DROP TRIGGER IF EXISTS task_slot_freed_wakeup ON tasks;
+      CREATE TRIGGER task_slot_freed_wakeup
+        AFTER UPDATE OF status ON tasks
+        FOR EACH ROW
+        WHEN (OLD.status IN ('QUEUED', 'PROCESSING') AND NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED'))
+        EXECUTE FUNCTION notify_outbox_wakeup();
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

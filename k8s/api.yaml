@@ -74,8 +74,9 @@ spec:
           value: "postgres"
         # Connection budget: maxReplicas (10) x this must fit max_connections
         # together with the workers. Checked in CI by scripts/check-db-connection-budget.mjs.
+        # 9 pooled + 1 dedicated LISTEN connection (outbox wake-ups) = 10 per pod.
         - name: POSTGRES_MAX_CONNECTIONS
-          value: "10"
+          value: "9"
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
