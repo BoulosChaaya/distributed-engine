@@ -81,7 +81,9 @@ for _ in $(seq 1 60); do
 done
 echo "   PROCESSING now: ${processing}"
 
-victim=$("${compose[@]}" ps -q worker | head -1)
+# awk reads all of its input: `head -1` exits after one line, docker compose can
+# then fail writing the rest (EPIPE) and pipefail stops the script.
+victim=$("${compose[@]}" ps -q worker | awk 'NR == 1')
 victim_held=$(sql "SELECT COUNT(*) FROM tasks WHERE status = 'PROCESSING'")
 echo "== CHAOS 1: SIGKILL worker ${victim:0:12} (in flight across workers: ${victim_held})"
 docker kill --signal KILL "$victim" >/dev/null

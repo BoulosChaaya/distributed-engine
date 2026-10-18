@@ -111,7 +111,7 @@ step "6. Chaos: 45 tasks in flight, then SIGKILL a worker and FLUSHALL Redis"
 ids=()
 for _ in $(seq 1 45); do ids+=("$(submit '{"name":"sleep","payload":{"ms":3000}}')"); done
 sleep 3
-victim=$(docker compose ps -q worker | head -1)
+victim=$(docker compose ps -q worker | awk 'NR == 1')  # not head: see chaos-compose.sh
 docker kill --signal KILL "$victim" >/dev/null
 echo "  killed worker ${victim:0:12}"
 docker compose exec -T redis redis-cli FLUSHALL >/dev/null
