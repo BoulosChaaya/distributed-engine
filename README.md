@@ -267,7 +267,7 @@ claim token, so a worker that lost its lease can never record an outcome.
 | POSTGRES_MAX_CONNECTIONS | 20 | Pool size |
 | REDIS_HOST / PORT / PASSWORD | localhost / 6379 / — | Redis |
 | OPERATOR_API_KEY | — | Operator Bearer key, 32+ chars; unset = operator routes 503 |
-| OUTBOX_POLL_INTERVAL_MS / BATCH_SIZE / MAX_ATTEMPTS | 1000 / 10 / 5 | Outbox publisher |
+| OUTBOX_POLL_INTERVAL_MS / BATCH_SIZE / MAX_ATTEMPTS | 1000 / 10 / 5 | Outbox publisher. The interval is the idle delay: a full batch is followed by the next poll at once |
 | SCHEDULER_POLL_INTERVAL_MS / BATCH_SIZE | 5000 / 50 | Scheduler |
 | RECONCILER_INTERVAL_MS / QUEUED_GRACE_MS / BATCH_SIZE | 30000 / 60000 / 100 | Redis-loss reconciler |
 | GRACEFUL_SHUTDOWN_TIMEOUT_MS | 30000 | Drain timeout |

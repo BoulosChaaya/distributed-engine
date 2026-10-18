@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, jest } from '@jest/globals';
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
@@ -1281,5 +1281,46 @@ describe('Redis connection down: publishing pauses (requires PostgreSQL)', () =>
     row = (await pool.query('SELECT status, attempts FROM outbox_events')).rows[0];
     expect(row).toEqual({ status: 'DELIVERED', attempts: 1 });
     expect(added).toHaveLength(1);
+  });
+});
+
+describe('OutboxPublisher throughput (requires PostgreSQL + Redis)', () => {
+  // A poll that fills its whole batch means more events are waiting. Sleeping
+  // the full poll interval after it caps publishing at batchSize per interval
+  // (10/s with the defaults), so any steady load above that grows a backlog
+  // that never drains.
+  it('keeps polling without the idle interval while batches come back full', async () => {
+    requireInfra();
+    for (let i = 0; i < 60; i++) {
+      await repo.createTaskWithOutbox({ name: `burst-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
+    }
+    const fast = new OutboxPublisher(pool, queue, 500, 10, 3);
+    fast.start();
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+    } finally {
+      await fast.stop();
+    }
+    // One interval (500 ms) to the first poll, then six back-to-back full
+    // batches. Before: one batch per 500 ms, so about 20 by now.
+    expect(await fast.getPendingCount()).toBe(0);
+  });
+
+  it('waits the poll interval once a batch comes back short', async () => {
+    requireInfra();
+    for (let i = 0; i < 3; i++) {
+      await repo.createTaskWithOutbox({ name: `trickle-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
+    }
+    const p = new OutboxPublisher(pool, queue, 400, 10, 3);
+    const polls = jest.spyOn(p, 'processOutbox');
+    p.start();
+    try {
+      await new Promise((r) => setTimeout(r, 1000));
+    } finally {
+      await p.stop();
+    }
+    // Polls at ~400 and ~800 ms only: an idle publisher does not spin.
+    expect(polls.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(await p.getPendingCount()).toBe(0);
   });
 });

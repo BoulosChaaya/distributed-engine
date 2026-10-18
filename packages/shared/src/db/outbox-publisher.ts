@@ -67,6 +67,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 export class OutboxPublisher {
   private running = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The last poll claimed a full batch and published it without failure. */
+  private lastPollFull = false;
   private activePoll: Promise<number> | null = null;
   private readonly publisherId: string;
   private readonly logger: Logger;
@@ -207,19 +209,29 @@ export class OutboxPublisher {
     return this.waitingForRedis;
   }
 
-  private schedulePoll(): void {
+  /**
+   * The poll interval is the idle delay, not a rate. A poll that claimed a
+   * full batch without a publish failure means more events are probably
+   * waiting, so the next poll starts at once; only a short batch, a failure,
+   * an open circuit or a Redis outage waits the interval. Otherwise one
+   * publisher moves at most batchSize events per interval (10/s with the
+   * defaults) and any steady load above that grows a backlog forever.
+   */
+  private schedulePoll(delayMs: number = this.pollIntervalMs): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
+      this.lastPollFull = false;
       const poll = this.processOutbox();
       this.activePoll = poll;
       try {
         await poll;
       } catch (error) {
+        this.lastPollFull = false;
         this.logger.error('Outbox poll error', { reason: String(error) });
       }
       this.activePoll = null;
-      this.schedulePoll();
-    }, this.pollIntervalMs);
+      this.schedulePoll(this.lastPollFull ? 0 : this.pollIntervalMs);
+    }, delayMs);
   }
 
   async processOutbox(): Promise<number> {
@@ -263,6 +275,8 @@ export class OutboxPublisher {
       const orderedRows = this.fairScheduler && (effectiveBatchSize > 1 || this.tenantAdmission)
         ? await this.claimFairly(client, effectiveBatchSize)
         : await this.claimGlobalFifo(client, effectiveBatchSize);
+      // Cleared below on any publish failure (see schedulePoll).
+      this.lastPollFull = !isHalfOpen && orderedRows.length >= this.batchSize;
 
       for (const [index, row] of orderedRows.entries()) {
         const event: OutboxEvent = {
@@ -282,6 +296,7 @@ export class OutboxPublisher {
         try {
           published = await this.publishEvent(event, client);
         } catch (error) {
+          this.lastPollFull = false;
           this.onBullMQFailure();
 
           this.logger.error('Failed to publish outbox event to queue', {
