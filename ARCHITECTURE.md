@@ -516,6 +516,12 @@ Concurrency leases compose with existing task claim leases and schedule executio
 
 When the concurrency limit is reached, the worker defers the job via `moveToDelayed` + `DelayedError`. This does **not** consume a BullMQ retry attempt — the same mechanism used for schedule lease deferral.
 
+**Ordering under the limit is not first-in, first-out.** A deferred job is retried 2 s later (`LEASE_DEFERRAL_MARGIN_MS`), and whichever deferred job happens to retry right after a slot frees takes it. Recorded with a limit of 1 and six queued tasks: they ran one at a time, and the task that took the slot first was not the first submitted (slow-1, submitted third, ran last). Priority is respected only up to the moment of the first deferral. Within one tenant this is fair over time (every waiting task retries at the same rate), but it does not keep submission order, and a waiting task's start time has 2 s of jitter.
+
+Why this is not "fixed" by letting only the oldest queued task take a free slot: a task waiting out a retry backoff (2 s, 4 s, 8 s, …) or one whose job Redis lost would then be the oldest and block every other task of its tenant until it runs, which is head-of-line blocking that turns a single bad task into a stalled tenant.
+
+What a real fix looks like, if ordering matters: **admission at publish time**. The outbox publisher already orders work per tenant (oldest PENDING event first) and already knows the tenant of every event. It would publish a tenant's events only while that tenant's running + queued-in-Redis count is under its limit, so BullMQ only ever holds jobs that can run now, and the outbox is the FIFO waiting room. That changes how the publisher, the concurrency lease and the reconciler (which treats an unpublished QUEUED task as normal while its event is PENDING) interact, so it is a design change of its own, not a patch.
+
 ### Rate Limiting
 
 Redis sliding-window sorted set rate limiter per tenant. Each request adds a timestamped entry; entries outside the window are pruned; the count of remaining entries determines whether the request is allowed.
