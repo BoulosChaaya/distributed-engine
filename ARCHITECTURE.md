@@ -359,7 +359,10 @@ than `TASK_TIMEOUT_MS`, and conditional edges.
 - Runs the outbox publisher, scheduler service and task reconciler as background processes
 - Startup waits for PostgreSQL with capped backoff (no crash-loop when the database starts later). Redis is not awaited: the client reconnects forever, and the BullMQ queue owns its own connection, so publishing resumes by itself when Redis returns
 - Health probes: `/ready` checks PG only (task submission requires only PG), `/live` always returns 200, `/health` checks both PG and Redis and reports outbox circuit breaker state. Every dependency call made for a probe or for `/metrics` is bounded by `HEALTH_DEPENDENCY_TIMEOUT_MS`: the Redis client waits rather than fails while Redis is down (`maxRetriesPerRequest: null`), so an unbounded probe would hang exactly when it is needed. `/metrics` then reports `queue.available: false` with null counts rather than zeros.
-- `/metrics` returns JSON with task status counts, queue depth, and outbox stats
+- `/metrics` returns JSON with task status counts, queue depth, and outbox stats (the dashboard reads it)
+- `/metrics/prometheus` (same operator key) exposes the same numbers for Prometheus: `engine_tasks{status}`, `engine_queue_jobs{state}`, `engine_outbox_events{status}`, `engine_outbox_oldest_event_age_seconds{status="pending"}` (publishing lag), `engine_outbox_circuit_state{state}`, HTTP request/error counters and Node process stats. When Redis or the outbox cannot be read, `engine_queue_up` / `engine_outbox_up` go to 0 and those series are dropped, so a graph shows a gap instead of a false zero; PostgreSQL failing fails the scrape. The gauges are engine-wide (read from PostgreSQL/Redis), so with several API replicas aggregate them with `max()`.
+- Each worker serves `/metrics` on its health port: `engine_worker_jobs_total{outcome}` and process stats (event-loop lag shows a worker that is alive but blocked), labelled `worker_id`.
+- `docker compose --profile metrics` runs Prometheus (port 9090) scraping both; `--profile observability` adds Grafana (port 3002) with the provisioned "Engine overview" dashboard. CI (`compose-metrics`) checks the scrape, the values after real work, the Redis-down gap and that every metric the dashboard queries exists.
 - Graceful shutdown: stops accepting connections, stops scheduler, drains in-flight requests, stops outbox publisher (waits for in-progress poll to complete), closes connections. Exit code 1 if shutdown times out with active requests.
 
 ### Worker (`apps/worker/`)
@@ -668,7 +671,7 @@ Istio Ambient mode does not change the engine's delivery semantics. The system p
 - **PostgreSQL**: Single instance (StatefulSet). For higher throughput, consider read replicas or connection pooling (PgBouncer).
 - **Redis**: Single instance (StatefulSet) with AOF persistence. BullMQ supports Redis Cluster for higher throughput, but this is not configured.
 
-HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling would require a Prometheus-format metrics endpoint plus a metrics adapter (KEDA or similar). `/metrics` is JSON today, so this is not included.
+HPA in the K8s manifests scales on CPU and memory. Queue-depth-based worker scaling needs a metrics adapter (KEDA or similar) reading `engine_queue_jobs` from Prometheus; the metrics exist (`/metrics/prometheus`) but the adapter and an in-cluster Prometheus are not included.
 
 ## Distributed Tracing (OpenTelemetry)
 
@@ -907,7 +910,8 @@ Logging infrastructure uses Docker Compose profiles to avoid forcing it on devel
 | (none) | postgres, redis, api, worker | `docker compose up` |
 | `tracing` | + jaeger, otel-collector | `docker compose --profile tracing up` |
 | `logging` | + loki, alloy, grafana | `docker compose --profile logging up` |
-| `observability` | + all tracing + all logging | `docker compose --profile observability up` |
+| `metrics` | + prometheus | `docker compose --profile metrics up` |
+| `observability` | + all tracing, logging and metrics | `docker compose --profile observability up` |
 
 ### Infrastructure Components
 
@@ -924,7 +928,7 @@ Logging infrastructure uses Docker Compose profiles to avoid forcing it on devel
 - Structured metadata enabled for queryable fields
 - **Not production-ready** — no replication, no retention policy
 
-**Grafana** (port 3001):
+**Grafana** (port 3002):
 - Auto-provisioned Loki data source via `grafana/provisioning/datasources/`
 - Anonymous admin access for local development
 
@@ -973,7 +977,7 @@ Then open the `traceId` in Jaeger UI (`http://localhost:16686`) to see the distr
 | OTel Collector gRPC | 4317 | — |
 | OTel Collector HTTP | 4318 | — |
 | Loki | 3100 | `http://localhost:3100` |
-| Grafana | 3001 | `http://localhost:3001` |
+| Grafana | 3002 | `http://localhost:3002` |
 
 ### Failure Semantics
 

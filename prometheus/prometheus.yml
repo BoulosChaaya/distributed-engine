@@ -1,0 +1,24 @@
+# Scrapes the engine in docker compose (profiles: metrics, observability).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Engine-wide gauges (tasks, queue, outbox) plus this API process's stats.
+  # The route is behind the operator key; compose mounts it as a secret.
+  - job_name: engine-api
+    metrics_path: /metrics/prometheus
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/operator_api_key
+    static_configs:
+      - targets: ['api:3000']
+
+  # One target per worker container: Docker's DNS returns every replica of
+  # `docker compose up --scale worker=N` for the name "worker".
+  - job_name: engine-worker
+    dns_sd_configs:
+      - names: ['worker']
+        type: A
+        port: 9000
+        refresh_interval: 5s

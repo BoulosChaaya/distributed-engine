@@ -201,6 +201,18 @@ app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => 
   }
 });
 
+// Same numbers for Prometheus. Behind the operator key like /metrics; the
+// scrape config sends it (Prometheus `authorization.credentials_file`).
+// /metrics stays JSON because the dashboard reads it.
+app.get('/metrics/prometheus', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { contentType, body } = await metrics.prometheus();
+    res.type(contentType).send(body);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const workers: unknown[] = [];

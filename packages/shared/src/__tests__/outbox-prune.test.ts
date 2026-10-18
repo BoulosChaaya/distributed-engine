@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { TaskRepository } from '../db/task-repository';
 import { TaskReconciler, ReconcilerQueue } from '../db/task-reconciler';
 import { runMigrations } from '../db/migrations';
+import { OutboxPublisher } from '../db/outbox-publisher';
 
 // DELIVERED outbox events are pruned after the retention period; nothing
 // else in the outbox is ever touched. Real PostgreSQL.
@@ -67,5 +68,24 @@ describe('pruning delivered outbox events (requires PostgreSQL)', () => {
     for (let i = 0; i < 5; i++) ids.push(await event('DELIVERED', 10));
     await reconciler({ deliveredOutboxRetentionMs: 7 * DAY, pruneBatchSize: 2 }).reconcile();
     expect(await exists(ids)).toEqual([false, false, false, false, false]);
+  });
+});
+
+describe('outbox publishing lag (requires PostgreSQL)', () => {
+  it('reports the age of the oldest PENDING event on the database clock', async () => {
+    const publisher = new OutboxPublisher(pool, {} as never, 60000);
+    const id = await event('PENDING', 0);
+    await pool.query(`UPDATE outbox_events SET created_at = NOW() - INTERVAL '2 hours' WHERE id = $1`, [id]);
+    const before = await publisher.getStats();
+    expect(before.oldestPendingAgeSeconds).toBeGreaterThanOrEqual(7200);
+    expect(before.pending).toBeGreaterThanOrEqual(1);
+
+    // Other suites' events may remain, so compare with this one's effect.
+    await pool.query(`UPDATE outbox_events SET status = 'FAILED' WHERE id = $1`, [id]);
+    const after = await publisher.getStats();
+    expect(after.pending).toBe(before.pending - 1);
+    expect(after.failed).toBeGreaterThanOrEqual(before.failed + 1);
+    expect(after.oldestPendingAgeSeconds).toBeGreaterThanOrEqual(0);
+    await pool.query(`UPDATE outbox_events SET status = 'DELIVERED' WHERE id = $1`, [id]);
   });
 });
