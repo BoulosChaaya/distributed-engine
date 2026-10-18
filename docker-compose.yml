@@ -132,6 +132,26 @@ services:
     depends_on:
       - jaeger
 
+  # --- Metrics (profile: metrics) ---
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: engine-prometheus
+    profiles:
+      - metrics
+      - observability
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # The API's /metrics/prometheus needs the operator key; it reaches
+    # Prometheus as a file, never in the config.
+    secrets:
+      - operator_api_key
+    depends_on:
+      api:
+        condition: service_healthy
+
   # --- Logging infrastructure (profile: logging) ---
 
   loki:
@@ -174,7 +194,8 @@ services:
       - logging
       - observability
     ports:
-      - "3001:3000"
+      # 3001 is the engine dashboard (web).
+      - "3002:3000"
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
@@ -185,6 +206,10 @@ services:
     depends_on:
       loki:
         condition: service_healthy
+
+secrets:
+  operator_api_key:
+    environment: OPERATOR_API_KEY
 
 volumes:
   redis_data:

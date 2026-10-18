@@ -3,6 +3,8 @@ name: Full stack
 # Proves the system as deployed, not just as unit-tested:
 #   compose-chaos: the whole docker compose stack under a killed worker and
 #                  a flushed Redis.
+#   compose-metrics: Prometheus scraping the API and every worker, including
+#                  while Redis is down.
 #   kind-istio:    the real k8s manifests on Kubernetes with Istio ambient,
 #                  including mTLS identity, AuthorizationPolicy deny paths and
 #                  a task driven through the Gateway.
@@ -33,6 +35,19 @@ jobs:
       - name: Publish result as annotations
         if: always()
         run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/chaos.log" compose-chaos 40
+
+  compose-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prometheus scrapes API and workers; Redis loss shows as a gap, not zeros
+        run: |
+          set -o pipefail
+          bash scripts/metrics-compose.sh 2>&1 | tee "$RUNNER_TEMP/metrics.log"
+      - name: Publish result as annotations
+        if: always()
+        run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/metrics.log" compose-metrics 40
 
   kind-istio:
     runs-on: ubuntu-latest
