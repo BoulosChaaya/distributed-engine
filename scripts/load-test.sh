@@ -213,20 +213,35 @@ q "SELECT a.tenant, count(*),
    WHERE a.kind IN ('sleep','echo','http') AND t.status = 'COMPLETED'
    GROUP BY a.tenant ORDER BY a.tenant" > "$OUT/latency.txt"
 q "SELECT a.kind, count(*) FROM load_accepted a GROUP BY 1 ORDER BY 2 DESC" > "$OUT/kinds.txt"
+# Per task, for latency inside vs outside the fault windows (report side).
+q "SELECT extract(epoch FROM t.created_at)::bigint, round(extract(epoch FROM t.started_at - t.created_at) * 1000)
+   FROM load_accepted a JOIN tasks t ON t.id = a.task_id
+   WHERE a.kind IN ('sleep','echo','http') AND t.status = 'COMPLETED'" > "$OUT/waits.txt"
+q "SELECT a.kind, count(*) FILTER (WHERE t.retries > 0), coalesce(sum(t.retries), 0)
+   FROM load_accepted a JOIN tasks t ON t.id = a.task_id GROUP BY 1 ORDER BY 1" > "$OUT/retries-by-kind.txt"
+requeued=$(q "SELECT count(DISTINCT task_id) FROM outbox_events WHERE event_type = 'TASK_REQUEUED'")
+"${compose[@]}" logs --no-color worker > "$OUT/worker.log" 2>&1 || true
+reclaims=$(grep -c 'Reclaimed stalled task' "$OUT/worker.log" || true)
 q "SELECT count(*), coalesce(sum(retries),0) FROM load_accepted a JOIN tasks t ON t.id = a.task_id WHERE a.kind IN ('sleep','echo','http')" > "$OUT/retries.txt"
 
 # Prometheus over the load window (and memory at the start/end of the steady tail).
 win=$((END - START))
 promq "max_over_time((sum(max by (state) (engine_queue_jobs{state=~\"waiting|prioritized\"})))[${win}s:5s])" "$END" > "$OUT/peak-queue.txt" || true
 promq "max_over_time(max(engine_outbox_oldest_event_age_seconds{status=\"pending\"})[${win}s:5s])" "$END" > "$OUT/peak-lag.txt" || true
+# Largest process's resident memory at checkpoints through the run (1-min
+# average). A worker is restarted at ~15% and the API at 70%, so compare
+# within the stretches between restarts.
 for job in engine_api_process_resident_memory_bytes engine_worker_process_resident_memory_bytes; do
-  early=$(promq "max(avg_over_time(${job}[2m]))" "$((START + DURATION_S * 10 / 100))" || true)
-  late=$(promq "max(avg_over_time(${job}[2m]))" "$END" || true)
-  echo "${job} ${early:-?} ${late:-?}" >> "$OUT/memory.txt"
+  line="$job"
+  for pct in 10 30 50 65 85 100; do
+    v=$(promq "max(avg_over_time(${job}[1m]))" "$((START + DURATION_S * pct / 100))" || true)
+    line="$line ${pct}:${v:-?}"
+  done
+  echo "$line" >> "$OUT/memory.txt"
 done
 
 node scripts/load-report.mjs "$OUT" \
   "lost=$lost" "open=$open" "wrong=$wrong" "wf_bad=$wf_bad" "no_effect=$no_effect" "reexec=$reexec" \
   "http_done=$http_done" "outbox_pending=$outbox_pending" "outbox_failed=$outbox_failed" "mismatch=$mismatch" \
-  "peak_conn=$peak_conn" "max_conn=$max_conn" "k6_status=$k6_status" "start=$START" "end=$END" "drained=$DRAINED" \
+  "peak_conn=$peak_conn" "max_conn=$max_conn" "reclaims=$reclaims" "requeued=$requeued" "k6_status=$k6_status" "start=$START" "end=$END" "drained=$DRAINED" \
   "duration_min=$DURATION_MIN" "workers=$WORKERS" "rates=${RATE_HEAVY}/${RATE_MEDIUM}/${RATE_LIGHT}"

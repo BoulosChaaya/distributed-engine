@@ -37,7 +37,23 @@ const latency = rows('latency.txt').map(([tenant, n, waitP50, waitP95, waitP99, 
 const kinds = Object.fromEntries(rows('kinds.txt').map(([k, n]) => [k, +n]));
 kinds.workflow = rows('workflows.tsv').length;
 const [plainTasks, plainRetries] = (rows('retries.txt')[0] ?? [0, 0]).map(Number);
-const memory = rows('memory.txt').map((r) => r[0].split(' ')).map(([job, early, late]) => ({ job, early: Number(early), late: Number(late) }));
+const memory = rows('memory.txt').map((r) => r[0].split(' ')).map(([job, ...points]) => ({
+  job: job.replace(/^engine_|_process_resident_memory_bytes$/g, ''),
+  points: points.map((p) => p.split(':')).map(([pct, v]) => ({ pct: Number(pct), bytes: Number(v) })),
+}));
+const retriesByKind = rows('retries-by-kind.txt').map(([kind, tasks, retries]) => ({ kind, tasksRetried: +tasks, retries: +retries }));
+
+// Queue wait for tasks created inside a fault window vs outside any.
+const pct = (xs, p) => (xs.length ? xs[Math.min(xs.length - 1, Math.floor(p * xs.length))] : null);
+const waitStats = (xs) => { xs.sort((a, b) => a - b); return { n: xs.length, p50: pct(xs, 0.5), p95: pct(xs, 0.95), p99: pct(xs, 0.99), max: xs.at(-1) ?? null }; };
+const waitIn = new Map(windows.map((w) => [w.label, []]));
+const waitOut = [];
+for (const [created, ms] of rows('waits.txt').map((r) => r.map(Number))) {
+  const w = windows.filter((x) => created >= x.from && created <= x.to).at(-1);
+  (w ? waitIn.get(w.label) : waitOut).push(ms);
+}
+const waitByWindow = [...waitIn].map(([label, xs]) => ({ window: label, ...waitStats(xs) }));
+const waitOutside = waitStats(waitOut);
 const conn = rows('pg-connections.txt').map((r) => Number(r[0].split(' ')[1]));
 
 const checks = [
@@ -63,6 +79,8 @@ const result = {
   perTenantMs: latency,
   retries: { tasks: plainTasks, retriesUsed: plainRetries },
   sideEffects: { httpCompleted: num('http_done'), executedMoreThanOnce: num('reexec') },
+  recovery: { leaseReclaims: num('reclaims'), requeuedByReconciler: num('requeued'), retriesByKind },
+  queueWaitMs: { outsideFaults: waitOutside, byFaultWindow: waitByWindow },
   peaks: { queueDepth: Number(read('peak-queue.txt')) || null, outboxLagSeconds: Number(read('peak-lag.txt')) || 0, pgConnections: num('peak_conn'), maxConnections: num('max_conn') },
   memoryBytes: memory,
   faults,
@@ -95,6 +113,13 @@ const md = [
   ``,
   `Immediate tasks only (sleep, echo, http), measured on the database clock.`,
   ``,
+  `Queue wait by when the task was created:`,
+  ``,
+  `| Created | Tasks | p50 / p95 / p99 / max |`,
+  `|---|---|---|---|`,
+  `| outside any fault window | ${waitOutside.n} | ${waitOutside.p50} / ${waitOutside.p95} / ${waitOutside.p99} / ${waitOutside.max} ms |`,
+  ...waitByWindow.map((w) => `| during ${w.window} (until 60 s after) | ${w.n} | ${w.p50} / ${w.p95} / ${w.p99} / ${w.max} ms |`),
+  ``,
   `## Faults`,
   ``,
   `| At | Event |`,
@@ -108,11 +133,18 @@ const md = [
   ``,
   `## Recovery cost`,
   ``,
-  `- Retries used by tasks that should succeed first time (sleep/echo/http): ${plainRetries} across ${plainTasks} tasks (lease reclaims after the crashes charge one).`,
+  `- Lease reclaims (a task taken over from a dead or frozen worker): ${num('reclaims')}. Tasks re-published by the reconciler: ${num('requeued')}.`,
+  `- Retries used by tasks that should succeed first time (sleep/echo/http): ${plainRetries} across ${plainTasks} tasks (each reclaim charges one).`,
+  `- Retries by kind: ${retriesByKind.map((r) => `${r.kind} ${r.retries} (${r.tasksRetried} tasks)`).join(', ')}.`,
   `- http side effects executed more than once: ${num('reexec')} of ${num('http_done')} (at-least-once execution: a task running when its worker died runs again).`,
   `- Peak queue depth (waiting + prioritized): ${result.peaks.queueDepth ?? 'n/a'}. Peak outbox lag: ${result.peaks.outboxLagSeconds.toFixed(1)} s.`,
   `- PostgreSQL connections: peak ${num('peak_conn')} of ${num('max_conn')} (sampled every 5 s; ${conn.length} samples).`,
-  ...memory.map((m) => `- ${m.job.replace(/^engine_|_process_resident_memory_bytes$/g, '')} resident memory (largest process): ${mb(m.early)} at 10% of the run, ${mb(m.late)} at the end.`),
+  ``,
+  `Resident memory of the largest process, 1-minute average (a worker restarts at ~15%, the API at 70%):`,
+  ``,
+  `| Process | ${memory[0]?.points.map((p) => `${p.pct}%`).join(' | ') ?? ''} |`,
+  `|---|${memory[0]?.points.map(() => '---').join('|') ?? ''}|`,
+  ...memory.map((m) => `| ${m.job} | ${m.points.map((p) => mb(p.bytes)).join(' | ')} |`),
   ``,
 ].join('\n');
 writeFileSync(`${out}/results.md`, md);
