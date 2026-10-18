@@ -16,6 +16,7 @@ function makeMockRedis(overrides: any = {}): any {
   };
 
   return {
+    status: 'ready',
     pipeline: jest.fn().mockReturnValue(pipeline),
     _pipeline: pipeline,
     ...overrides,
@@ -79,5 +80,33 @@ describe('RedisRateLimiter', () => {
 
     const pipeline = redis._pipeline;
     expect(pipeline.zremrangebyscore).toHaveBeenCalled();
+  });
+});
+
+describe('RedisRateLimiter while Redis is unavailable', () => {
+  // The API's Redis client waits for a reconnect instead of failing
+  // (maxRetriesPerRequest: null), so "fail open on error" alone never fired:
+  // the call simply waited, and every tenant request with it, for as long as
+  // Redis was down.
+  it('fails open within the timeout when Redis does not answer', async () => {
+    const redis = makeMockRedis();
+    redis._pipeline.exec.mockReturnValue(new Promise(() => {}));
+    const limiter = new RedisRateLimiter(redis, 60000, 100);
+
+    const started = Date.now();
+    const result = await limiter.check('tenant:t1', 10);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(result.allowed).toBe(true);
+  });
+
+  it('fails open at once, without queueing a command, while the client is not connected', async () => {
+    const redis = makeMockRedis({ status: 'reconnecting' });
+    const limiter = new RedisRateLimiter(redis, 60000, 100);
+
+    const started = Date.now();
+    const result = await limiter.check('tenant:t1', 10);
+    expect(Date.now() - started).toBeLessThan(50);
+    expect(result.allowed).toBe(true);
+    expect(redis.pipeline).not.toHaveBeenCalled();
   });
 });
