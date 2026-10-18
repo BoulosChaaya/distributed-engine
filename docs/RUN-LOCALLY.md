@@ -21,6 +21,42 @@ bash scripts/demo-local.sh
 ```
 
 <!-- output:start -->
+```text
+== Building and starting (first run builds the images: a few minutes)
+== Checking
+   ok    API /health (PostgreSQL + Redis)               200
+   ok    API rejects /tasks without the operator key    401
+   ok    API accepts the operator key                   200
+   ok    Dashboard asks for a login                     401
+   ok    Dashboard with the login from .env             200
+   ok    Prometheus is ready                            200
+   ok    Grafana is up                                  200
+   ok    Prometheus scrapes the API and 3 workers       4/4 up
+   ok    Worker containers running                      3
+   Dashboard   http://localhost:3001   user ops, password in .env
+   Grafana     http://localhost:3002   dashboard "Engine overview" (folder Engine)
+   Prometheus  http://localhost:9090
+   API         http://localhost:3000   operator key in .env (OPERATOR_API_KEY)
+   Stop and delete everything: bash scripts/demo-local.sh --down
+
+== Checking
+   ok    API /health (PostgreSQL + Redis)               200
+   ok    API rejects /tasks without the operator key    401
+   ok    API accepts the operator key                   200
+   ok    Dashboard asks for a login                     401
+   ok    Dashboard with the login from .env             200
+   ok    Prometheus is ready                            200
+   ok    Grafana is up                                  200
+   ok    Prometheus scrapes the API and 3 workers       4/4 up
+   ok    Worker containers running                      3
+
+   Dashboard   http://localhost:3001   user ops, password in .env
+   Grafana     http://localhost:3002   dashboard "Engine overview" (folder Engine)
+   Prometheus  http://localhost:9090
+   API         http://localhost:3000   operator key in .env (OPERATOR_API_KEY)
+
+   Stop and delete everything: bash scripts/demo-local.sh --down
+```
 <!-- output:end -->
 
 *(in the browser)* Open the dashboard at http://localhost:3001 (user `ops`,
@@ -41,6 +77,9 @@ echo ready
 ```
 
 <!-- output:start -->
+```text
+ready
+```
 <!-- output:end -->
 
 ## 3. One task, end to end
@@ -55,6 +94,18 @@ sql "SELECT event_type, status, attempts FROM outbox_events WHERE task_id = '$ID
 ```
 
 <!-- output:start -->
+```text
+9664da412d0b4facfcfe01cdf373eaf7 -> COMPLETED
+  status   | retries | version |                                result                                
+-----------+---------+---------+----------------------------------------------------------------------
+ COMPLETED |       0 |       3 | {"output": {"echo": {"hello": "laptop"}}, "processedBy": "dd4c2f0d"}
+(1 row)
+
+  event_type  |  status   | attempts 
+--------------+-----------+----------
+ TASK_CREATED | DELIVERED |        1
+(1 row)
+```
 <!-- output:end -->
 
 `version` counts every state change (QUEUED → PROCESSING → COMPLETED). The
@@ -72,6 +123,13 @@ sql "SELECT status, retries, result FROM tasks WHERE id = '$ID'"
 ```
 
 <!-- output:start -->
+```text
+e0eda8b2b38ff094a525311b701b0bca -> COMPLETED
+  status   | retries |                              result                              
+-----------+---------+------------------------------------------------------------------
+ COMPLETED |       2 | {"output": {"succeededOnAttempt": 3}, "processedBy": "1bb10846"}
+(1 row)
+```
 <!-- output:end -->
 
 ## 5. A tenant, with its own key, quota and idempotency
@@ -91,6 +149,11 @@ tenant $API/tenant/usage | field data.usage
 ```
 
 <!-- output:start -->
+```text
+first:  1925ca2e342cfb6c0478d5eb50ceb495  idempotent=false
+again:  1925ca2e342cfb6c0478d5eb50ceb495  idempotent=true
+{"acceptedJobs":1,"computeUnits":0,"storageMb":0,"billingPeriodStart":"2026-10-18T00:00:00.000Z"}
+```
 <!-- output:end -->
 
 The same key twice gives the same task, and the job is counted once.
@@ -111,6 +174,16 @@ sql "SELECT step_key, status, started_at::time(0) AS started, completed_at::time
 ```
 
 <!-- output:start -->
+```text
+step_key |  status   | started  | completed 
+----------+-----------+----------+-----------
+ start    | COMPLETED | 19:35:57 | 19:35:57
+ left     | COMPLETED | 19:35:57 | 19:35:58
+
+ right    | COMPLETED | 19:35:57 | 19:35:57
+ join     | COMPLETED | 19:35:58 | 19:35:58
+(4 rows)
+```
 <!-- output:end -->
 
 ## 7. A task scheduled for later
@@ -123,6 +196,10 @@ wait_status "$ID" COMPLETED
 ```
 
 <!-- output:start -->
+```text
+now:   SCHEDULED
+04c32c9090c4f5c50e61614ddb4a9a2a -> COMPLETED
+```
 <!-- output:end -->
 
 ## 8. Break it: kill a worker in the middle of work
@@ -145,10 +222,22 @@ docker start "$VICTIM" > /dev/null && echo "worker restarted"
 ```
 
 <!-- output:start -->
+```text
+killed worker 612ebd94f8fb
+  status   | count 
+-----------+-------
+ COMPLETED |    31
+(1 row)
+
+reclaimed after the kill: 5
+worker restarted
+```
 <!-- output:end -->
 
-In Grafana: **Workers up** drops to 2, **Job outcomes per worker** shows the
-others picking up the work.
+31 `sleep` tasks: these 30 and the workflow step from step 6. Each
+reclaim is a task the dead worker held, taken over once its lease expired
+(and charged one retry). In Grafana: **Workers up** drops to 2, **Job
+outcomes per worker** shows the others picking up the work.
 
 ## 9. Break it: stop Redis
 
@@ -176,6 +265,20 @@ echo "outbox PENDING after recovery: $pending"
 ```
 
 <!-- output:start -->
+```text
+Redis stopped
+submit while Redis is down: 201 in 0.003916s
+submit while Redis is down: 201 in 0.002481s
+submit while Redis is down: 201 in 0.003923s
+/health: 200 {"status":"degraded","timestamp":"2026-10-18T19:36:48.718Z","outboxCircuitBreaker":"CLOSED","dependencies":{"postgres":"up","redis":"down"}}
+ status  | count 
+---------+-------
+ PENDING |     3
+(1 row)
+
+Redis started
+outbox PENDING after recovery: 0
+```
 <!-- output:end -->
 
 In Grafana: **Queue (Redis)** goes DOWN and the queue panels show a gap (not
@@ -197,6 +300,13 @@ curl -s -o /dev/null -w "/ready after:        %{http_code}\n" $API/ready
 ```
 
 <!-- output:start -->
+```text
+PostgreSQL frozen
+/ready while frozen: 503 in 1.000984s
+/live while frozen:  200
+PostgreSQL resumed
+/ready after:        200
+```
 <!-- output:end -->
 
 `/live` stays 200 (the process is fine, so Kubernetes must not restart it);
@@ -220,6 +330,13 @@ wait_status "$HELD" COMPLETED
 ```
 
 <!-- output:start -->
+```text
+SUSPENDED
+new submission while suspended: 403
+due 6 s ago, tenant suspended: QUEUED
+ACTIVE
+0667fe69c92172122f39520e246abfc9 -> COMPLETED
+```
 <!-- output:end -->
 
 `QUEUED` while suspended: the scheduler released it on time, and the
@@ -233,10 +350,29 @@ stop, a PostgreSQL freeze and an API kill in the middle:
 
 ```bash
 bash scripts/demo-local.sh --down
-DURATION_MIN=3 OUT=/tmp/load-out bash scripts/load-test.sh | tail -15
+DURATION_MIN=3 OUT=/tmp/load-out bash scripts/load-test.sh 2>&1 | tail -15
 ```
 
 <!-- output:start -->
+```text
+Stopped and removed (data volumes deleted).
+
+== Draining (up to 900 s for every accepted task to finish)
+   drained in 57 s
+== Checking
+   ok: no accepted task lost
+   ok: every accepted task finished
+   ok: every task ended in its expected state
+   ok: every workflow completed
+   ok: every completed http task reached the sink
+   ok: idempotent replays returned the same task
+   ok: outbox has no PENDING events
+   ok: outbox has no FAILED events
+   ok: PostgreSQL connections stayed under max_connections
+   ok: k6 completed
+   RESULT: 2777 accepted, 15.26/s; submit p95 229.1 ms; drained in 57 s
+== LOAD TEST PASSED
+```
 <!-- output:end -->
 
 The full report is `/tmp/load-out/results.md`. The 60-minute run's numbers
@@ -251,6 +387,9 @@ bash scripts/demo-local.sh --down
 ```
 
 <!-- output:start -->
+```text
+Stopped and removed (data volumes deleted).
+```
 <!-- output:end -->
 
 ## When something does not work

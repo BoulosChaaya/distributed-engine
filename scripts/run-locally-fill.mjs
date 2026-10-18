@@ -11,7 +11,9 @@ const outputs = new Map();
 for (const part of log.split(/^@@@ /m).slice(1)) {
   const [head, ...rest] = part.split('\n');
   const m = head.match(/^step (\d+)/);
-  if (m) outputs.set(Number(m[1]), rest.join('\n').trim());
+  // Docker's build and container progress lines are noise in a guide.
+  const noise = /^(#\d+ |\s*(Container|Network|Volume|Image) \S+ |\[\+\]|\s*\S+\s+(Pulling|Pulled|Already exists|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Built|Waiting)\b)/;
+  if (m) outputs.set(Number(m[1]), rest.filter((l) => !noise.test(l)).join('\n').replace(/\n{3,}/g, '\n\n').trim());
 }
 let n = 0;
 const md = readFileSync(doc, 'utf8').replace(
