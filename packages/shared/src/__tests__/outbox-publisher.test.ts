@@ -524,7 +524,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should go CLOSED -> OPEN after failure threshold via internal state', () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,
@@ -545,7 +545,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should not open before reaching failure threshold', () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,
@@ -561,7 +561,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should reset failure count on success', () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,
@@ -602,7 +602,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should transition HALF_OPEN -> CLOSED after success threshold', async () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,
@@ -637,7 +637,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should transition HALF_OPEN -> OPEN on failure', () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,
@@ -655,7 +655,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
   it('should return 0 processed when circuit is OPEN', async () => {
     requireInfra();
 
-    let fakeNow = 1000;
+    const fakeNow = 1000;
     const cbPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3, {
       failureThreshold: 3,
       successThreshold: 2,

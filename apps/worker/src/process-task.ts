@@ -1,18 +1,19 @@
 import type { Job } from 'bullmq';
 import type { Span } from '@opentelemetry/api';
+import type { EffectiveLimits, RecurringSchedule, Task, TaskStatus, Tenant, TenantConcurrencyLease, TransitionExtra } from '@repo/shared';
 
 export interface TaskRepoLike {
   claimTtl: number;
-  getTask(taskId: string): Promise<any>;
-  transitionStatus(taskId: string, version: number, status: string, opts: any): Promise<any>;
-  reclaimStalledTask(taskId: string, version: number, workerId: string): Promise<any>;
-  renewClaim(taskId: string, claimToken: string): Promise<any>;
+  getTask(taskId: string): Promise<Task | null>;
+  transitionStatus(taskId: string, version: number, status: TaskStatus, opts?: TransitionExtra): Promise<Task>;
+  reclaimStalledTask(taskId: string, version: number, workerId: string): Promise<Task>;
+  renewClaim(taskId: string, claimToken: string): Promise<Task>;
   /** Workflow steps: outputs of direct dependencies keyed by step key. */
   getUpstreamOutputs?(taskId: string): Promise<Record<string, unknown>>;
 }
 
 export interface ScheduleRepoLike {
-  getSchedule(scheduleId: string): Promise<any>;
+  getSchedule(scheduleId: string): Promise<RecurringSchedule | null>;
   acquireExecutionLease(scheduleId: string, durationMs: number): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date }>;
   renewExecutionLease(scheduleId: string, leaseToken: string, durationMs: number): Promise<void>;
   releaseExecutionLease(scheduleId: string, leaseToken: string): Promise<void>;
@@ -40,9 +41,9 @@ export interface WorkerMetrics {
 }
 
 export interface TenantRepoLike {
-  getTenant(tenantId: string): Promise<any>;
-  getEffectiveLimits(tenantId: string): Promise<any>;
-  acquireConcurrencyLease(tenantId: string, taskId: string, workerId: string, maxConcurrent: number, leaseDurationMs: number): Promise<{ acquired: boolean; lease?: any }>;
+  getTenant(tenantId: string): Promise<Tenant | null>;
+  getEffectiveLimits(tenantId: string): Promise<EffectiveLimits>;
+  acquireConcurrencyLease(tenantId: string, taskId: string, workerId: string, maxConcurrent: number, leaseDurationMs: number): Promise<{ acquired: boolean; lease?: TenantConcurrencyLease }>;
   renewConcurrencyLease(leaseToken: string, leaseDurationMs: number): Promise<void>;
   releaseConcurrencyLease(leaseToken: string): Promise<void>;
 }
@@ -72,8 +73,8 @@ export interface ProcessTaskDeps {
    */
   cancelCheckIntervalMs?: number;
   workerMetrics: WorkerMetrics;
-  ClaimNotExpiredError: new (...args: any[]) => any;
-  DelayedError: new (...args: any[]) => any;
+  ClaimNotExpiredError: new (taskId: string, expiresAt: Date) => Error & { expiresAt: Date };
+  DelayedError: new (message?: string) => Error;
   /**
    * BullMQ's UnrecoverableError. Thrown when PostgreSQL says the retry budget
    * is spent but the BullMQ job still has attempts left (a job re-published by
@@ -317,10 +318,10 @@ export function createProcessTask(deps: ProcessTaskDeps) {
             await tenantRepo.releaseConcurrencyLease(concurrencyLeaseToken).catch(() => {});
             concurrencyLeaseToken = undefined;
           }
-          const deferUntil = (error as any).expiresAt.getTime() + leaseDeferralMarginMs;
+          const deferUntil = (error as InstanceType<ProcessTaskDeps['ClaimNotExpiredError']>).expiresAt.getTime() + leaseDeferralMarginMs;
           logger.info('Lease not expired, deferring job', {
             taskId,
-            expiresAt: (error as any).expiresAt.toISOString(),
+            expiresAt: (error as InstanceType<ProcessTaskDeps['ClaimNotExpiredError']>).expiresAt.toISOString(),
             deferUntil: new Date(deferUntil).toISOString(),
           });
           await job.moveToDelayed(deferUntil, job.token);

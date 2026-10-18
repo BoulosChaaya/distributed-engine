@@ -10,7 +10,7 @@ import {
   IdempotencyConflictError,
   computeBillingPeriodStart,
 } from '@repo/shared';
-import { CreateWorkflowSchema, PaginationSchema, ValidationError } from './validation.js';
+import { CreateWorkflowSchema, PaginationSchema, ValidationError, isZodError } from './validation.js';
 import { routeId } from './route-params.js';
 
 /**
@@ -28,7 +28,7 @@ function wrap(fn: (req: Request, res: Response) => Promise<unknown>): RequestHan
     try {
       await fn(req, res);
     } catch (error) {
-      if (error instanceof Error && error.name === 'ZodError') next(new ValidationError(error as any));
+      if (isZodError(error)) next(new ValidationError(error));
       else if (error instanceof WorkflowValidationError) next(new AppError(422, error.message));
       else if (error instanceof WorkflowStateError) next(new AppError(409, error.message));
       else if (error instanceof IdempotencyConflictError) next(new AppError(409, error.message));

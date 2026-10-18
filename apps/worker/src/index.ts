@@ -343,7 +343,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   });
 
   heartbeatInterval = setInterval(() => {
-    updateWorkerStatus();
+    // updateWorkerStatus catches and logs its own errors.
+    void updateWorkerStatus();
   }, 10000);
 
   await updateWorkerStatus();

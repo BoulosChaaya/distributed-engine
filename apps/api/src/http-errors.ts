@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppError } from '@repo/shared';
-import { ValidationError } from './validation.js';
+import { ValidationError, isZodError } from './validation.js';
 
 interface ErrorLogger {
   error(msg: string, meta?: Record<string, unknown>): void;
@@ -45,8 +45,8 @@ export function createErrorHandler(deps: { logger: ErrorLogger; recordError: () 
 
     // Any route that let a ZodError through (e.g. bad query strings on list
     // routes) is still a client error, never a 500.
-    if (err instanceof Error && err.name === 'ZodError') {
-      err = new ValidationError(err as any);
+    if (isZodError(err)) {
+      err = new ValidationError(err);
     }
 
     if (err instanceof ValidationError) {

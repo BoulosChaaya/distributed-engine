@@ -1,0 +1,7 @@
+{
+  "//": "Used only by ESLint for type information, so test files are linted too. Tests are compiled by ts-jest with its own settings.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "./src" },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

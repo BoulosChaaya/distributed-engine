@@ -4,6 +4,8 @@ import { TenantRepository, RedisRateLimiter } from '@repo/shared';
 import type { Tenant } from '@repo/shared';
 
 declare global {
+  // Express's own type augmentation point is a namespace; there is no module form.
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       tenant?: Tenant;

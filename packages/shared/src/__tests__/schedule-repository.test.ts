@@ -883,17 +883,17 @@ describe('Execution lease primitives (requires PostgreSQL)', () => {
       overlapPolicy: 'FORBID_OVERLAP',
     });
 
-    const occ1 = await scheduleRepo.generateOccurrence(
+    await scheduleRepo.generateOccurrence(
       schedule.id,
       new Date('2025-01-01T00:00:00Z'),
       new Date('2025-01-01T01:00:00Z'),
     );
-    const occ2 = await scheduleRepo.generateOccurrence(
+    await scheduleRepo.generateOccurrence(
       schedule.id,
       new Date('2025-01-01T01:00:00Z'),
       new Date('2025-01-01T02:00:00Z'),
     );
-    const occ3 = await scheduleRepo.generateOccurrence(
+    await scheduleRepo.generateOccurrence(
       schedule.id,
       new Date('2025-01-01T02:00:00Z'),
       new Date('2025-01-01T03:00:00Z'),

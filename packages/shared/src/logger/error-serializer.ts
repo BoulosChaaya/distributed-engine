@@ -33,7 +33,7 @@ function scrubCredentials(text: string): string {
 }
 
 function sanitizeMessage(message: string): string {
-  let result = scrubCredentials(message);
+  const result = scrubCredentials(message);
   if (result.length > MAX_MESSAGE_LENGTH) {
     return result.substring(0, MAX_MESSAGE_LENGTH) + '…[truncated]';
   }

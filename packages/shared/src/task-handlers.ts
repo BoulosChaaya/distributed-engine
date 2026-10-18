@@ -240,6 +240,9 @@ export async function runTaskHandler(
     return boundResult(await handler({ ...ctx, signal }));
   } catch (error) {
     if (timeout.aborted && !ctx.signal.aborted) {
+      // The caught error is only the AbortSignal's TimeoutError; this message
+      // says everything it did. (`cause` needs lib ES2022; we target ES2020.)
+      // eslint-disable-next-line preserve-caught-error
       throw new Error(`task timed out after ${timeoutMs}ms`);
     }
     throw error;

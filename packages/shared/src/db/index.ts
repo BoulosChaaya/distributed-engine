@@ -1,6 +1,6 @@
 export { runMigrations, waitForPostgres } from './migrations.js';
 export { TaskRepository, StaleVersionError, ClaimTokenMismatchError, ClaimNotExpiredError, RetryBudgetExhaustedError, TaskNotRetryableError, rowToTask } from './task-repository.js';
-export type { CreateTaskInput, TaskWithOutbox, AcceptTaskInput, AcceptTaskResult } from './task-repository.js';
+export type { CreateTaskInput, TransitionExtra, TaskWithOutbox, AcceptTaskInput, AcceptTaskResult } from './task-repository.js';
 export { OutboxPublisher } from './outbox-publisher.js';
 export type { CircuitState } from './outbox-publisher.js';
 export { TaskReconciler } from './task-reconciler.js';
