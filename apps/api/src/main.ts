@@ -46,7 +46,7 @@ import { buildDefaultJobOptions } from './queue-options.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
 import { createWorkflowRouter } from './workflow-routes.js';
 import { buildRedisOptions } from './redis-options.js';
-import { MetricsCollector } from './metrics.js';
+import { MetricsCollector, PostgresTimeoutError } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
 import { notFoundHandler, createErrorHandler } from './http-errors.js';
 import { config } from './config.js';
@@ -213,7 +213,7 @@ app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => 
     const metricsData = await metrics.getMetrics();
     res.json({ success: true, data: metricsData, timestamp: new Date() });
   } catch (error) {
-    next(error);
+    next(error instanceof PostgresTimeoutError ? new AppError(503, error.message) : error);
   }
 });
 
@@ -225,7 +225,7 @@ app.get('/metrics/prometheus', async (_req: Request, res: Response, next: NextFu
     const { contentType, body } = await metrics.prometheus();
     res.type(contentType).send(body);
   } catch (error) {
-    next(error);
+    next(error instanceof PostgresTimeoutError ? new AppError(503, error.message) : error);
   }
 });
 
