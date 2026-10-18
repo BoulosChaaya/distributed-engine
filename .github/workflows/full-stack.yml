@@ -49,6 +49,23 @@ jobs:
         if: always()
         run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/metrics.log" compose-metrics 40
 
+  # docs/RUN-LOCALLY.md is run top to bottom, as a person would follow it.
+  run-locally:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Follow docs/RUN-LOCALLY.md
+        run: |
+          set -o pipefail
+          bash scripts/check-run-locally.sh 2>&1 | tee "$RUNNER_TEMP/run-locally.log"
+      - name: Publish result as annotations
+        if: always()
+        run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/run-locally.log" run-locally 400
+
   kind-istio:
     runs-on: ubuntu-latest
     timeout-minutes: 40
