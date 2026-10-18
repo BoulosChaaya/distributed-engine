@@ -70,9 +70,9 @@ ghcr.io/<owner>/distributed-engine-web:<git sha>
 To build them yourself:
 
 ```bash
-docker build -f Dockerfile.api    -t distributed-engine-api:0.1.0 .
-docker build -f Dockerfile.worker -t distributed-engine-worker:0.1.0 .
-docker build -f Dockerfile.web    -t distributed-engine-web:0.1.0 .
+docker build -f Dockerfile.api    -t distributed-engine-api:1.0.0 .
+docker build -f Dockerfile.worker -t distributed-engine-worker:1.0.0 .
+docker build -f Dockerfile.web    -t distributed-engine-web:1.0.0 .
 ```
 
 All three run as a non-root user (uid 1001) under `dumb-init`.

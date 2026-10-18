@@ -56,7 +56,7 @@ export function initTelemetry(config: TelemetryConfig): void {
 
   const resource = resourceFromAttributes({
     [ATTR_SERVICE_NAME]: config.serviceName,
-    [ATTR_SERVICE_VERSION]: config.serviceVersion ?? '0.1.0',
+    [ATTR_SERVICE_VERSION]: config.serviceVersion ?? '1.0.0',
     'deployment.environment': process.env.NODE_ENV ?? 'development',
   });
 

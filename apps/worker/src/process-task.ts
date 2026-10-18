@@ -372,8 +372,9 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       }, renewalIntervalMs);
 
       // Cancellation is a status change in PostgreSQL, which the handler cannot
-      // see. Without this check a cancelled task kept running until it finished
-      // or the next renewal failed (up to 10 s), and its result was discarded.
+      // see. Without this check a cancelled task would keep running until it
+      // finished or the next renewal failed (up to 10 s), and its result would
+      // be discarded.
       if (cancelCheckIntervalMs > 0) {
         cancelTimer = setInterval(async () => {
           try {

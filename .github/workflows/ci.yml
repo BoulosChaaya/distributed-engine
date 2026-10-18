@@ -101,8 +101,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Image names must be lowercase; the repository owner (BoulosChaaya) is not. Using it as-is
-      # made every push to main fail at "docker build -t", so no image was ever published.
+      # Image names must be lowercase; the repository owner (BoulosChaaya) is not, and
+      # `docker build -t` rejects an uppercase name.
       - name: Image names
         id: names
         run: |

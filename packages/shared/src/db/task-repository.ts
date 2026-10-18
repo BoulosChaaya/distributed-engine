@@ -270,10 +270,10 @@ export class TaskRepository {
    * Take over a PROCESSING task whose lease expired (its worker died or hung).
    *
    * The lost run counts as an attempt and is charged to the retry budget, as
-   * the reconciler already does for the same situation. Without that, a task
-   * whose execution kills its worker (a "poison" task) was reclaimed for free
+   * the reconciler does for the same situation. Without that, a task whose
+   * execution kills its worker (a "poison" task) would be reclaimed for free
    * until BullMQ's own stall limit gave up, then requeued by the reconciler,
-   * which charged only then: three worker crashes per retry. When the budget
+   * which charges only then: three worker crashes per retry. When the budget
    * is already spent the task is failed here and RetryBudgetExhaustedError
    * is thrown, so the caller does not run it again.
    */

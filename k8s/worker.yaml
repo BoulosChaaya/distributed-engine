@@ -40,7 +40,7 @@ spec:
 
       containers:
       - name: worker
-        image: distributed-engine-worker:0.1.0
+        image: distributed-engine-worker:1.0.0
         imagePullPolicy: IfNotPresent
 
         env:

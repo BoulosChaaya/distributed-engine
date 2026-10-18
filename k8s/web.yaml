@@ -28,7 +28,7 @@ spec:
         emptyDir: {}
       containers:
       - name: web
-        image: distributed-engine-web:0.1.0
+        image: distributed-engine-web:1.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3001

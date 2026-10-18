@@ -97,8 +97,8 @@ export class SchedulerService {
 
   /**
    * Sleep until the next known due time instead of always the full interval.
-   * With a fixed 5 s poll, a task could start up to 5 s after its time (4.8 s
-   * was recorded). After each poll the scheduler now asks PostgreSQL how long
+   * A fixed 5 s poll would start a task up to 5 s after its time. After each
+   * poll the scheduler asks PostgreSQL how long
    * until the earliest SCHEDULED task or ACTIVE schedule is due, on the
    * database clock, and wakes then (at least MIN_WAKE_DELAY_MS, at most the
    * poll interval). Work created during the sleep for a time inside it is
@@ -202,8 +202,8 @@ export class SchedulerService {
     switch (misfirePolicy) {
       case 'SKIP_MISSED': {
         // Run the most recent occurrence only if it is on time; never make up
-        // for missed ones. Before this, SKIP_MISSED ran the oldest missed
-        // occurrence after any downtime, exactly like RUN_ONCE.
+        // for missed ones. Running the oldest missed occurrence after downtime
+        // is RUN_ONCE's behaviour, not this policy's.
         const nextFuture = getNextOccurrence(schedule.cronExpression, schedule.timezone, dbNow);
         const latest = getLatestOccurrence(schedule.cronExpression, schedule.timezone, dbNow);
         const scheduledFor = latest > schedule.nextRunAt ? latest : schedule.nextRunAt;

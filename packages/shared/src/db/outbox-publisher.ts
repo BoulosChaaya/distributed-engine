@@ -171,10 +171,11 @@ export class OutboxPublisher {
    * terminal state (a tenant's concurrency slot is free again). Delivered at
    * commit, so a wake-up never arrives before the row is visible.
    *
-   * Why: with tenant admission a freed slot was only refilled on the next
-   * poll, so a tenant ran at most maxConcurrent tasks per (interval + run
-   * time): about 4/s for a limit of 5 and 1 s polls, whatever the workers
-   * could do. And every task waited 0 to 1 s just to be published.
+   * Why: with tenant admission, a freed slot would otherwise be refilled
+   * only on the next poll, so a tenant would run at most maxConcurrent tasks
+   * per (interval + run time): about 4/s for a limit of 5 and 1 s polls,
+   * whatever the workers could do. And every task would wait 0 to 1 s just
+   * to be published.
    *
    * Notifications are a shortcut, not the mechanism: polling continues at
    * pollIntervalMs, so a lost notification or a dropped LISTEN connection
@@ -560,14 +561,14 @@ export class OutboxPublisher {
    * running, or in a retry backoff). Slots = limit - in-flight, and 0 for a
    * SUSPENDED tenant. Publishing only into free slots means BullMQ only holds
    * jobs that can start now, so the outbox (ordered by priority, then age) is
-   * the tenant's waiting room. Before, every job was published at once and
-   * the ones over the limit were deferred and retried every 2 s by the
-   * workers: random start order, and a backlog of N tasks cost ~N/2 deferral
-   * round trips per second against PostgreSQL.
+   * the tenant's waiting room. Publishing every job at once instead would
+   * leave the workers to defer the ones over the limit and retry them every
+   * 2 s: random start order, and a backlog of N tasks would cost ~N/2
+   * deferral round trips per second against PostgreSQL.
    *
    * This is a soft gate: two API replicas can both see a free slot and admit
    * one job each. The worker's concurrency lease stays the hard limit and
-   * defers the extra job, as before.
+   * defers the extra job.
    */
   private async admissionSlots(client: import('pg').PoolClient, tenantIds: string[]): Promise<Map<string, number>> {
     const result = await client.query(

@@ -299,9 +299,15 @@ claim token, so a worker that lost its lease can never record an outcome.
 docker compose up -d postgres redis
 pnpm test            # unit + integration against real PostgreSQL and Redis
 pnpm verify          # build + test
+pnpm lint            # type-aware ESLint
 bash scripts/chaos-compose.sh       # full stack under a killed worker and a flushed Redis
+bash scripts/metrics-compose.sh     # Prometheus scraping the API and workers, including with Redis down
 bash scripts/k8s-kind-e2e.sh        # kind + Istio ambient + runtime verifier (needs images built)
+DURATION_MIN=10 bash scripts/load-test.sh   # three tenants under load, with a worker, Redis, PostgreSQL and the API failing mid-run
 ```
+
+The 60-minute run: 57,495 tasks at 16/s through four faults, nothing lost, every
+task in its expected final state ([docs/load-test.md](docs/load-test.md)).
 
 Integration tests fail loudly when PostgreSQL or Redis is missing. They never
 skip silently.
@@ -322,10 +328,8 @@ scripts/      smoke, chaos, kind e2e, demo
 docs/         runbooks (backup/restore, Redis-loss recovery, deployment)
 ```
 
-## Not Included (Yet)
+## Known Limits
 
-- Queue-depth autoscaling (the metrics exist; a KEDA/adapter setup does not)
-- A Prometheus scrape setup for Kubernetes (compose has one)
-- Workflows started by cron schedules (schedules create single tasks today)
-- A dead-letter queue beyond FAILED tasks; saga/compensation
-- TLS at the Gateway (environment-specific certificates)
+What the engine does not do, or does only within bounds (at-least-once
+execution, one PostgreSQL primary, the connection ceiling, features not
+built), with the reasoning for each: [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).
