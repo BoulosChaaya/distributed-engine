@@ -47,6 +47,7 @@ import { createWorkflowRouter } from './workflow-routes.js';
 import { buildRedisOptions } from './redis-options.js';
 import { MetricsCollector } from './metrics.js';
 import { ShutdownManager } from './shutdown.js';
+import { notFoundHandler, createErrorHandler } from './http-errors.js';
 import { config } from './config.js';
 
 initTelemetry({
@@ -742,42 +743,8 @@ app.get('/tenant/usage', tenantAuth, rateLimitMiddleware, async (req: Request, r
   }
 });
 
-app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  metrics.recordError();
-
-  // Any route that let a ZodError through (e.g. bad query strings on list
-  // routes) is still a client error, never a 500.
-  if (err instanceof Error && err.name === 'ZodError') {
-    err = new ValidationError(err as any);
-  }
-
-  if (err instanceof ValidationError) {
-    return res.status(422).json({
-      success: false,
-      error: 'Validation error',
-      details: err.toJSON(),
-      timestamp: new Date(),
-    });
-  }
-
-  if (err instanceof AppError) {
-    return res.status(err.statusCode).json({
-      success: false,
-      error: err.message,
-      timestamp: new Date(),
-    });
-  }
-
-  logger.error('Unhandled error', {
-    errorType: err instanceof Error ? err.name : 'UnknownError',
-    reason: err instanceof Error ? err.message : String(err),
-  });
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error',
-    timestamp: new Date(),
-  });
-});
+app.use(notFoundHandler);
+app.use(createErrorHandler({ logger, recordError: () => metrics.recordError() }));
 
 async function start() {
   // Redis is not awaited: the API serves health and reads from PostgreSQL
