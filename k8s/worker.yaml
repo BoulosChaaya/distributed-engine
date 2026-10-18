@@ -59,6 +59,16 @@ spec:
           value: "INFO"
         - name: QUEUE_CONCURRENCY
           value: "5"
+        # Failure detection: crash -> reclaim in ~16 s instead of ~35 s
+        # (defaults 30000/5000/30000). Lock and claim TTL stay equal; 15 s
+        # stays far above any event-loop pause of the built-in handlers.
+        # See DEPLOYMENT.md "Failure detection timing".
+        - name: WORKER_LOCK_DURATION_MS
+          value: "15000"
+        - name: WORKER_STALLED_INTERVAL_MS
+          value: "2000"
+        - name: TASK_CLAIM_TTL_MS
+          value: "15000"
         - name: POSTGRES_HOST
           value: "postgres.distributed-engine.svc.cluster.local"
         - name: POSTGRES_PORT
