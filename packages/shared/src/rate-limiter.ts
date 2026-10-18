@@ -6,10 +6,24 @@ export interface RateLimitResult {
   resetAtMs: number;
 }
 
+/**
+ * Sliding-window rate limit per key in Redis. It is a guard against bursts,
+ * not an accounting of record (quotas are enforced in PostgreSQL when a task
+ * is accepted), so it fails open: with Redis unavailable a request is let
+ * through rather than refused or held.
+ *
+ * Failing open has to be fast. The API's Redis client waits for a reconnect
+ * instead of failing commands (maxRetriesPerRequest: null), so a command sent
+ * during an outage neither errors nor returns: it waits. Without a bound
+ * every tenant request waited for Redis to come back, although accepting a
+ * task needs only PostgreSQL. So: not connected -> allow at once, without
+ * queueing a command; connected but slow -> allow after timeoutMs.
+ */
 export class RedisRateLimiter {
   constructor(
     private redis: IORedis,
     private windowMs: number = 60000,
+    private timeoutMs: number = 1000,
   ) {}
 
   async check(key: string, limit: number): Promise<RateLimitResult> {
@@ -17,6 +31,10 @@ export class RedisRateLimiter {
     const windowStart = now - this.windowMs;
     const redisKey = `ratelimit:${key}`;
 
+    const allowAll = { allowed: true, remaining: limit, resetAtMs: now + this.windowMs };
+    if (this.redis.status !== 'ready') return allowAll;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const pipeline = this.redis.pipeline();
       pipeline.zremrangebyscore(redisKey, '-inf', windowStart);
@@ -24,7 +42,8 @@ export class RedisRateLimiter {
       pipeline.zcard(redisKey);
       pipeline.pexpire(redisKey, this.windowMs);
 
-      const results = await pipeline.exec();
+      const timedOut = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), this.timeoutMs); });
+      const results = await Promise.race([pipeline.exec(), timedOut]);
       if (!results) {
         return { allowed: true, remaining: limit, resetAtMs: now + this.windowMs };
       }
@@ -35,7 +54,9 @@ export class RedisRateLimiter {
 
       return { allowed, remaining, resetAtMs: now + this.windowMs };
     } catch {
-      return { allowed: true, remaining: limit, resetAtMs: now + this.windowMs };
+      return allowAll;
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

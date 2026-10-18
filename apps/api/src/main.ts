@@ -97,7 +97,8 @@ const taskRepo = new TaskRepository(pgPool);
 const scheduleRepo = new ScheduleRepository(pgPool);
 const tenantRepo = new TenantRepository(pgPool);
 const workflowRepo = new WorkflowRepository(pgPool);
-const rateLimiter = new RedisRateLimiter(redisClient);
+// Fails open after the same budget the health checks use when Redis is slow.
+const rateLimiter = new RedisRateLimiter(redisClient, 60000, config.health.dependencyTimeoutMs);
 
 const tenantAuth = createTenantAuth(tenantRepo);
 const rateLimitMiddleware = createRateLimitMiddleware(rateLimiter, tenantRepo);
