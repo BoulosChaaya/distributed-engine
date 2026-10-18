@@ -182,7 +182,8 @@ They answer 503 if no key is configured.
 | PUT | /workflows/:id/cancel | Cancel the workflow and every unfinished step |
 | POST/GET/PUT | /schedules, /schedules/:id | Cron schedules |
 | PUT | /schedules/:id/status | ACTIVE / PAUSED / DISABLED |
-| GET | /metrics | JSON: task counts, queue depth, outbox |
+| GET | /metrics | JSON: task counts, queue depth, outbox (read by the dashboard) |
+| GET | /metrics/prometheus | The same numbers plus process stats, in Prometheus format |
 | GET | /workers | Live workers (heartbeats) |
 | GET | /plans | Plans |
 | GET/POST | /tenants | List / create (returns the tenant key **once**) |
@@ -320,7 +321,8 @@ docs/         runbooks (backup/restore, Redis-loss recovery, deployment)
 
 ## Not Included (Yet)
 
-- Prometheus-format metrics (`/metrics` is JSON), so no queue-depth autoscaling
+- Queue-depth autoscaling (the metrics exist; a KEDA/adapter setup does not)
+- A Prometheus scrape setup for Kubernetes (compose has one)
 - Workflows started by cron schedules (schedules create single tasks today)
 - A dead-letter queue beyond FAILED tasks; saga/compensation
 - TLS at the Gateway (environment-specific certificates)

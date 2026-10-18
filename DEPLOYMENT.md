@@ -46,7 +46,10 @@ open http://localhost:3001      # dashboard (Basic auth)
 ```
 
 Optional profiles: `--profile tracing` (OTel collector + Jaeger on :16686),
-`--profile logging` (Alloy + Loki + Grafana), `--profile observability` (both).
+`--profile logging` (Alloy + Loki + Grafana on :3002), `--profile metrics`
+(Prometheus on :9090, scraping the API and every worker), `--profile
+observability` (all of them; Grafana gets the "Engine overview" dashboard).
+Check with `bash scripts/metrics-compose.sh`.
 
 Chaos run (kills a worker and flushes Redis mid-run, then checks every task
 completed): `bash scripts/chaos-compose.sh`.
@@ -216,8 +219,9 @@ keep the defaults.
   reconciler at a time (advisory lock). Scheduler instances share work via
   `FOR UPDATE SKIP LOCKED`.
 - Workers: stateless; HPA 5–20 replicas; `QUEUE_CONCURRENCY` jobs each.
-- Queue-depth autoscaling is not configured. It needs Prometheus-format
-  metrics and an adapter such as KEDA, and `/metrics` is JSON today.
+- Queue-depth autoscaling is not configured. The metrics exist
+  (`engine_queue_jobs` on `/metrics/prometheus`); an in-cluster Prometheus
+  and an adapter such as KEDA do not.
 - PostgreSQL connections: every pod has its own pool, so the worst case is
   `HPA maxReplicas × POSTGRES_MAX_CONNECTIONS` per service. The manifests set
   api 10 × 10 and worker 20 × 7 (`QUEUE_CONCURRENCY` + 2) = 240, and

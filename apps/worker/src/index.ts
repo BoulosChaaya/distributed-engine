@@ -21,6 +21,7 @@ import {
 import { randomUUID } from 'crypto';
 import { createProcessTask, computeRenewalInterval, validateScheduleLeaseDuration } from './process-task.js';
 import { parseStrictIntInRange } from './config.js';
+import { createWorkerRegistry } from './metrics.js';
 
 initTelemetry({
   serviceName: 'distributed-engine-worker',
@@ -252,10 +253,18 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   await runMigrations(pgPool);
   logger.info('Database migrations complete');
 
+  const metricsRegistry = createWorkerRegistry(workerMetrics, WORKER_ID);
   healthServer = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'alive' }));
+    } else if (req.method === 'GET' && req.url === '/metrics') {
+      // Counters and process stats only, no task data, so it shares the
+      // unauthenticated health port (cluster-internal in k8s).
+      metricsRegistry.metrics().then(
+        (body) => { res.writeHead(200, { 'Content-Type': metricsRegistry.contentType }); res.end(body); },
+        (error) => { res.writeHead(500); res.end(String(error)); },
+      );
     } else {
       res.writeHead(404);
       res.end();

@@ -608,6 +608,24 @@ export class OutboxPublisher {
     return result.rows[0].count;
   }
 
+  /**
+   * Pending and failed counts plus the age in seconds of the oldest PENDING
+   * event (database clock; 0 when none), read in one statement so the three
+   * agree with each other. The age is publishing lag: a count can sit still
+   * while the publisher is stuck, the age keeps growing.
+   */
+  async getStats(): Promise<{ pending: number; failed: number; oldestPendingAgeSeconds: number }> {
+    const result = await this.pool.query(
+      `SELECT COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending,
+              COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed,
+              COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(created_at) FILTER (WHERE status = 'PENDING')), 0)::float8 AS age
+         FROM outbox_events
+        WHERE status IN ('PENDING', 'FAILED')`,
+    );
+    const row = result.rows[0];
+    return { pending: row.pending, failed: row.failed, oldestPendingAgeSeconds: row.age };
+  }
+
   async getFailedCount(): Promise<number> {
     const result = await this.pool.query(
       `SELECT COUNT(*)::int as count FROM outbox_events WHERE status = 'FAILED'`,
