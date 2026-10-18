@@ -32,6 +32,14 @@ export interface AcceptTaskResult {
   outboxEventId?: string;
 }
 
+/**
+ * Fields a status transition may also write. `undefined` leaves a column as
+ * it is; `error: null` clears it (a COMPLETED task has no current error).
+ */
+export type TransitionExtra = Partial<Pick<Task, 'result' | 'retries' | 'startedAt' | 'completedAt' | 'claimedBy' | 'claimToken'>> & {
+  error?: string | null;
+};
+
 export interface TaskWithOutbox {
   task: Task;
   outboxEvent: OutboxEvent;
@@ -149,7 +157,7 @@ export class TaskRepository {
     taskId: string,
     expectedVersion: number,
     toStatus: TaskStatus,
-    extra?: Partial<Pick<Task, 'error' | 'result' | 'retries' | 'startedAt' | 'completedAt' | 'claimedBy' | 'claimToken'>>,
+    extra?: TransitionExtra,
   ): Promise<Task> {
     const client = await this.pool.connect();
     try {

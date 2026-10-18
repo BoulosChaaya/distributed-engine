@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { randomBytes } from 'crypto';
 import { AppError, TenantRepository, computeBillingPeriodStart } from '@repo/shared';
-import { CreateTenantSchema, SetTenantStatusSchema, ValidationError } from './validation.js';
+import { CreateTenantSchema, SetTenantStatusSchema, ValidationError, isZodError } from './validation.js';
 import { hashApiKey } from './tenant-middleware.js';
 import { routeId } from './route-params.js';
 
@@ -26,8 +26,8 @@ function wrap(fn: (req: Request, res: Response) => Promise<unknown>) {
     try {
       await fn(req, res);
     } catch (error) {
-      if (error instanceof Error && error.name === 'ZodError') {
-        next(new ValidationError(error as any));
+      if (isZodError(error)) {
+        next(new ValidationError(error));
       } else if (error instanceof Error && error.message.includes('not found')) {
         next(new AppError(404, error.message));
       } else {

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { RedisRateLimiter, RateLimitResult } from '../rate-limiter';
+import { describe, it, expect, jest } from '@jest/globals';
+import { RedisRateLimiter } from '../rate-limiter';
 
 function makeMockRedis(overrides: any = {}): any {
   const pipeline = {

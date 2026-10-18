@@ -78,6 +78,14 @@ export const TenantCreateScheduleSchema = z.object({
 
 export type TenantCreateScheduleInput = z.infer<typeof TenantCreateScheduleSchema>;
 
+/**
+ * Matched by name, not instanceof: a schema built by another copy of zod
+ * (a dependency's) throws a ZodError from a different class.
+ */
+export function isZodError(error: unknown): error is z.ZodError {
+  return error instanceof Error && error.name === 'ZodError';
+}
+
 export class ValidationError extends Error {
   constructor(public errors: z.ZodError) {
     super('Validation error');

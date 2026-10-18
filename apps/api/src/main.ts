@@ -36,6 +36,7 @@ import {
   TenantSubmitTaskSchema,
   TenantCreateScheduleSchema,
   ValidationError,
+  isZodError,
 } from './validation.js';
 import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware.js';
 import { checkHealth, settleWithin } from './dependency-check.js';
@@ -202,7 +203,7 @@ app.get('/metrics', async (_req: Request, res: Response, next: NextFunction) => 
 
 app.get('/workers', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    let workers: unknown[] = [];
+    const workers: unknown[] = [];
     try {
       // SCAN, not KEYS: KEYS blocks Redis for the whole keyspace walk.
       const keys: string[] = [];
@@ -301,9 +302,9 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
       timestamp: new Date(),
     } as ApiResponse<Task>);
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
+    if (isZodError(error)) {
       logger.warn('Task creation rejected: validation error', { errorType: 'ValidationError' });
-      next(new ValidationError(error as any));
+      next(new ValidationError(error));
     } else {
       logger.error('Task creation failed', {
         errorType: error instanceof Error ? error.name : 'UnknownError',
@@ -429,8 +430,8 @@ app.post('/schedules', async (req: Request, res: Response, next: NextFunction) =
       timestamp: new Date(),
     } as ApiResponse<RecurringSchedule>);
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
-      next(new ValidationError(error as any));
+    if (isZodError(error)) {
+      next(new ValidationError(error));
     } else {
       logger.error('Schedule creation failed', {
         errorType: error instanceof Error ? error.name : 'UnknownError',
@@ -501,8 +502,8 @@ app.put('/schedules/:id', async (req: Request, res: Response, next: NextFunction
 
     res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
-      next(new ValidationError(error as any));
+    if (isZodError(error)) {
+      next(new ValidationError(error));
     } else if (error instanceof ScheduleStaleVersionError) {
       next(new AppError(409, error.message));
     } else if (error instanceof Error && error.message.includes('not found')) {
@@ -531,8 +532,8 @@ app.put('/schedules/:id/status', async (req: Request, res: Response, next: NextF
 
     res.json({ success: true, data: schedule, timestamp: new Date() } as ApiResponse<RecurringSchedule>);
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
-      next(new ValidationError(error as any));
+    if (isZodError(error)) {
+      next(new ValidationError(error));
     } else if (error instanceof ScheduleStaleVersionError) {
       next(new AppError(409, error.message));
     } else if (error instanceof Error && error.message.includes('not found')) {
@@ -577,8 +578,8 @@ app.post('/tenant/tasks', tenantAuth, rateLimitMiddleware, async (req: Request, 
       timestamp: new Date(),
     });
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
-      next(new ValidationError(error as any));
+    if (isZodError(error)) {
+      next(new ValidationError(error));
     } else if (error instanceof IdempotencyConflictError) {
       next(new AppError(409, error.message));
     } else if (error instanceof QuotaExceededError) {
@@ -702,8 +703,8 @@ app.post('/tenant/schedules', tenantAuth, rateLimitMiddleware, async (req: Reque
       timestamp: new Date(),
     } as ApiResponse<RecurringSchedule>);
   } catch (error) {
-    if (error instanceof Error && error.name === 'ZodError') {
-      next(new ValidationError(error as any));
+    if (isZodError(error)) {
+      next(new ValidationError(error));
     } else {
       next(error);
     }

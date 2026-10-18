@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { SchedulerService, SchedulerConfig } from '../scheduler/scheduler-service';
+import { SchedulerService } from '../scheduler/scheduler-service';
 import { ScheduleRepository, DuplicateOccurrenceError } from '../db/schedule-repository';
-import { RecurringSchedule, MisfirePolicy, OverlapPolicy } from '../types';
+import { RecurringSchedule } from '../types';
 
 function makeSchedule(overrides: Partial<RecurringSchedule> = {}): RecurringSchedule {
   return {

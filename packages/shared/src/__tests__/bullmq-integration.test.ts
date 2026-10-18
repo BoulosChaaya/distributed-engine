@@ -88,7 +88,7 @@ describe('Section 5: Lease deferral does not consume execution retry budget (req
       maxRetries: 1,
     });
 
-    const claimed = await testRepo.transitionStatus(task.id, task.version, 'PROCESSING', {
+    await testRepo.transitionStatus(task.id, task.version, 'PROCESSING', {
       startedAt: new Date(),
       claimedBy: 'worker-original',
     });
@@ -370,10 +370,8 @@ describe('Section 7: Healthy long task with renewal — foreign worker cannot re
             claimedBy: 'worker-owner',
           });
 
-          let claimToken = claimed.claimToken!;
-          let renewalTimer: ReturnType<typeof setInterval> | undefined;
-
-          renewalTimer = setInterval(async () => {
+          const claimToken = claimed.claimToken!;
+          const renewalTimer: ReturnType<typeof setInterval> = setInterval(async () => {
             try {
               await testRepo.renewClaim(taskId, claimToken);
             } catch {
