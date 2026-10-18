@@ -519,11 +519,14 @@ Concurrency leases compose with existing task claim leases and schedule executio
 
 When the concurrency limit is reached, the worker defers the job via `moveToDelayed` + `DelayedError`. This does **not** consume a BullMQ retry attempt — the same mechanism used for schedule lease deferral.
 
-**Ordering under the limit is not first-in, first-out.** A deferred job is retried 2 s later (`LEASE_DEFERRAL_MARGIN_MS`), and whichever deferred job happens to retry right after a slot frees takes it. Recorded with a limit of 1 and six queued tasks: they ran one at a time, and the task that took the slot first was not the first submitted (slow-1, submitted third, ran last). Priority is respected only up to the moment of the first deferral. Within one tenant this is fair over time (every waiting task retries at the same rate), but it does not keep submission order, and a waiting task's start time has 2 s of jitter.
+**Admission at publish time (FIFO by priority under the limit).** The outbox publisher only publishes a tenant's task into a free concurrency slot. Slots = the tenant's `max_concurrent_executions` minus its in-flight tasks, where in flight means QUEUED or PROCESSING with no PENDING outbox event: waiting in BullMQ, running, or waiting out a retry backoff. A SUSPENDED tenant has no slots, so its new work stays in the outbox until it is reactivated. The outbox is the tenant's waiting room, ordered by priority (CRITICAL, HIGH, NORMAL, LOW) and then age, so tasks start in that order. Tasks without a tenant are never held back, and weighted fair publishing between tenants is unchanged; admission only caps how much of a tenant's share it can use right now. `OUTBOX_TENANT_ADMISSION=false` turns it off.
 
-Why this is not "fixed" by letting only the oldest queued task take a free slot: a task waiting out a retry backoff (2 s, 4 s, 8 s, …) or one whose job Redis lost would then be the oldest and block every other task of its tenant until it runs, which is head-of-line blocking that turns a single bad task into a stalled tenant.
+Why at publish time and not in the worker. Before, every task was published at once and the worker deferred the ones over the limit by 2 s, again and again. Whichever deferred job retried right after a slot freed took it, so the start order was random (recorded: limit 1, six tasks, the third submitted ran last) and priority was lost at the first deferral. It also cost work proportional to the backlog: N waiting tasks meant about N/2 deferral round trips per second, each with PostgreSQL queries, for tasks that could not run.
 
-What a real fix looks like, if ordering matters: **admission at publish time**. The outbox publisher already orders work per tenant (oldest PENDING event first) and already knows the tenant of every event. It would publish a tenant's events only while that tenant's running + queued-in-Redis count is under its limit, so BullMQ only ever holds jobs that can run now, and the outbox is the FIFO waiting room. That changes how the publisher, the concurrency lease and the reconciler (which treats an unpublished QUEUED task as normal while its event is PENDING) interact, so it is a design change of its own, not a patch.
+What it costs, stated plainly:
+- A task in a retry backoff holds its slot until it runs again. With a limit of 1, the tenant's next task waits for the retry. That is the meaning of a concurrency limit protecting a tenant's downstream (a retry against a struggling upstream should not let more work pile in), but it is stricter than before, when other tasks ran during the backoff.
+- A task whose BullMQ job was lost (Redis flush) holds its slot until the reconciler requeues it (`RECONCILER_QUEUED_GRACE_MS`, default 60 s). Bounded, and the reconciler then puts it back in the waiting room.
+- It is a soft gate. Two API replicas can see the same free slot and both publish. The worker's concurrency lease (above) stays the hard limit and defers the extra job, so the limit is never exceeded; ordering is exact with one replica and close with several.
 
 ### Rate Limiting
 
@@ -546,7 +549,8 @@ Higher-weight tenants accumulate deficit more slowly, so they are selected more 
 ### Tenant Suspension
 
 - **API**: SUSPENDED tenants receive HTTP 403 on all tenant-scoped endpoints
-- **Worker**: Tasks belonging to SUSPENDED tenants are skipped (returned as `{status: 'SKIPPED', reason: 'tenant_suspended'}`) without consuming retries or leases
+- **Publisher**: new work of a SUSPENDED tenant is not published (no admission slots); it waits in the outbox and runs after reactivation
+- **Worker**: a task of a SUSPENDED tenant that was already published is deferred by `TENANT_SUSPENDED_RECHECK_MS` (default 60 s) without consuming retries or leases, and runs after reactivation
 - **In-flight**: Tasks already in PROCESSING continue to completion — suspension does not kill active work
 
 ## Service Mesh (Istio Ambient Mode)

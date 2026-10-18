@@ -107,7 +107,11 @@ const outboxPublisher = new OutboxPublisher(
   config.outbox.pollIntervalMs,
   config.outbox.batchSize,
   config.outbox.maxAttempts,
-  { fairScheduler: new WeightedFairScheduler(), publishTimeoutMs: config.outbox.publishTimeoutMs },
+  {
+    fairScheduler: new WeightedFairScheduler(),
+    publishTimeoutMs: config.outbox.publishTimeoutMs,
+    tenantAdmission: config.outbox.tenantAdmission,
+  },
 );
 
 const taskReconciler = new TaskReconciler(pgPool, taskQueue, {

@@ -30,6 +30,9 @@ const PRIORITY_MAP: Record<string, number> = {
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
+/** Waiting-room order inside a tenant under admission: higher priority first. */
+const PRIORITY_RANK_SQL = `CASE t.priority WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'NORMAL' THEN 1 ELSE 0 END`;
+
 export class PublishTimeoutError extends Error {
   constructor(timeoutMs: number) {
     super(`queue.add did not complete within ${timeoutMs}ms`);
@@ -78,6 +81,7 @@ export class OutboxPublisher {
   private readonly nowFn: () => number;
   private readonly fairScheduler?: WeightedFairScheduler;
   private readonly publishTimeoutMs: number;
+  private readonly tenantAdmission: boolean;
   private waitingForRedis = false;
 
   constructor(
@@ -95,6 +99,12 @@ export class OutboxPublisher {
       fairScheduler?: WeightedFairScheduler;
       /** Upper bound for one queue.add; a slower add counts as a failure. */
       publishTimeoutMs?: number;
+      /**
+       * Publish a tenant's events only while it has a free concurrency slot
+       * (see admissionSlots). Requires fairScheduler. Off by default in the
+       * library; the API turns it on (OUTBOX_TENANT_ADMISSION).
+       */
+      tenantAdmission?: boolean;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -104,6 +114,7 @@ export class OutboxPublisher {
     this.nowFn = circuitOptions?.nowFn ?? (() => Date.now());
     this.fairScheduler = circuitOptions?.fairScheduler;
     this.publishTimeoutMs = circuitOptions?.publishTimeoutMs ?? 5000;
+    this.tenantAdmission = (circuitOptions?.tenantAdmission ?? false) && !!this.fairScheduler;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -247,7 +258,9 @@ export class OutboxPublisher {
 
       const effectiveBatchSize = isHalfOpen ? 1 : this.batchSize;
 
-      const orderedRows = this.fairScheduler && effectiveBatchSize > 1
+      // With admission every tenant event goes through the per-tenant path,
+      // even a single event in HALF_OPEN, so no path bypasses the limit.
+      const orderedRows = this.fairScheduler && (effectiveBatchSize > 1 || this.tenantAdmission)
         ? await this.claimFairly(client, effectiveBatchSize)
         : await this.claimGlobalFifo(client, effectiveBatchSize);
 
@@ -356,6 +369,41 @@ export class OutboxPublisher {
     return result.rows as OutboxRow[];
   }
 
+  /**
+   * Free concurrency slots per tenant, for publish-time admission.
+   *
+   * A tenant's in-flight work is every task that has left the outbox and not
+   * finished: QUEUED or PROCESSING with no PENDING event (waiting in BullMQ,
+   * running, or in a retry backoff). Slots = limit - in-flight, and 0 for a
+   * SUSPENDED tenant. Publishing only into free slots means BullMQ only holds
+   * jobs that can start now, so the outbox (ordered by priority, then age) is
+   * the tenant's waiting room. Before, every job was published at once and
+   * the ones over the limit were deferred and retried every 2 s by the
+   * workers: random start order, and a backlog of N tasks cost ~N/2 deferral
+   * round trips per second against PostgreSQL.
+   *
+   * This is a soft gate: two API replicas can both see a free slot and admit
+   * one job each. The worker's concurrency lease stays the hard limit and
+   * defers the extra job, as before.
+   */
+  private async admissionSlots(client: import('pg').PoolClient, tenantIds: string[]): Promise<Map<string, number>> {
+    const result = await client.query(
+      `SELECT tn.id AS tenant_id,
+         CASE WHEN tn.status = 'SUSPENDED' THEN 0
+              ELSE COALESCE(o.max_concurrent_executions, p.max_concurrent_executions) END::int AS max_concurrent,
+         (SELECT COUNT(*) FROM tasks t
+           WHERE t.tenant_id = tn.id AND t.status IN ('QUEUED', 'PROCESSING')
+             AND NOT EXISTS (SELECT 1 FROM outbox_events oe WHERE oe.task_id = t.id AND oe.status = 'PENDING')
+         )::int AS in_flight
+       FROM tenants tn
+       JOIN plans p ON p.id = tn.plan_id
+       LEFT JOIN tenant_overrides o ON o.tenant_id = tn.id
+       WHERE tn.id = ANY($1)`,
+      [tenantIds],
+    );
+    return new Map(result.rows.map((r) => [r.tenant_id as string, Math.max(0, (r.max_concurrent as number) - (r.in_flight as number))]));
+  }
+
   private async claimFairly(
     client: import('pg').PoolClient,
     batchSize: number,
@@ -376,11 +424,19 @@ export class OutboxPublisher {
       [this.maxAttempts],
     );
 
-    if (tenantResult.rows.length <= 1) {
+    // One tenant (or none) needs no fair ordering, but with admission its
+    // events still have to respect its concurrency limit.
+    if (tenantResult.rows.length === 0 || (tenantResult.rows.length === 1 && !this.tenantAdmission)) {
       return this.claimGlobalFifo(client, batchSize);
     }
 
-    const tenantRows = tenantResult.rows as Array<{ tenant_id: string; weight: number; pending_count: number }>;
+    let tenantRows = tenantResult.rows as Array<{ tenant_id: string; weight: number; pending_count: number }>;
+    if (this.tenantAdmission) {
+      const slots = await this.admissionSlots(client, tenantRows.map((r) => r.tenant_id));
+      tenantRows = tenantRows
+        .map((r) => ({ ...r, pending_count: Math.min(r.pending_count, slots.get(r.tenant_id) ?? 0) }))
+        .filter((r) => r.pending_count > 0);
+    }
     const entries: TenantWeightEntry[] = tenantRows.map((r) => ({
       tenantId: r.tenant_id,
       weight: r.weight,
@@ -418,7 +474,7 @@ export class OutboxPublisher {
              AND (oe.claimed_by IS NULL OR oe.claimed_at < NOW() - INTERVAL '30 seconds')
              AND oe.attempts < $2
              AND t.tenant_id = $3
-           ORDER BY oe.created_at ASC
+           ORDER BY ${this.tenantAdmission ? `${PRIORITY_RANK_SQL} DESC, ` : ''}oe.created_at ASC
            LIMIT $4
            FOR UPDATE OF oe SKIP LOCKED
          )

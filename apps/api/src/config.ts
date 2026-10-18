@@ -22,6 +22,7 @@ export interface AppConfig {
   };
 
   outbox: {
+    tenantAdmission: boolean;
     pollIntervalMs: number;
     batchSize: number;
     maxAttempts: number;
@@ -94,6 +95,9 @@ export function loadConfig(): AppConfig {
     },
 
     outbox: {
+      // Publish a tenant's tasks only into free concurrency slots (FIFO by
+      // priority, then age). 'false' restores publish-everything + worker deferral.
+      tenantAdmission: process.env.OUTBOX_TENANT_ADMISSION !== 'false',
       pollIntervalMs: parseNumber(process.env.OUTBOX_POLL_INTERVAL_MS, 1000),
       batchSize: parseNumber(process.env.OUTBOX_BATCH_SIZE, 10),
       maxAttempts: parseNumber(process.env.OUTBOX_MAX_ATTEMPTS, 5),
