@@ -55,11 +55,11 @@ export class PublishTimeoutError extends Error {
  * eventual rejection is swallowed so it cannot surface as an unhandled
  * rejection, which would crash the process.
  */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what?: string): Promise<T> {
   promise.catch(() => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new PublishTimeoutError(timeoutMs)), timeoutMs);
+    timer = setTimeout(() => reject(what ? new Error(`${what} did not complete within ${timeoutMs}ms`) : new PublishTimeoutError(timeoutMs)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
@@ -82,6 +82,9 @@ export class OutboxPublisher {
   private listenerBackoffMs = 1000;
   private readonly droppedListeners = new WeakSet<Client>();
   private readonly wakeupMinGapMs: number;
+  private readonly listenerHeartbeatMs: number;
+  private readonly listenerTimeoutMs: number;
+  private listenerHeartbeat: ReturnType<typeof setInterval> | null = null;
   private activePoll: Promise<number> | null = null;
   private readonly publisherId: string;
   private readonly logger: Logger;
@@ -125,6 +128,12 @@ export class OutboxPublisher {
        * wake-up, so a burst of notifications becomes one poll. Default 25 ms.
        */
       wakeupMinGapMs?: number;
+      /**
+       * How often the LISTEN connection is checked with SELECT 1, and how
+       * long connect, LISTEN and that check may take. Defaults 15 s / 5 s.
+       */
+      listenerHeartbeatMs?: number;
+      listenerTimeoutMs?: number;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -136,6 +145,8 @@ export class OutboxPublisher {
     this.publishTimeoutMs = circuitOptions?.publishTimeoutMs ?? 5000;
     this.tenantAdmission = (circuitOptions?.tenantAdmission ?? false) && !!this.fairScheduler;
     this.wakeupMinGapMs = circuitOptions?.wakeupMinGapMs ?? 25;
+    this.listenerHeartbeatMs = circuitOptions?.listenerHeartbeatMs ?? 15_000;
+    this.listenerTimeoutMs = circuitOptions?.listenerTimeoutMs ?? 5_000;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -191,14 +202,17 @@ export class OutboxPublisher {
     });
     client.on('end', () => this.dropListener(client));
     try {
-      await client.connect();
-      await client.query('LISTEN outbox_wakeup');
+      // Bounded: connecting to an address that drops packets would otherwise
+      // wait for the kernel to give up (minutes) with no retry meanwhile.
+      await withTimeout(client.connect(), this.listenerTimeoutMs, 'connect');
+      await withTimeout(client.query('LISTEN outbox_wakeup'), this.listenerTimeoutMs, 'LISTEN');
       if (!this.running || this.droppedListeners.has(client)) {
         this.dropListener(client);
         return;
       }
       this.listener = client;
       this.listenerBackoffMs = 1000;
+      this.startListenerHeartbeat(client);
       this.logger.info('Outbox publisher listening for wake-ups');
       this.wake();
     } catch (error) {
@@ -207,10 +221,45 @@ export class OutboxPublisher {
     }
   }
 
+  /**
+   * A LISTEN connection only receives, so a dead peer that never closed the
+   * socket (a database moved to another address, a dropped NAT entry, a
+   * partition) is invisible: no error, no 'end', just no notifications
+   * ever again, and the publisher falls back to the poll interval without a
+   * word. Measured with the connection's packets dropped: publish-to-start
+   * went from 22 ms to 574-666 ms p50 and nothing was logged after 60 s.
+   * So the connection is asked SELECT 1 every listenerHeartbeatMs; no answer
+   * within listenerTimeoutMs drops it and reconnects.
+   */
+  private startListenerHeartbeat(client: Client): void {
+    this.stopListenerHeartbeat();
+    let inFlight = false;
+    this.listenerHeartbeat = setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
+      withTimeout(client.query('SELECT 1'), this.listenerTimeoutMs, 'SELECT 1').then(
+        () => { inFlight = false; },
+        (error) => {
+          inFlight = false;
+          this.logger.warn('Outbox wake-up connection stopped answering; reconnecting', { reason: String(error) });
+          this.dropListener(client);
+        },
+      );
+    }, this.listenerHeartbeatMs);
+  }
+
+  private stopListenerHeartbeat(): void {
+    if (this.listenerHeartbeat) clearInterval(this.listenerHeartbeat);
+    this.listenerHeartbeat = null;
+  }
+
   private dropListener(client: Client): void {
     if (this.droppedListeners.has(client)) return;
     this.droppedListeners.add(client);
-    if (this.listener === client) this.listener = null;
+    if (this.listener === client) {
+      this.listener = null;
+      this.stopListenerHeartbeat();
+    }
     client.removeAllListeners('notification');
     client.end().catch(() => {});
     if (!this.running || this.listenerRetryTimer) return;
