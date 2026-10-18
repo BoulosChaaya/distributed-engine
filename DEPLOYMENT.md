@@ -49,7 +49,8 @@ Optional profiles: `--profile tracing` (OTel collector + Jaeger on :16686),
 `--profile logging` (Alloy + Loki + Grafana on :3002), `--profile metrics`
 (Prometheus on :9090, scraping the API and every worker), `--profile
 observability` (all of them; Grafana gets the "Engine overview" dashboard).
-Check with `bash scripts/metrics-compose.sh`.
+Check with `bash scripts/metrics-compose.sh`. To run and try everything on a
+laptop step by step, see [docs/RUN-LOCALLY.md](docs/RUN-LOCALLY.md).
 
 Chaos run (kills a worker and flushes Redis mid-run, then checks every task
 completed): `bash scripts/chaos-compose.sh`.

@@ -192,6 +192,7 @@ services:
     container_name: engine-grafana
     profiles:
       - logging
+      - metrics
       - observability
     ports:
       # 3001 is the engine dashboard (web).
@@ -204,8 +205,11 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning
       - grafana_data:/var/lib/grafana
     depends_on:
+      # Only with the logging profile; with `metrics` alone Grafana shows
+      # Prometheus and the Loki datasource is simply unreachable.
       loki:
         condition: service_healthy
+        required: false
 
 secrets:
   operator_api_key:

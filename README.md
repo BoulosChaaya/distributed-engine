@@ -117,6 +117,8 @@ Full design: [ARCHITECTURE.md](ARCHITECTURE.md). Operations:
 
 ## Quick Start
 
+**Fastest path:** `bash scripts/demo-local.sh` starts everything (API, 3 workers, dashboard, Prometheus, Grafana) and checks it; [docs/RUN-LOCALLY.md](docs/RUN-LOCALLY.md) then walks through tasks, tenants, workflows and breaking things on purpose.
+
 Requirements: Node.js 22+, pnpm (via corepack), Docker.
 
 ```bash
