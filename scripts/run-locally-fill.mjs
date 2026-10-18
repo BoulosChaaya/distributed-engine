@@ -5,7 +5,8 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const doc = 'docs/RUN-LOCALLY.md';
-const log = readFileSync(process.argv[2], 'utf8').replace(/\x1b\[[0-9;]*m/g, '');
+// Strip terminal colour codes (ESC [ ... m).
+const log = readFileSync(process.argv[2], 'utf8').replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g'), '');
 const outputs = new Map();
 for (const part of log.split(/^@@@ /m).slice(1)) {
   const [head, ...rest] = part.split('\n');
