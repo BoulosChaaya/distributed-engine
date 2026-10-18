@@ -8,6 +8,10 @@ name: Full stack
 #   kind-istio:    the real k8s manifests on Kubernetes with Istio ambient,
 #                  including mTLS identity, AuthorizationPolicy deny paths and
 #                  a task driven through the Gateway.
+#   demo:          scripts/demo.sh, the guided tour, run unattended.
+#   run-locally:   docs/RUN-LOCALLY.md followed top to bottom, as a person
+#                  would on a laptop.
+# The load and endurance test is its own workflow (load.yml).
 on:
   pull_request:
     branches: [main]

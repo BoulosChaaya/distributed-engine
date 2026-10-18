@@ -4,8 +4,7 @@
  * A task's `name` is its type, the way a BullMQ job name or a Celery task name
  * is. The worker looks the name up in a registry and runs the matching
  * handler. A name with no handler fails immediately and permanently, because
- * retrying cannot make code appear. Before this module every task was a
- * hard-coded 2-second sleep.
+ * retrying cannot make code appear.
  *
  * Error contract (read by the worker):
  *  - NonRetryableTaskError: the task can never succeed as submitted (unknown

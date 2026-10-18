@@ -8,9 +8,9 @@ import { routeId } from './route-params.js';
 /**
  * Operator-only tenant provisioning (mounted behind operator auth).
  *
- * The tenant API (/tenant/*) authenticates with per-tenant API keys, but
- * until now there was no way to create a tenant or issue a key short of
- * writing SQL by hand. These routes close that gap.
+ * The tenant API (/tenant/*) authenticates with per-tenant API keys; these
+ * routes are how tenants and their keys are created, without writing SQL by
+ * hand.
  *
  * Keys are generated server-side (256 bits, base64url, `te_` prefix so a
  * leaked key is recognisable in logs and secret scanners). Only the SHA-256

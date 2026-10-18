@@ -77,9 +77,9 @@ pgPool.on('error', (err) => logger.error('PostgreSQL pool error', { errorType: e
 const redisOptions = buildRedisOptions(config.redis);
 
 // Connects in the background and keeps reconnecting forever (redisRetryStrategy:
-// 250 ms steps, capped at 2 s). It used to be lazyConnect + an explicit connect() at
-// startup: if Redis was not reachable at that moment, the BullMQ Queue sharing
-// this client failed its own initialisation and stayed broken
+// 250 ms steps, capped at 2 s). Not lazyConnect + an explicit connect() at
+// startup: if Redis were unreachable at that moment, a BullMQ Queue sharing
+// this client would fail its own initialisation and stay broken
 // ("Connection is closed") even after Redis came up.
 const redisClient = new IORedis(redisOptions);
 
