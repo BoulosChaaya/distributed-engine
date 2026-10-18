@@ -72,4 +72,9 @@ export default tseslint.config(
     files: ['**/*.mjs', '**/*.js', '**/*.cjs'],
     languageOptions: { globals: { ...globals.node } },
   },
+  {
+    // k6 scripts run in k6's JavaScript runtime, not Node.
+    files: ['load/k6/**/*.js'],
+    languageOptions: { globals: { __ENV: 'readonly', __VU: 'readonly', __ITER: 'readonly' } },
+  },
 );
