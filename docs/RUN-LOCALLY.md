@@ -153,7 +153,9 @@ others picking up the work.
 ## 9. Break it: stop Redis
 
 The queue is gone for 20 seconds. Tasks are still accepted (PostgreSQL is
-the source of truth); they wait in the outbox and go out when Redis is back:
+the source of truth); they wait in the outbox and go out when Redis is back.
+`/health` says `degraded` but stays 200: the API still serves, so a load
+balancer must keep sending it traffic:
 
 ```bash
 docker compose stop redis > /dev/null && echo "Redis stopped"
@@ -162,7 +164,7 @@ for i in 1 2 3; do
     -H "Authorization: Bearer $OPERATOR_API_KEY" -H 'Content-Type: application/json' \
     -X POST $API/tasks -d '{"name":"echo","payload":{}}'
 done
-curl -s -o /dev/null -w "/health: %{http_code}\n" $API/health
+curl -s -o /dev/null -w "/health: %{http_code} " $API/health; curl -s $API/health | field data
 sql "SELECT status, count(*) FROM outbox_events WHERE status <> 'DELIVERED' GROUP BY status"
 sleep 15
 docker compose start redis > /dev/null && echo "Redis started"
@@ -202,20 +204,26 @@ curl -s -o /dev/null -w "/ready after:        %{http_code}\n" $API/ready
 
 ## 11. Suspend a tenant
 
-A suspended tenant's work waits; nothing is lost and it runs after
-reactivation:
+A suspended tenant cannot submit (403), and work it already has waits
+instead of running; nothing is lost. Here a task is scheduled 6 seconds
+ahead, the tenant is suspended, and the task falls due while suspended:
 
 ```bash
+WHEN=$(node -e 'console.log(new Date(Date.now() + 6000).toISOString())')
+HELD=$(tenant -X POST $API/tenant/tasks -d "{\"name\":\"echo\",\"payload\":{\"held\":true},\"scheduledFor\":\"$WHEN\"}" | field data.id)
 api -X PUT $API/tenants/$TENANT_ID/status -d '{"status":"SUSPENDED"}' | field data.status
-HELD=$(tenant -X POST $API/tenant/tasks -d '{"name":"echo","payload":{"held":true}}' | field data.id)
-sleep 5
-echo "while suspended: $(api $API/tasks/$HELD | field data.status)"
+tenant -o /dev/null -w "new submission while suspended: %{http_code}\n" -X POST $API/tenant/tasks -d '{"name":"echo","payload":{}}'
+sleep 12
+echo "due 6 s ago, tenant suspended: $(api $API/tasks/$HELD | field data.status)"
 api -X PUT $API/tenants/$TENANT_ID/status -d '{"status":"ACTIVE"}' | field data.status
 wait_status "$HELD" COMPLETED
 ```
 
 <!-- output:start -->
 <!-- output:end -->
+
+`QUEUED` while suspended: the scheduler released it on time, and the
+outbox holds it back because a suspended tenant has no free slots.
 
 ## 12. A short load test
 
