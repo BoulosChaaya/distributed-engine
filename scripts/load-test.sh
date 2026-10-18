@@ -90,6 +90,12 @@ for t in heavy:10:10 medium:3:6 light:1:4; do
   echo "   load-${name}: weight ${weight}, max ${conc} concurrent, ${!rate_var}/s"
 done
 
+# Worker id per container, to find which one holds work when it is killed.
+declare -A WORKER_ID
+for c in $("${compose[@]}" ps -q worker); do
+  WORKER_ID[$c]=$(docker logs "$c" 2>&1 | grep -o '"workerId":"[a-f0-9]*"' | awk -F'"' 'NR == 1 {print $4}')
+done
+
 max_conn=$(sql "SHOW max_connections")
 echo "$max_conn" > "$OUT/max_connections.txt"
 
@@ -118,8 +124,25 @@ K6_PID=$!
 
 wait_until() { local t=$((START + $1)); while [ "$(now)" -lt "$t" ]; do sleep 1; done; }
 
+# The worker holding the most PROCESSING tasks right now, as "container count".
+# A kill only tests recovery if the victim holds work, so wait (up to 20 s)
+# until one does.
+busiest_worker() {
+  local best="" best_n=0 n c
+  for _ in $(seq 1 40); do
+    for c in "${!WORKER_ID[@]}"; do
+      n=$(sql "SELECT count(*) FROM tasks WHERE status = 'PROCESSING' AND claimed_by = '${WORKER_ID[$c]}'" 2>/dev/null || echo 0)
+      if [ "$n" -gt "$best_n" ]; then best=$c; best_n=$n; fi
+    done
+    [ "$best_n" -gt 0 ] && break
+    sleep 0.5
+  done
+  echo "${best:-$(cid worker)} $best_n"
+}
+
 ( set +e
-  wait_until "$(at 15)"; w=$(cid worker); mark "fault: SIGKILL worker ${w:0:12}"; docker kill "$w" >/dev/null
+  wait_until "$(at 15)"; read -r w held < <(busiest_worker)
+  docker kill "$w" >/dev/null; mark "fault: SIGKILL worker ${w:0:12} holding ${held} running tasks"
   sleep 30; mark "recover: worker restarted"; docker start "$w" >/dev/null
   wait_until "$(at 35)"; mark "fault: Redis stopped"; "${compose[@]}" stop redis >/dev/null 2>&1
   sleep 20; mark "recover: Redis started"; "${compose[@]}" start redis >/dev/null 2>&1
@@ -226,7 +249,7 @@ q "SELECT count(*), coalesce(sum(retries),0) FROM load_accepted a JOIN tasks t O
 
 # Prometheus over the load window (and memory at the start/end of the steady tail).
 win=$((END - START))
-promq "max_over_time((sum(max by (state) (engine_queue_jobs{state=~\"waiting|prioritized\"})))[${win}s:5s])" "$END" > "$OUT/peak-queue.txt" || true
+promq "max_over_time(sum(engine_queue_jobs{state=~\"waiting|prioritized\"})[${win}s:5s])" "$END" > "$OUT/peak-queue.txt" || true
 promq "max_over_time(max(engine_outbox_oldest_event_age_seconds{status=\"pending\"})[${win}s:5s])" "$END" > "$OUT/peak-lag.txt" || true
 # Largest process's resident memory at checkpoints through the run (1-min
 # average). A worker is restarted at ~15% and the API at 70%, so compare
