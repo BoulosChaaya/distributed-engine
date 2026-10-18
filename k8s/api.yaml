@@ -40,7 +40,7 @@ spec:
 
       containers:
       - name: api
-        image: distributed-engine-api:0.1.0
+        image: distributed-engine-api:1.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3000
