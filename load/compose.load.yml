@@ -1,0 +1,19 @@
+# Added on top of docker-compose.yml by scripts/load-test.sh.
+services:
+  # Records the side effects of the `http` tasks.
+  sink:
+    image: node:22-alpine
+    volumes:
+      - ./load/sink/server.mjs:/sink/server.mjs:ro
+    command: ["node", "/sink/server.mjs"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    environment:
+      HTTP_TASK_ALLOWED_HOSTS: sink

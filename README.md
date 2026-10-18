@@ -327,4 +327,3 @@ docs/         runbooks (backup/restore, Redis-loss recovery, deployment)
 - Workflows started by cron schedules (schedules create single tasks today)
 - A dead-letter queue beyond FAILED tasks; saga/compensation
 - TLS at the Gateway (environment-specific certificates)
-- Load and soak testing

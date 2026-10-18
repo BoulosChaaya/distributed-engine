@@ -1,0 +1,54 @@
+name: Load
+
+# Steady multi-tenant load with faults injected mid-run (scripts/load-test.sh).
+#   pull_request: an 8-minute run when the load test itself changes.
+#   workflow_dispatch: any length; the 60-minute endurance run is started
+#   this way and its numbers are recorded in docs/load-test.md.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'load/**'
+      - 'scripts/load-test.sh'
+      - 'scripts/load-report.mjs'
+      - '.github/workflows/load.yml'
+  workflow_dispatch:
+    inputs:
+      duration_min:
+        description: Minutes of load
+        default: '60'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DURATION_MIN: ${{ inputs.duration_min || '8' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Load test (${{ env.DURATION_MIN }} min, faults at 15/35/55/70%)
+        run: |
+          set -o pipefail
+          OUT="$RUNNER_TEMP/load-out" bash scripts/load-test.sh 2>&1 | tee "$RUNNER_TEMP/load.log"
+      # GitHub keeps at most 10 notices per step, hence one step each.
+      - name: Annotate log
+        if: always()
+        run: bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/load.log" load 60
+      - name: Annotate results
+        if: always()
+        run: |
+          bash scripts/ci-annotate-log.sh "$RUNNER_TEMP/load-out/results.md" load-results 200
+          if [ -f "$RUNNER_TEMP/load-out/results.md" ]; then cat "$RUNNER_TEMP/load-out/results.md" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Annotate results.json
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/load-out/results.json"
+          [ -f "$f" ] || exit 0
+          echo "::notice title=load-results.json::$(node -e 'process.stdout.write(JSON.stringify(require(process.argv[1])))' "$f" | sed 's/%/%25/g')"
