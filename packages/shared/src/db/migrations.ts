@@ -312,6 +312,14 @@ const MIGRATIONS = [
         CHECK (status IN ('SCHEDULED','BLOCKED','QUEUED','PROCESSING','COMPLETED','FAILED','CANCELLED'));
     `,
   },
+  {
+    version: 19,
+    name: 'add_delivered_outbox_prune_index',
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_outbox_events_delivered_processed_at
+        ON outbox_events(processed_at) WHERE status = 'DELIVERED';
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

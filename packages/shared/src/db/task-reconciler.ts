@@ -56,6 +56,13 @@ export interface TaskReconcilerOptions {
   intervalMs?: number;
   queuedGraceMs?: number;
   batchSize?: number;
+  /**
+   * Delete DELIVERED outbox events older than this. Undefined or 0 keeps them
+   * forever (the old behaviour). PENDING and FAILED events are never pruned.
+   */
+  deliveredOutboxRetentionMs?: number;
+  /** Rows per DELETE; up to PRUNE_MAX_BATCHES of them per cycle. */
+  pruneBatchSize?: number;
   logger?: Logger;
 }
 
@@ -64,6 +71,7 @@ export interface ReconcileResult {
   examined: number;
   requeued: number;
   failed: number;
+  pruned?: number;
 }
 
 interface CandidateRow {
@@ -73,6 +81,7 @@ interface CandidateRow {
 }
 
 const RECONCILER_LOCK_KEY = 7_340_021;
+const PRUNE_MAX_BATCHES = 10;
 
 const LIVE_JOB_STATES = new Set(['waiting', 'delayed', 'prioritized', 'active', 'waiting-children']);
 const DEAD_JOB_STATES = new Set(['completed', 'failed', 'unknown']);
@@ -84,6 +93,8 @@ export class TaskReconciler {
   private readonly intervalMs: number;
   private readonly queuedGraceMs: number;
   private readonly batchSize: number;
+  private readonly deliveredOutboxRetentionMs: number;
+  private readonly pruneBatchSize: number;
   private readonly logger: Logger;
 
   constructor(
@@ -94,6 +105,8 @@ export class TaskReconciler {
     this.intervalMs = options.intervalMs ?? 30_000;
     this.queuedGraceMs = options.queuedGraceMs ?? 60_000;
     this.batchSize = options.batchSize ?? 100;
+    this.deliveredOutboxRetentionMs = options.deliveredOutboxRetentionMs ?? 0;
+    this.pruneBatchSize = options.pruneBatchSize ?? 1000;
     this.logger = options.logger ?? createLogger({
       service: 'task-reconciler',
       environment: process.env.NODE_ENV ?? 'development',
@@ -157,6 +170,8 @@ export class TaskReconciler {
         return { ...result, skipped: 'locked' };
       }
 
+      result.pruned = await this.pruneDeliveredOutbox(lockClient);
+
       const candidates = await this.findCandidates(lockClient);
       result.examined = candidates.length;
       if (candidates.length === 0) return result;
@@ -203,6 +218,40 @@ export class TaskReconciler {
       }
       lockClient.release();
     }
+  }
+
+  /**
+   * The outbox only needs an event until it is delivered; after that the
+   * task row is the record. Without pruning, every task ever accepted left
+   * one or more DELIVERED rows behind forever, so the table, its indexes and
+   * vacuum work grew with total history rather than with load.
+   *
+   * Runs under the reconciler's advisory lock, so one replica prunes. Each
+   * DELETE is bounded (pruneBatchSize rows, picked with the partial index on
+   * processed_at) and short, so it never holds locks long next to the
+   * publisher; at most PRUNE_MAX_BATCHES per cycle, the rest waits for the
+   * next cycle. A failure is logged and does not stop reconciling.
+   */
+  private async pruneDeliveredOutbox(client: PoolClient): Promise<number> {
+    if (!this.deliveredOutboxRetentionMs) return 0;
+    let total = 0;
+    try {
+      for (let i = 0; i < PRUNE_MAX_BATCHES; i++) {
+        const r = await client.query(
+          `DELETE FROM outbox_events WHERE id IN (
+             SELECT id FROM outbox_events
+             WHERE status = 'DELIVERED' AND processed_at < NOW() - $1 * INTERVAL '1 millisecond'
+             LIMIT $2)`,
+          [this.deliveredOutboxRetentionMs, this.pruneBatchSize],
+        );
+        total += r.rowCount ?? 0;
+        if ((r.rowCount ?? 0) < this.pruneBatchSize) break;
+      }
+      if (total > 0) this.logger.info('Pruned delivered outbox events', { pruned: total });
+    } catch (error) {
+      this.logger.warn('Outbox prune failed; will retry next cycle', { reason: String(error), pruned: total });
+    }
+    return total;
   }
 
   private async findCandidates(client: PoolClient): Promise<CandidateRow[]> {

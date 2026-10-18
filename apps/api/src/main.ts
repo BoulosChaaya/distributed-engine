@@ -113,6 +113,7 @@ const taskReconciler = new TaskReconciler(pgPool, taskQueue, {
   intervalMs: config.reconciler.intervalMs,
   queuedGraceMs: config.reconciler.queuedGraceMs,
   batchSize: config.reconciler.batchSize,
+  deliveredOutboxRetentionMs: config.outbox.deliveredRetentionHours * 3_600_000,
   logger: logger.child({ component: 'reconciler' }),
 });
 
