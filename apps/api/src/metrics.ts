@@ -7,6 +7,14 @@ import { settleWithin } from './dependency-check.js';
 const QUEUE_STATES = ['waiting', 'prioritized', 'delayed', 'active', 'failed'] as const;
 const CIRCUIT_STATES = ['CLOSED', 'OPEN', 'HALF_OPEN'] as const;
 
+/** PostgreSQL did not answer a metrics query within the budget. */
+export class PostgresTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`PostgreSQL did not answer within ${timeoutMs} ms`);
+    this.name = 'PostgresTimeoutError';
+  }
+}
+
 export class MetricsCollector {
   private requestCount = 0;
   private errorCount = 0;
@@ -33,10 +41,23 @@ export class MetricsCollector {
     private taskRepo: TaskRepository,
     private taskQueue: Queue,
     private outboxPublisher: OutboxPublisher,
-    /** Budget for the Redis queue counts; they hang while Redis is down. */
-    private redisTimeoutMs = 1000,
+    /**
+     * Budget for every dependency call. Both clients wait instead of failing
+     * while their server is unreachable (see dependency-check.ts), so
+     * without it the endpoints hang exactly when someone is looking.
+     */
+    private timeoutMs = 1000,
   ) {
     collectDefaultMetrics({ register: this.registry, prefix: 'engine_api_' });
+  }
+
+  /** A PostgreSQL call bounded by the budget; errors pass through unchanged. */
+  private pg<T>(query: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new PostgresTimeoutError(this.timeoutMs)), this.timeoutMs);
+    });
+    return Promise.race([query, timeout]).finally(() => clearTimeout(timer));
   }
 
   recordRequest() {
@@ -50,22 +71,20 @@ export class MetricsCollector {
   }
 
   async getMetrics() {
-    const statusCounts = await this.taskRepo.getTaskStatusCounts();
-    const totalTasks = await this.taskRepo.getTaskCount();
+    const [statusCounts, totalTasks] = await this.pg(Promise.all([this.taskRepo.getTaskStatusCounts(), this.taskRepo.getTaskCount()]));
 
     // null (with available: false) means "Redis did not answer in time",
     // which a dashboard must not show as an empty queue.
     const queueCounts = await settleWithin(
       Promise.all([this.taskQueue.count(), this.taskQueue.getActiveCount(), this.taskQueue.getWaitingCount()]),
-      this.redisTimeoutMs,
+      this.timeoutMs,
     );
     const [queueTotal, activeCount, waitingCount] = queueCounts.ok ? queueCounts.value : [null, null, null];
 
     let outboxPending = 0;
     let outboxFailed = 0;
     try {
-      outboxPending = await this.outboxPublisher.getPendingCount();
-      outboxFailed = await this.outboxPublisher.getFailedCount();
+      [outboxPending, outboxFailed] = await this.pg(Promise.all([this.outboxPublisher.getPendingCount(), this.outboxPublisher.getFailedCount()]));
     } catch {
       // Outbox metrics unavailable
     }
@@ -98,17 +117,17 @@ export class MetricsCollector {
   }
 
   /**
-   * Prometheus text exposition. PostgreSQL failing fails the scrape (the
-   * caller answers 500 and Prometheus records up=0); Redis or the outbox
+   * Prometheus text exposition. PostgreSQL failing or not answering within
+   * the budget fails the scrape (503, so Prometheus records up=0 at once); Redis or the outbox
    * failing does not: their *_up gauge goes to 0 and their series are
    * dropped, so a graph shows a gap rather than a false zero.
    */
   async prometheus(): Promise<{ contentType: string; body: string }> {
-    const statusCounts = await this.taskRepo.getTaskStatusCounts();
+    const statusCounts = await this.pg(this.taskRepo.getTaskStatusCounts());
     this.tasks.reset();
     for (const [status, count] of Object.entries(statusCounts)) this.tasks.set({ status }, count);
 
-    const jobCounts = await settleWithin(this.taskQueue.getJobCounts(...QUEUE_STATES), this.redisTimeoutMs);
+    const jobCounts = await settleWithin(this.taskQueue.getJobCounts(...QUEUE_STATES), this.timeoutMs);
     this.queueJobs.reset();
     this.queueUp.set(jobCounts.ok ? 1 : 0);
     if (jobCounts.ok) {
@@ -118,7 +137,7 @@ export class MetricsCollector {
     this.outboxEvents.reset();
     this.outboxLag.reset();
     try {
-      const stats = await this.outboxPublisher.getStats();
+      const stats = await this.pg(this.outboxPublisher.getStats());
       this.outboxEvents.set({ status: 'pending' }, stats.pending);
       this.outboxEvents.set({ status: 'failed' }, stats.failed);
       this.outboxLag.set({ status: 'pending' }, stats.oldestPendingAgeSeconds);

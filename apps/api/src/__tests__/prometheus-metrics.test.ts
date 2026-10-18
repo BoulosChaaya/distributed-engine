@@ -75,3 +75,33 @@ describe('MetricsCollector.prometheus', () => {
     await expect(new MetricsCollector(pgDown as never, queue() as never, outbox() as never, 50).prometheus()).rejects.toThrow('ECONNREFUSED');
   });
 });
+
+describe('metrics while PostgreSQL does not answer', () => {
+  // The pool waits for a connection instead of failing, so an unbounded
+  // query hangs for as long as PostgreSQL is frozen: exactly when the
+  // dashboard and Prometheus are looking.
+  const frozen = { getTaskStatusCounts: () => never(), getTaskCount: () => never() };
+  const frozenOutbox = outbox({ getStats: () => never(), getPendingCount: () => never(), getFailedCount: () => never() });
+
+  it('JSON metrics fail within the budget instead of hanging', async () => {
+    const m = new MetricsCollector(frozen as never, queue() as never, frozenOutbox as never, 100);
+    const started = Date.now();
+    await expect(m.getMetrics()).rejects.toThrow(/PostgreSQL did not answer/);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('the Prometheus scrape fails within the budget instead of hanging', async () => {
+    const m = new MetricsCollector(frozen as never, queue() as never, frozenOutbox as never, 100);
+    const started = Date.now();
+    await expect(m.prometheus()).rejects.toThrow(/PostgreSQL did not answer/);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('an outbox that does not answer is reported as down, not waited for', async () => {
+    const m = new MetricsCollector(taskRepo as never, queue() as never, frozenOutbox as never, 100);
+    const started = Date.now();
+    const { body } = await m.prometheus();
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(sample(body, 'engine_outbox_up')).toBe(0);
+  });
+});
