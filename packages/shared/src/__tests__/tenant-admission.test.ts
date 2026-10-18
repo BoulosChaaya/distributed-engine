@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
-import { Pool } from 'pg';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
+import { Pool, Client } from 'pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { TaskRepository } from '../db/task-repository';
@@ -137,3 +137,87 @@ describe('publish-time tenant admission (requires PostgreSQL + Redis)', () => {
     expect((await published()).sort()).toEqual(['operator', 't1']);
   });
 });
+
+describe('publisher wake-ups (requires PostgreSQL + Redis)', () => {
+  // 60 s poll interval in every case: anything published within a second
+  // was published because PostgreSQL said so, not because a poll came round.
+  const running: OutboxPublisher[] = [];
+  afterEach(async () => {
+    for (const p of running.splice(0)) await p.stop();
+  });
+
+  async function startPublisher(listen: boolean): Promise<OutboxPublisher> {
+    const pub = new OutboxPublisher(pool, queue, 60000, 10, 5, {
+      fairScheduler: new WeightedFairScheduler(), tenantAdmission: true, logger: silent,
+    });
+    if (listen) pub.listenForWakeups(() => new Client({ connectionString: TEST_PG_URL }));
+    running.push(pub);
+    pub.start();
+    if (listen) {
+      for (let i = 0; i < 100 && !pub.isListening(); i++) await sleep(20);
+      expect(pub.isListening()).toBe(true);
+    }
+    return pub;
+  }
+
+  async function waitForPublished(names: string[], ms: number): Promise<string[]> {
+    const until = Date.now() + ms;
+    let got = await published();
+    while (Date.now() < until && !names.every((n) => got.includes(n))) {
+      await sleep(25);
+      got = await published();
+    }
+    return got;
+  }
+
+  it('publishes a new task as soon as it is committed', async () => {
+    await startPublisher(true);
+    const { submit } = await tenantWithLimit(5);
+    const started = Date.now();
+    await submit('fresh', 'NORMAL');
+    expect(await waitForPublished(['fresh'], 1000)).toEqual(['fresh']);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('refills a freed concurrency slot as soon as a task finishes', async () => {
+    const { submit } = await tenantWithLimit(1);
+    await submit('first', 'NORMAL');
+    await submit('second', 'NORMAL');
+    await startPublisher(true);
+    expect(await waitForPublished(['first'], 1000)).toEqual(['first']);
+
+    // Through the repository, as a worker would: QUEUED -> PROCESSING -> COMPLETED.
+    const first = (await pool.query(`SELECT id FROM tasks WHERE name = 'first'`)).rows[0].id;
+    const claimed = await tasks.transitionStatus(first, 1, 'PROCESSING', { startedAt: new Date(), claimedBy: 'w' });
+    await tasks.transitionStatus(first, claimed.version, 'COMPLETED', { completedAt: new Date(), claimToken: claimed.claimToken });
+
+    expect(await waitForPublished(['first', 'second'], 1000)).toEqual(['first', 'second']);
+  });
+
+  it('without the wake-up the freed slot waits for the next poll (the old behaviour)', async () => {
+    const { submit } = await tenantWithLimit(1);
+    await submit('first', 'NORMAL');
+    await submit('second', 'NORMAL');
+    const pub = await startPublisher(false);
+    await pub.processOutbox();
+    await finish('first');
+    expect(await waitForPublished(['first', 'second'], 1000)).toEqual(['first']);
+  });
+
+  it('keeps working by polling when the LISTEN connection cannot be opened', async () => {
+    const pub = new OutboxPublisher(pool, queue, 200, 10, 5, {
+      fairScheduler: new WeightedFairScheduler(), tenantAdmission: true, logger: silent,
+    });
+    pub.listenForWakeups(() => new Client({ connectionString: 'postgresql://nobody:wrong@127.0.0.1:1/none' }));
+    running.push(pub);
+    pub.start();
+    const { submit } = await tenantWithLimit(5);
+    await submit('polled', 'NORMAL');
+    expect(await waitForPublished(['polled'], 2000)).toEqual(['polled']);
+    expect(pub.isListening()).toBe(false);
+  });
+});
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}

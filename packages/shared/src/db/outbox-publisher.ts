@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, type Client } from 'pg';
 import { Queue } from 'bullmq';
 import { generateId } from '../utils.js';
 import { OutboxEvent, OutboxEventType } from '../types.js';
@@ -69,6 +69,19 @@ export class OutboxPublisher {
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   /** The last poll claimed a full batch and published it without failure. */
   private lastPollFull = false;
+  /** When the pending poll timer fires (ms epoch). */
+  private pollDueAt = 0;
+  private lastPollEndedAt = 0;
+  /** A wake-up arrived while a poll was running: poll again right after it. */
+  private wakeRequested = false;
+  // LISTEN connection (see listenForWakeups). A dedicated client, not one
+  // from the pool: it is held for the life of the process.
+  private createListenerClient: (() => Client) | null = null;
+  private listener: Client | null = null;
+  private listenerRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private listenerBackoffMs = 1000;
+  private readonly droppedListeners = new WeakSet<Client>();
+  private readonly wakeupMinGapMs: number;
   private activePoll: Promise<number> | null = null;
   private readonly publisherId: string;
   private readonly logger: Logger;
@@ -107,6 +120,11 @@ export class OutboxPublisher {
        * library; the API turns it on (OUTBOX_TENANT_ADMISSION).
        */
       tenantAdmission?: boolean;
+      /**
+       * Shortest gap between the end of one poll and a poll started by a
+       * wake-up, so a burst of notifications becomes one poll. Default 25 ms.
+       */
+      wakeupMinGapMs?: number;
     },
   ) {
     this.publisherId = generateId().substring(0, 12);
@@ -117,6 +135,7 @@ export class OutboxPublisher {
     this.fairScheduler = circuitOptions?.fairScheduler;
     this.publishTimeoutMs = circuitOptions?.publishTimeoutMs ?? 5000;
     this.tenantAdmission = (circuitOptions?.tenantAdmission ?? false) && !!this.fairScheduler;
+    this.wakeupMinGapMs = circuitOptions?.wakeupMinGapMs ?? 25;
     const baseLogger = circuitOptions?.logger ?? createLogger({
       service: 'outbox-publisher',
       environment: process.env.NODE_ENV ?? 'development',
@@ -130,10 +149,105 @@ export class OutboxPublisher {
     this.running = true;
     this.logger.info('Outbox publisher started');
     this.schedulePoll();
+    if (this.createListenerClient) void this.connectListener();
+  }
+
+  /**
+   * Polls as soon as PostgreSQL says there may be work, instead of only every
+   * pollIntervalMs. Migration 20 adds triggers that NOTIFY outbox_wakeup when
+   * an outbox event is inserted (new task, workflow step ready, scheduled
+   * release, requeue) and when a task leaves QUEUED/PROCESSING for a
+   * terminal state (a tenant's concurrency slot is free again). Delivered at
+   * commit, so a wake-up never arrives before the row is visible.
+   *
+   * Why: with tenant admission a freed slot was only refilled on the next
+   * poll, so a tenant ran at most maxConcurrent tasks per (interval + run
+   * time): about 4/s for a limit of 5 and 1 s polls, whatever the workers
+   * could do. And every task waited 0 to 1 s just to be published.
+   *
+   * Notifications are a shortcut, not the mechanism: polling continues at
+   * pollIntervalMs, so a lost notification or a dropped LISTEN connection
+   * only costs latency. The connection is re-opened with backoff (1 s to
+   * 30 s); after reconnecting, one poll catches up on anything missed.
+   * Uses one dedicated connection per publisher.
+   */
+  listenForWakeups(createClient: () => Client): void {
+    this.createListenerClient = createClient;
+    if (this.running && !this.listener) void this.connectListener();
+  }
+
+  /** Whether the LISTEN connection is up (for tests and diagnostics). */
+  isListening(): boolean {
+    return this.listener !== null;
+  }
+
+  private async connectListener(): Promise<void> {
+    if (!this.running || !this.createListenerClient) return;
+    const client = this.createListenerClient();
+    client.on('notification', () => this.wake());
+    client.on('error', (error) => {
+      this.logger.warn('Outbox wake-up connection error', { reason: String(error) });
+      this.dropListener(client);
+    });
+    client.on('end', () => this.dropListener(client));
+    try {
+      await client.connect();
+      await client.query('LISTEN outbox_wakeup');
+      if (!this.running || this.droppedListeners.has(client)) {
+        this.dropListener(client);
+        return;
+      }
+      this.listener = client;
+      this.listenerBackoffMs = 1000;
+      this.logger.info('Outbox publisher listening for wake-ups');
+      this.wake();
+    } catch (error) {
+      this.logger.warn('Outbox wake-up connection failed; polling only until it is back', { reason: String(error) });
+      this.dropListener(client);
+    }
+  }
+
+  private dropListener(client: Client): void {
+    if (this.droppedListeners.has(client)) return;
+    this.droppedListeners.add(client);
+    if (this.listener === client) this.listener = null;
+    client.removeAllListeners('notification');
+    client.end().catch(() => {});
+    if (!this.running || this.listenerRetryTimer) return;
+    const delay = this.listenerBackoffMs;
+    this.listenerBackoffMs = Math.min(this.listenerBackoffMs * 2, 30_000);
+    this.listenerRetryTimer = setTimeout(() => {
+      this.listenerRetryTimer = null;
+      void this.connectListener();
+    }, delay);
+  }
+
+  /**
+   * Bring the next poll forward. While a poll runs, remember the request and
+   * poll right after it (the running poll may have missed the new work). Not
+   * while publishing is paused (Redis down, circuit open): those wait out
+   * their own interval.
+   */
+  private wake(): void {
+    if (!this.running || this.waitingForRedis || this.getCircuitState() === 'OPEN') return;
+    if (this.activePoll) {
+      this.wakeRequested = true;
+      return;
+    }
+    const now = Date.now();
+    const delay = Math.max(0, this.lastPollEndedAt + this.wakeupMinGapMs - now);
+    if (this.pollTimer && this.pollDueAt <= now + delay) return;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.schedulePoll(delay);
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    if (this.listenerRetryTimer) {
+      clearTimeout(this.listenerRetryTimer);
+      this.listenerRetryTimer = null;
+    }
+    if (this.listener) this.dropListener(this.listener);
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
@@ -219,8 +333,10 @@ export class OutboxPublisher {
    */
   private schedulePoll(delayMs: number = this.pollIntervalMs): void {
     if (!this.running) return;
+    this.pollDueAt = Date.now() + delayMs;
     this.pollTimer = setTimeout(async () => {
       this.lastPollFull = false;
+      this.wakeRequested = false;
       const poll = this.processOutbox();
       this.activePoll = poll;
       try {
@@ -230,7 +346,10 @@ export class OutboxPublisher {
         this.logger.error('Outbox poll error', { reason: String(error) });
       }
       this.activePoll = null;
-      this.schedulePoll(this.lastPollFull ? 0 : this.pollIntervalMs);
+      this.lastPollEndedAt = Date.now();
+      const next = this.lastPollFull ? 0 : this.wakeRequested ? this.wakeupMinGapMs : this.pollIntervalMs;
+      this.wakeRequested = false;
+      this.schedulePoll(next);
     }, delayMs);
   }
 
