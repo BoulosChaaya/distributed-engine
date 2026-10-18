@@ -41,6 +41,7 @@ import { createTenantAuth, createRateLimitMiddleware } from './tenant-middleware
 import { checkHealth, settleWithin } from './dependency-check.js';
 import { createOperatorAuth } from './operator-auth.js';
 import { routeId } from './route-params.js';
+import { buildDefaultJobOptions } from './queue-options.js';
 import { createTenantAdminRouter } from './tenant-admin.js';
 import { createWorkflowRouter } from './workflow-routes.js';
 import { buildRedisOptions } from './redis-options.js';
@@ -87,10 +88,7 @@ redisClient.on('connect', () => logger.info('Redis connected'));
 // its connection lifecycle and recovers on its own when Redis returns.
 const taskQueue = new Queue('tasks', {
   connection: redisOptions,
-  defaultJobOptions: {
-    removeOnComplete: 100,
-    removeOnFail: false,
-  },
+  defaultJobOptions: buildDefaultJobOptions(config.queue),
 });
 
 const taskRepo = new TaskRepository(pgPool);
