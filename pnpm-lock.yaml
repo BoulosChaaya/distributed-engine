@@ -211,6 +211,9 @@ importers:
       pino:
         specifier: ^10.4.0
         version: 10.4.0
+      undici:
+        specifier: 8.12.1
+        version: 8.12.1
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -3063,6 +3066,10 @@ packages:
 
   undici-types@6.21.0:
     resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+
+  undici@8.12.1:
+    resolution: {integrity: sha512-usz3OVQBeh1LxNn0DzU0voLXMgn5CU/WUdpBsY6Ti5afNao+vTkmn4H/NxoXolc10cOqe2+YIG0Hspq2rsl64w==}
+    engines: {node: '>=22.19.0'}
 
   unpipe@1.0.0:
     resolution: {integrity: sha512-pjy2bYhSsufwWlKwPc+l3cN7+wuJlK6uz0YdJEOlQDbl6jo/YlPi4mb8agUkVC8BF7V8NuzeyPNqRksA3hztKQ==}
@@ -6271,6 +6278,8 @@ snapshots:
     optional: true
 
   undici-types@6.21.0: {}
+
+  undici@8.12.1: {}
 
   unpipe@1.0.0: {}
 

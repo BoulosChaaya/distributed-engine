@@ -11,6 +11,7 @@ import {
   MAX_RESULT_BYTES,
   TaskContext,
 } from '../task-handlers';
+import { classifyAddress, guardedLookup } from '../http-guard';
 
 function ctx(name: string, payload: Record<string, unknown> = {}, attempt = 1, signal = new AbortController().signal): TaskContext {
   return { taskId: 't1', name, payload, attempt, signal };
@@ -163,6 +164,63 @@ describe('http handler', () => {
   it('applies the per-request timeout as a retryable error', async () => {
     const err = await runTaskHandler(handlers, ctx('http', { url: `${base}/slow`, timeoutMs: 100 }), 5000).catch((e) => e);
     expect(isNonRetryable(err)).toBe(false);
+  });
+});
+
+describe('http handler: addresses, not just names', () => {
+  // KNOWN-LIMITS until 1.0.2: the allow-list checked names only, so an
+  // allow-listed name that resolved to an internal address was reachable.
+  const port = () => (server.address() as AddressInfo).port;
+
+  it('refuses an allow-listed name that resolves to a private address, without a request', async () => {
+    const handlers = createBuiltinHandlers({ httpAllowedHosts: ['localhost'] });
+    const before = hits.length;
+    const err = await runTaskHandler(handlers, ctx('http', { url: `http://localhost:${port()}/ok` }), 5000).catch((e) => e);
+    expect(isNonRetryable(err)).toBe(true);
+    expect(err.message).toMatch(/localhost resolves to .*(127\.0\.0\.1|::1).*HTTP_TASK_PRIVATE_HOSTS/);
+    expect(hits.length).toBe(before);
+  });
+
+  it('calls it when the name is also listed as private on purpose', async () => {
+    const handlers = createBuiltinHandlers({ httpAllowedHosts: ['localhost'], httpPrivateHosts: ['localhost'] });
+    const out: any = await runTaskHandler(handlers, ctx('http', { url: `http://localhost:${port()}/ok` }), 5000);
+    expect(out.status).toBe(200);
+  });
+
+  it('never calls link-local addresses (cloud metadata), even when listed', async () => {
+    const handlers = createBuiltinHandlers({ httpAllowedHosts: ['169.254.169.254'], httpPrivateHosts: ['169.254.169.254'] });
+    const err = await runTaskHandler(handlers, ctx('http', { url: 'http://169.254.169.254/latest/meta-data' }), 5000).catch((e) => e);
+    expect(isNonRetryable(err)).toBe(true);
+    expect(err.message).toMatch(/link-local/);
+  });
+
+  it('checks the address at connect time: a record with any blocked address is refused', async () => {
+    const run = (addrs: string[], privateOk = false) => new Promise<unknown>((resolve) => {
+      const lookup = guardedLookup(() => privateOk, async () => addrs.map((address) => ({ address, family: address.includes(':') ? 6 : 4 })));
+      (lookup as any)('svc.example.com', { all: true }, (err: Error | null, out: unknown) => resolve(err ?? out));
+    });
+    expect(await run(['93.184.216.34'])).toEqual([{ address: '93.184.216.34', family: 4 }]);
+    expect(String(await run(['93.184.216.34', '10.0.0.5']))).toMatch(/10\.0\.0\.5, a private address/);
+    expect(await run(['10.0.0.5'], true)).toEqual([{ address: '10.0.0.5', family: 4 }]);
+    expect(String(await run(['169.254.169.254'], true))).toMatch(/link-local/);
+  });
+
+  it('classifies addresses', () => {
+    expect(classifyAddress('8.8.8.8')).toBeNull();
+    expect(classifyAddress('2606:4700::1111')).toBeNull();
+    expect(classifyAddress('10.1.2.3')).toBe('private');
+    expect(classifyAddress('172.20.0.5')).toBe('private');
+    expect(classifyAddress('192.168.1.1')).toBe('private');
+    expect(classifyAddress('127.0.0.1')).toBe('private');
+    expect(classifyAddress('100.64.0.1')).toBe('private');
+    expect(classifyAddress('::1')).toBe('private');
+    expect(classifyAddress('fd00:ec2::254')).toBe('private');
+    expect(classifyAddress('::ffff:10.0.0.1')).toBe('private');
+    expect(classifyAddress('169.254.169.254')).toBe('link-local');
+    expect(classifyAddress('fe80::1')).toBe('link-local');
+    expect(classifyAddress('0.0.0.0')).toBe('unspecified');
+    expect(classifyAddress('::')).toBe('unspecified');
+    expect(classifyAddress('224.0.0.1')).toBe('multicast');
   });
 });
 

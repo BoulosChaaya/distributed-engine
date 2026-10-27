@@ -17,3 +17,5 @@ services:
   worker:
     environment:
       HTTP_TASK_ALLOWED_HOSTS: sink
+      # sink is a compose service: its address is private, on purpose.
+      HTTP_TASK_PRIVATE_HOSTS: sink

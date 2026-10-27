@@ -85,9 +85,9 @@ come from the load test ([load-test.md](load-test.md)).
   interval therefore builds a backlog that drains at the speed of the runs.
 - No dead-letter queue beyond the FAILED state (and operator or tenant
   retry); no saga or compensation steps in workflows.
-- The `http` task type allow-lists host names only; it does not resolve
-  them and reject private addresses, so an allow-listed name that points at
-  an internal address is reachable.
+- The `http` task type checks the address it connects to, but an internal
+  service listed in `HTTP_TASK_PRIVATE_HOSTS` is reachable by anyone who can
+  submit a task; keep that list to services meant to be called.
 
 ## Security posture of the defaults
 

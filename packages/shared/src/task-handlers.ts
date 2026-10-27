@@ -19,6 +19,9 @@
  * (the task is then handed back without charging a retry). Handlers must stop
  * promptly when it fires.
  */
+import net from 'node:net';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { addressRefusal, findBlocked, guardedLookup } from './http-guard.js';
 
 export class NonRetryableTaskError extends Error {
   constructor(message: string) {
@@ -56,6 +59,12 @@ export interface BuiltinHandlerOptions {
    * requests to internal services (SSRF).
    */
   httpAllowedHosts?: string[];
+  /**
+   * Allow-listed names that may resolve to private or loopback addresses
+   * (internal services called on purpose). Any other name that resolves to
+   * one is refused; link-local addresses (cloud metadata) are refused always.
+   */
+  httpPrivateHosts?: string[];
   maxSleepMs?: number;
   fetchImpl?: typeof fetch;
 }
@@ -101,7 +110,13 @@ export function hostAllowed(hostname: string, allowed: string[]): boolean {
 export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<string, TaskHandler> {
   const maxSleepMs = options.maxSleepMs ?? 300_000;
   const allowed = options.httpAllowedHosts ?? [];
-  const doFetch = options.fetchImpl ?? fetch;
+  const privateHosts = options.httpPrivateHosts ?? [];
+  const isPrivateAllowed = (host: string) => hostAllowed(host, privateHosts);
+  // The address check runs in the connection's own DNS lookup, so the address
+  // checked is the address connected to (no second resolution to rebind).
+  const agent = new Agent({ connect: { lookup: guardedLookup(isPrivateAllowed) } });
+  const doFetch = options.fetchImpl ?? ((url: URL, init: RequestInit) =>
+    undiciFetch(url, { ...(init as object), dispatcher: agent }) as unknown as Promise<Response>);
 
   const handlers = new Map<string, TaskHandler>();
 
@@ -148,6 +163,13 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
     if (!hostAllowed(url.hostname, allowed)) {
       throw new NonRetryableTaskError(`host ${url.hostname} is not in HTTP_TASK_ALLOWED_HOSTS`);
     }
+    // An IP literal is never looked up, so it is checked here. Written in the
+    // allow-list it is taken as meant, except for addresses never called.
+    const literal = url.hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(literal)) {
+      const why = addressRefusal(literal, literal, true);
+      if (why) throw new NonRetryableTaskError(why);
+    }
     const method = typeof payload.method === 'string' ? payload.method.toUpperCase() : 'GET';
     if (!HTTP_METHODS.has(method)) throw new NonRetryableTaskError(`payload.method ${method} is not supported`);
 
@@ -168,14 +190,21 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
     }
 
     const timeoutMs = intField(payload, 'timeoutMs', 10_000, 100, 120_000);
-    const response = await doFetch(url, {
-      method,
-      headers,
-      body,
-      // Following a redirect could leave the allow-list.
-      redirect: 'manual',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-    });
+    let response: Response;
+    try {
+      response = await doFetch(url, {
+        method,
+        headers,
+        body,
+        // Following a redirect could leave the allow-list.
+        redirect: 'manual',
+        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+      });
+    } catch (error) {
+      const blocked = findBlocked(error);
+      if (blocked) throw new NonRetryableTaskError(blocked.message);
+      throw error;
+    }
     const text = method === 'HEAD' ? '' : await response.text();
     const result = {
       status: response.status,

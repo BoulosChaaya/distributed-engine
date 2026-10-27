@@ -75,9 +75,15 @@ const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
   .split(',')
   .map((h) => h.trim())
   .filter(Boolean);
+// Allow-listed names that may resolve to private addresses (internal
+// services called on purpose). Any other name that does is refused.
+const HTTP_TASK_PRIVATE_HOSTS = (process.env.HTTP_TASK_PRIVATE_HOSTS ?? '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter(Boolean);
 // How often a running task checks for cancellation; 0 disables.
 const CANCEL_CHECK_INTERVAL_MS = parseStrictIntInRange(process.env.CANCEL_CHECK_INTERVAL_MS, 2000, 'CANCEL_CHECK_INTERVAL_MS', 0, 60000);
-const taskHandlers = createBuiltinHandlers({ httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS });
+const taskHandlers = createBuiltinHandlers({ httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS, httpPrivateHosts: HTTP_TASK_PRIVATE_HOSTS });
 // Liveness endpoint (/healthz). Configurable so more than one worker can run on
 // one host (local runs, tests); containers keep the default.
 const WORKER_HEALTH_PORT = parseStrictIntInRange(process.env.WORKER_HEALTH_PORT, 9000, 'WORKER_HEALTH_PORT', 1, 65535);
@@ -262,6 +268,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   logger.info('Task handlers registered', {
     types: [...taskHandlers.keys()].sort(),
     httpAllowedHosts: HTTP_TASK_ALLOWED_HOSTS,
+    httpPrivateHosts: HTTP_TASK_PRIVATE_HOSTS,
     taskTimeoutMs: TASK_TIMEOUT_MS,
   });
 

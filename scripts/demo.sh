@@ -32,6 +32,7 @@ set -a
 source .env
 set +a
 export HTTP_TASK_ALLOWED_HOSTS=api          # lets the http task call the API's own /live
+export HTTP_TASK_PRIVATE_HOSTS=api          # api is a compose service, so its address is private
 export RECONCILER_INTERVAL_MS=5000 RECONCILER_QUEUED_GRACE_MS=10000
 
 API=http://localhost:3000
