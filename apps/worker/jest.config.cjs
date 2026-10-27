@@ -6,7 +6,7 @@ const config = {
   testMatch: ['**/__tests__/**/*.test.ts'],
   preset: 'ts-jest',
   transform: {
-    '^.+\\.tsx?$': ['ts-jest', { tsconfig: { module: 'CommonJS', moduleResolution: 'Node' } }],
+    '^.+\\.tsx?$': ['ts-jest', { tsconfig: { module: 'CommonJS', moduleResolution: 'Node', ignoreDeprecations: '6.0' } }],
   },
   moduleFileExtensions: ['ts', 'js', 'json'],
   moduleNameMapper: {
