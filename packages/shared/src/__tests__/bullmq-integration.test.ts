@@ -4,6 +4,7 @@ import { Queue, Worker, Job, DelayedError } from 'bullmq';
 import IORedis from 'ioredis';
 import { TaskRepository, ClaimNotExpiredError, StaleVersionError, ClaimTokenMismatchError } from '../db/task-repository';
 import { runMigrations } from '../db/migrations';
+import { submitTask } from './helpers/submit-task';
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 const TEST_REDIS_HOST = process.env.TEST_REDIS_HOST || 'localhost';
@@ -81,7 +82,7 @@ describe('Section 5: Lease deferral does not consume execution retry budget (req
     const testRepo = new TaskRepository(pool, LEASE_TTL);
     const LEASE_DEFERRAL_MARGIN_MS = 500;
 
-    const { task } = await testRepo.createTaskWithOutbox({
+    const { task } = await submitTask(testRepo, {
       name: 'lease-deferral-test',
       priority: 'NORMAL',
       payload: {},
@@ -158,7 +159,7 @@ describe('Section 5: Lease deferral does not consume execution retry budget (req
     const testRepo = new TaskRepository(pool, LEASE_TTL);
     const LEASE_DEFERRAL_MARGIN_MS = 500;
 
-    const { task } = await testRepo.createTaskWithOutbox({
+    const { task } = await submitTask(testRepo, {
       name: 'recoverable-deferral-test',
       priority: 'NORMAL',
       payload: {},
@@ -234,7 +235,7 @@ describe('Section 6: Real execution failure consumes retry budget (requires Post
 
     const testRepo = new TaskRepository(pool, 30000);
 
-    const { task } = await testRepo.createTaskWithOutbox({
+    const { task } = await submitTask(testRepo, {
       name: 'exec-failure-test',
       priority: 'NORMAL',
       payload: {},
@@ -346,7 +347,7 @@ describe('Section 7: Healthy long task with renewal — foreign worker cannot re
     const RENEWAL_INTERVAL = Math.floor(LEASE_TTL / 3);
     const testRepo = new TaskRepository(pool, LEASE_TTL);
 
-    const { task } = await testRepo.createTaskWithOutbox({
+    const { task } = await submitTask(testRepo, {
       name: 'renewal-test',
       priority: 'NORMAL',
       payload: {},
@@ -449,7 +450,7 @@ describe('Section 8: Ownership loss — cooperative abort and stale token reject
     const RENEWAL_INTERVAL = Math.floor(LEASE_TTL / 3);
     const testRepo = new TaskRepository(pool, LEASE_TTL);
 
-    const { task } = await testRepo.createTaskWithOutbox({
+    const { task } = await submitTask(testRepo, {
       name: 'ownership-loss-test',
       priority: 'NORMAL',
       payload: {},

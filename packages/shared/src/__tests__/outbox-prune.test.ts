@@ -4,6 +4,7 @@ import { TaskRepository } from '../db/task-repository';
 import { TaskReconciler, ReconcilerQueue } from '../db/task-reconciler';
 import { runMigrations } from '../db/migrations';
 import { OutboxPublisher } from '../db/outbox-publisher';
+import { submitTask } from './helpers/submit-task';
 
 // DELIVERED outbox events are pruned after the retention period; nothing
 // else in the outbox is ever touched. Real PostgreSQL.
@@ -24,7 +25,7 @@ afterAll(async () => { await pool.end(); });
 
 /** A task whose single outbox event is in `status`, processed `ageDays` ago. */
 async function event(status: 'PENDING' | 'DELIVERED' | 'FAILED', ageDays: number): Promise<string> {
-  const { task, outboxEvent } = await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 0 });
+  const { task, outboxEvent } = await submitTask(repo, { name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 0 });
   await pool.query(`UPDATE tasks SET status = 'COMPLETED' WHERE id = $1`, [task.id]); // not a reconcile candidate
   await pool.query(
     `UPDATE outbox_events SET status = $2, processed_at = NOW() - $3 * INTERVAL '1 day' WHERE id = $1`,

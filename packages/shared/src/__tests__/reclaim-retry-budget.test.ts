@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { runMigrations } from '../db/migrations';
 import { TaskRepository, RetryBudgetExhaustedError } from '../db/task-repository';
 import { WorkflowRepository } from '../db/workflow-repository';
+import { submitTask } from './helpers/submit-task';
 
 // A task whose worker dies mid-run (lease expired) is reclaimed by another
 // worker. The lost run must count against the retry budget, or a task that
@@ -37,7 +38,7 @@ async function status(taskId: string) {
 
 describe('reclaiming a stalled task charges the lost attempt (requires PostgreSQL)', () => {
   it('charges one retry per reclaim and says why', async () => {
-    const { task } = await repo.createTaskWithOutbox({ name: 'sleep', priority: 'NORMAL', payload: {}, maxRetries: 3 });
+    const { task } = await submitTask(repo, { name: 'sleep', priority: 'NORMAL', payload: {}, maxRetries: 3 });
     const p = await processing(task.id, task.version, 'w-dead');
     await expireLease(task.id);
 
@@ -49,7 +50,7 @@ describe('reclaiming a stalled task charges the lost attempt (requires PostgreSQ
   });
 
   it('fails the task instead of reclaiming it once the budget is spent', async () => {
-    const { task } = await repo.createTaskWithOutbox({ name: 'sleep', priority: 'NORMAL', payload: {}, maxRetries: 1 });
+    const { task } = await submitTask(repo, { name: 'sleep', priority: 'NORMAL', payload: {}, maxRetries: 1 });
     let t = await processing(task.id, task.version, 'w1');
     await expireLease(task.id);
     t = await repo.reclaimStalledTask(task.id, t.version, 'w2'); // lost run 1: retries 1 of 1

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/glo
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
+import { submitTask } from './helpers/submit-task';
 import {
   context,
   trace,
@@ -125,7 +126,7 @@ describe('Trace context propagation', () => {
 
     let outboxEvent: any;
     await context.with(ctx, async () => {
-      const result = await repo.createTaskWithOutbox({
+      const result = await submitTask(repo, {
         name: 'trace-context-test',
         priority: 'NORMAL',
         payload: { test: true },
@@ -151,7 +152,7 @@ describe('Trace context propagation', () => {
 
     let taskId: string;
     await context.with(ctx, async () => {
-      const result = await repo.createTaskWithOutbox({
+      const result = await submitTask(repo, {
         name: 'persist-trace-test',
         priority: 'HIGH',
         payload: {},
@@ -177,7 +178,7 @@ describe('Trace context propagation', () => {
 
     let taskId: string;
     await context.with(ctx, async () => {
-      const result = await repo.createTaskWithOutbox({
+      const result = await submitTask(repo, {
         name: 'propagation-test',
         priority: 'NORMAL',
         payload: { data: 'test' },
@@ -273,7 +274,7 @@ describe('Backward compatibility', () => {
 
 describe('Failure isolation', () => {
   it('should not fail task creation when tracing is unavailable', async () => {
-    const result = await repo.createTaskWithOutbox({
+    const result = await submitTask(repo, {
       name: 'no-tracing-task',
       priority: 'NORMAL',
       payload: { important: true },
@@ -285,7 +286,7 @@ describe('Failure isolation', () => {
   });
 
   it('should not change task status when span operations fail', async () => {
-    const result = await repo.createTaskWithOutbox({
+    const result = await submitTask(repo, {
       name: 'span-fail-task',
       priority: 'NORMAL',
       payload: {},
@@ -404,7 +405,7 @@ describe('Distributed trace correlation', () => {
     await context.with(apiCtx, async () => {
       const createSpan = tracing.startTaskCreation('pending', 'correlation-test', 'NORMAL');
       const result = await tracing.withActiveSpan(createSpan, () =>
-        repo.createTaskWithOutbox({
+        submitTask(repo, {
           name: 'correlation-test',
           priority: 'NORMAL',
           payload: {},
@@ -447,7 +448,7 @@ describe('Distributed trace correlation', () => {
       const createSpan = tracing.startTaskCreation('pending', 'parent-chain-test', 'HIGH');
       createSpanId = createSpan.spanContext().spanId;
       const result = await tracing.withActiveSpan(createSpan, () =>
-        repo.createTaskWithOutbox({
+        submitTask(repo, {
           name: 'parent-chain-test',
           priority: 'HIGH',
           payload: {},

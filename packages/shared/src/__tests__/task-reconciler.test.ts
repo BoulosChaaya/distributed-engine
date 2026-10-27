@@ -6,6 +6,7 @@ import { TaskRepository } from '../db/task-repository';
 import { OutboxPublisher } from '../db/outbox-publisher';
 import { TaskReconciler, ReconcilerQueue } from '../db/task-reconciler';
 import { runMigrations } from '../db/migrations';
+import { submitTask } from './helpers/submit-task';
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 const TEST_REDIS_HOST = process.env.TEST_REDIS_HOST || 'localhost';
@@ -46,7 +47,7 @@ async function wipeQueueFromRedis(): Promise<number> {
 }
 
 async function createTask(name = 'job', maxRetries = 3): Promise<string> {
-  const { task } = await repo.createTaskWithOutbox({ name, priority: 'NORMAL', payload: { n: name }, maxRetries } as any);
+  const { task } = await submitTask(repo, { name, priority: 'NORMAL', payload: { n: name }, maxRetries } as any);
   return task.id;
 }
 

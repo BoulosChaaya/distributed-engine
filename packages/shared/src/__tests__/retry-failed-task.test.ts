@@ -6,6 +6,7 @@ import { runMigrations } from '../db/migrations';
 import { TaskRepository, TaskNotRetryableError } from '../db/task-repository';
 import { OutboxPublisher } from '../db/outbox-publisher';
 import { WorkflowRepository } from '../db/workflow-repository';
+import { submitTask } from './helpers/submit-task';
 
 // Operator redrive of a FAILED task, against real PostgreSQL and Redis.
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
@@ -40,7 +41,7 @@ beforeEach(async () => {
 });
 
 async function failedTask() {
-  const { task } = await repo.createTaskWithOutbox({ name: 'http', priority: 'NORMAL', payload: {}, maxRetries: 2 });
+  const { task } = await submitTask(repo, { name: 'http', priority: 'NORMAL', payload: {}, maxRetries: 2 });
   await pool.query(
     `UPDATE tasks SET status = 'FAILED', retries = 3, error = 'upstream responded 503', completed_at = NOW() WHERE id = $1`,
     [task.id],
@@ -66,7 +67,7 @@ describe('retryFailedTask (requires PostgreSQL)', () => {
   });
 
   it.each(['QUEUED', 'PROCESSING', 'COMPLETED', 'CANCELLED'])('refuses a %s task', async (status) => {
-    const { task } = await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 2 });
+    const { task } = await submitTask(repo, { name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 2 });
     await pool.query('UPDATE tasks SET status = $2 WHERE id = $1', [task.id, status]);
     await expect(repo.retryFailedTask(task.id)).rejects.toBeInstanceOf(TaskNotRetryableError);
   });

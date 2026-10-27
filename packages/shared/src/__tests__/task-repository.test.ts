@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { TaskRepository, StaleVersionError, ClaimTokenMismatchError, ClaimNotExpiredError } from '../db/task-repository';
 import { InvalidTransitionError } from '../state-machine';
 import { runMigrations } from '../db/migrations';
+import { submitTask } from './helpers/submit-task';
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 
@@ -44,7 +45,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should create a task with outbox event atomically', async () => {
     requirePg();
 
-    const { task, outboxEvent } = await repo.createTaskWithOutbox({
+    const { task, outboxEvent } = await submitTask(repo, {
       name: 'test-task',
       priority: 'HIGH',
       payload: { key: 'value' },
@@ -66,7 +67,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should retrieve a task by ID', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'get-task',
       priority: 'NORMAL',
       payload: {},
@@ -89,7 +90,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
     requirePg();
 
     for (let i = 0; i < 5; i++) {
-      await repo.createTaskWithOutbox({
+      await submitTask(repo, {
         name: `task-${i}`,
         priority: 'NORMAL',
         payload: {},
@@ -109,7 +110,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should transition status with version check', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'transition-task',
       priority: 'NORMAL',
       payload: {},
@@ -138,7 +139,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reject invalid state transitions', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'invalid-transition',
       priority: 'NORMAL',
       payload: {},
@@ -153,7 +154,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reject stale version updates', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stale-version',
       priority: 'NORMAL',
       payload: {},
@@ -170,7 +171,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should handle concurrent transitions safely', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'concurrent-task',
       priority: 'NORMAL',
       payload: {},
@@ -192,7 +193,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should cancel a task atomically', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'cancel-task',
       priority: 'NORMAL',
       payload: {},
@@ -206,7 +207,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reject cancellation of completed tasks', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'no-cancel-completed',
       priority: 'NORMAL',
       payload: {},
@@ -225,13 +226,13 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should get task status counts', async () => {
     requirePg();
 
-    const { task: t1 } = await repo.createTaskWithOutbox({
+    const { task: t1 } = await submitTask(repo, {
       name: 'count-1', priority: 'NORMAL', payload: {}, maxRetries: 3,
     });
-    const { task: t2 } = await repo.createTaskWithOutbox({
+    const { task: t2 } = await submitTask(repo, {
       name: 'count-2', priority: 'NORMAL', payload: {}, maxRetries: 3,
     });
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'count-3', priority: 'NORMAL', payload: {}, maxRetries: 3,
     });
 
@@ -246,7 +247,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should handle FAILED -> QUEUED retry transition', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'retry-task',
       priority: 'NORMAL',
       payload: {},
@@ -268,7 +269,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should handle PROCESSING -> QUEUED retry transition', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'processing-retry-task',
       priority: 'NORMAL',
       payload: {},
@@ -290,7 +291,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should handle atomicity: task and outbox event created together', async () => {
     requirePg();
 
-    const { task, outboxEvent } = await repo.createTaskWithOutbox({
+    const { task, outboxEvent } = await submitTask(repo, {
       name: 'atomic-test',
       priority: 'NORMAL',
       payload: { foo: 'bar' },
@@ -308,7 +309,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reclaim a stalled PROCESSING task with expired claim', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stalled-task',
       priority: 'NORMAL',
       payload: {},
@@ -335,7 +336,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reject reclaim on non-PROCESSING task', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'no-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -350,7 +351,7 @@ describe('TaskRepository (requires PostgreSQL)', () => {
   it('should reject reclaim with stale version', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stale-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -444,7 +445,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should set claimed_by when transitioning to PROCESSING', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-processing',
       priority: 'NORMAL',
       payload: {},
@@ -462,7 +463,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should generate claim token on QUEUED -> PROCESSING', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-claim-token',
       priority: 'NORMAL',
       payload: {},
@@ -485,7 +486,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should clear claimed_by when transitioning to COMPLETED', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-completed',
       priority: 'NORMAL',
       payload: {},
@@ -510,7 +511,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should clear claimed_by when transitioning to FAILED', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-failed',
       priority: 'NORMAL',
       payload: {},
@@ -534,7 +535,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should clear claimed_by when transitioning to CANCELLED', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-cancelled',
       priority: 'NORMAL',
       payload: {},
@@ -555,7 +556,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should update claimed_by on reclaim with new worker ID', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -583,7 +584,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should reject self-reclaim (same worker ID)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-self-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -603,7 +604,7 @@ describe('Task ownership semantics (requires PostgreSQL)', () => {
   it('should allow reclaim without worker ID when claim expired', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'ownership-no-id-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -629,7 +630,7 @@ describe('Worker completion race (requires PostgreSQL)', () => {
   it('should prevent COMPLETED transition on a CANCELLED task via version check', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'completion-race',
       priority: 'NORMAL',
       payload: {},
@@ -657,7 +658,7 @@ describe('Worker completion race (requires PostgreSQL)', () => {
   it('should prevent COMPLETED transition when another worker reclaimed the task', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'double-reclaim-race',
       priority: 'NORMAL',
       payload: {},
@@ -692,7 +693,7 @@ describe('Worker completion race (requires PostgreSQL)', () => {
   it('should clear claimed_by when transitioning PROCESSING -> QUEUED on retry', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'retry-clear-owner',
       priority: 'NORMAL',
       payload: {},
@@ -720,7 +721,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should reject reclaim when claim has not expired (live owner theft)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'live-owner-theft',
       priority: 'NORMAL',
       payload: {},
@@ -746,7 +747,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should allow reclaim only after claim expires', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'expired-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -781,7 +782,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should reject stale completion after ownership transfer (claim token mismatch)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stale-completion',
       priority: 'NORMAL',
       payload: {},
@@ -819,7 +820,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should reject stale failure transition after ownership transfer', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stale-failure',
       priority: 'NORMAL',
       payload: {},
@@ -854,7 +855,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should allow current owner to complete with correct claim token', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'owner-completes',
       priority: 'NORMAL',
       payload: {},
@@ -881,7 +882,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should allow cancellation to override ownership (no claim token required)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'cancel-beats-owner',
       priority: 'NORMAL',
       payload: {},
@@ -912,7 +913,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should ensure only one worker wins concurrent initial claim (QUEUED -> PROCESSING)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'concurrent-claim',
       priority: 'NORMAL',
       payload: {},
@@ -948,7 +949,7 @@ describe('Execution ownership protocol (requires PostgreSQL)', () => {
   it('should reject transition without claim token when task has one', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'no-token-reject',
       priority: 'NORMAL',
       payload: {},
@@ -974,7 +975,7 @@ describe('Worker lifecycle integration (requires PostgreSQL)', () => {
     requirePg();
 
     // 1. Create task
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'lifecycle-test',
       priority: 'NORMAL',
       payload: { input: 'data' },
@@ -1008,7 +1009,7 @@ describe('Worker lifecycle integration (requires PostgreSQL)', () => {
     requirePg();
 
     // 1. Create and claim
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'stalled-lifecycle',
       priority: 'NORMAL',
       payload: {},
@@ -1055,7 +1056,7 @@ describe('Worker lifecycle integration (requires PostgreSQL)', () => {
     requirePg();
 
     // 1. Create and claim
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'retry-lifecycle',
       priority: 'NORMAL',
       payload: {},
@@ -1097,7 +1098,7 @@ describe('Early BullMQ redelivery before lease expiry (requires PostgreSQL)', ()
   it('should throw ClaimNotExpiredError when reclaim attempted before lease expires', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'early-redelivery',
       priority: 'NORMAL',
       payload: {},
@@ -1126,7 +1127,7 @@ describe('Early BullMQ redelivery before lease expiry (requires PostgreSQL)', ()
   it('should allow reclaim after lease expires following earlier rejection', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'deferred-reclaim',
       priority: 'NORMAL',
       payload: {},
@@ -1167,7 +1168,7 @@ describe('Early BullMQ redelivery before lease expiry (requires PostgreSQL)', ()
   it('should not consume version when reclaim is rejected (task remains reclaimable later)', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'version-stable',
       priority: 'NORMAL',
       payload: {},
@@ -1195,7 +1196,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should renew claim with valid token', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-valid',
       priority: 'NORMAL',
       payload: {},
@@ -1222,7 +1223,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should reject renewal with wrong claim token', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-wrong-token',
       priority: 'NORMAL',
       payload: {},
@@ -1242,7 +1243,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should reject renewal with stale token after ownership transfer', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-stale-token',
       priority: 'NORMAL',
       payload: {},
@@ -1270,7 +1271,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should reject renewal on CANCELLED task', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-cancelled',
       priority: 'NORMAL',
       payload: {},
@@ -1292,7 +1293,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should reject renewal on COMPLETED task', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-completed',
       priority: 'NORMAL',
       payload: {},
@@ -1317,7 +1318,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should reject renewal on FAILED task', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-failed',
       priority: 'NORMAL',
       payload: {},
@@ -1342,7 +1343,7 @@ describe('Lease renewal (requires PostgreSQL)', () => {
   it('should extend expiry from current PG time, not from original expiry', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renew-extends-from-now',
       priority: 'NORMAL',
       payload: {},
@@ -1381,7 +1382,7 @@ describe('Long-running worker with lease renewal (requires PostgreSQL)', () => {
   it('should prevent reclaim while renewal keeps lease fresh', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'long-running-renewed',
       priority: 'NORMAL',
       payload: {},
@@ -1417,7 +1418,7 @@ describe('Long-running worker with lease renewal (requires PostgreSQL)', () => {
 
     const shortTtlRepo = new TaskRepository(pool, 100);
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'renewed-then-expired',
       priority: 'NORMAL',
       payload: {},
@@ -1455,7 +1456,7 @@ describe('Retry and failure interactions (requires PostgreSQL)', () => {
   it('should distinguish execution failure from stalled redelivery', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'failure-vs-stall',
       priority: 'NORMAL',
       payload: {},
@@ -1498,7 +1499,7 @@ describe('Retry and failure interactions (requires PostgreSQL)', () => {
   it('should handle final failure correctly', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'final-failure',
       priority: 'NORMAL',
       payload: {},
@@ -1525,7 +1526,7 @@ describe('Retry and failure interactions (requires PostgreSQL)', () => {
   it('should not confuse temporarily non-reclaimable with permanent failure', async () => {
     requirePg();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'temp-non-reclaimable',
       priority: 'NORMAL',
       payload: {},
