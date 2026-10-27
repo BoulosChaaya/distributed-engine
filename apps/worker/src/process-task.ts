@@ -63,6 +63,13 @@ export interface ProcessTaskDeps {
    * reconciler leaves it alone. Default 60 s.
    */
   suspendedTenantRecheckMs?: number;
+  /**
+   * How long a FORBID_OVERLAP occurrence waits before asking for the
+   * schedule's execution lease again. Not the lease's expiry: the holder
+   * renews it to now + scheduleLeaseDurationMs every renewal, so expiry
+   * says nothing about when the holder will finish.
+   */
+  overlapRecheckMs?: number;
   renewalIntervalMs: number;
   /**
    * How often a running task checks whether it was cancelled (a primary-key
@@ -140,6 +147,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     scheduleLeaseDurationMs,
     leaseDeferralMarginMs,
     suspendedTenantRecheckMs = 60_000,
+    overlapRecheckMs = 5_000,
     renewalIntervalMs,
     cancelCheckIntervalMs = 0,
     workerMetrics,
@@ -236,7 +244,14 @@ export function createProcessTask(deps: ProcessTaskDeps) {
           scheduleLeaseDurationMs,
         );
         if (!leaseResult.acquired) {
-          const deferUntil = (leaseResult.expiresAt?.getTime() ?? Date.now()) + leaseDeferralMarginMs;
+          // Ask again soon rather than at the lease's expiry. The holder
+          // releases the lease the moment it finishes, but nothing wakes a
+          // delayed job, and its expiry is renewed to ~5 minutes ahead every
+          // 10 s. Waiting for expiry ran the next occurrence up to 5 minutes
+          // after the previous one had finished. A crashed holder is still
+          // covered: its lease expires and the next recheck after that wins.
+          const leaseEnd = (leaseResult.expiresAt?.getTime() ?? Date.now()) + leaseDeferralMarginMs;
+          const deferUntil = Math.min(leaseEnd, Date.now() + overlapRecheckMs);
           logger.info('Schedule execution lease held, deferring', {
             taskId,
             scheduleId: schedule.id,
