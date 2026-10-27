@@ -63,6 +63,12 @@ const QUEUE_CONCURRENCY = parseStrictIntInRange(process.env.QUEUE_CONCURRENCY, 5
 const POSTGRES_MAX_CONNECTIONS = parseStrictIntInRange(process.env.POSTGRES_MAX_CONNECTIONS, 10, 'POSTGRES_MAX_CONNECTIONS', 1, 200);
 const TASK_TIMEOUT_MS = parseStrictIntInRange(process.env.TASK_TIMEOUT_MS, 300000, 'TASK_TIMEOUT_MS', 1000, 3600000);
 // A job of a suspended tenant is parked this long before the worker checks again.
+const SCHEDULE_OVERLAP_RECHECK_MS = parseStrictIntInRange(process.env.SCHEDULE_OVERLAP_RECHECK_MS, 5000, 'SCHEDULE_OVERLAP_RECHECK_MS', 500, 300000);
+// SIGTERM: running tasks get this long to finish; then the ones still
+// running are stopped and handed back uncharged. Kept under the 30 s
+// shutdown guard so the hand-back always happens before the process exits.
+const WORKER_SHUTDOWN_DRAIN_MS = parseStrictIntInRange(process.env.WORKER_SHUTDOWN_DRAIN_MS, 20000, 'WORKER_SHUTDOWN_DRAIN_MS', 0, 25000);
+const shutdownController = new AbortController();
 const TENANT_SUSPENDED_RECHECK_MS = parseStrictIntInRange(process.env.TENANT_SUSPENDED_RECHECK_MS, 60000, 'TENANT_SUSPENDED_RECHECK_MS', 1000, 3600000);
 // Hosts the `http` task type may call; empty disables it (no open SSRF from inside the cluster).
 const HTTP_TASK_ALLOWED_HOSTS = (process.env.HTTP_TASK_ALLOWED_HOSTS ?? '')
@@ -113,6 +119,14 @@ async function gracefulShutdown(signal: string) {
     healthServer.close();
   }
 
+  // worker.close() stops taking jobs and waits for the running ones. After
+  // the drain window they are stopped and released (see shutdownSignal in
+  // process-task.ts), so close() returns well before the guard above.
+  const drainTimer = setTimeout(() => {
+    logger.warn('Drain window over; releasing tasks still running', { drainMs: WORKER_SHUTDOWN_DRAIN_MS });
+    shutdownController.abort();
+  }, WORKER_SHUTDOWN_DRAIN_MS);
+
   try {
     if (worker) {
       await worker.close();
@@ -120,6 +134,8 @@ async function gracefulShutdown(signal: string) {
     }
   } catch (error) {
     logger.warn('Error closing worker', { reason: String(error) });
+  } finally {
+    clearTimeout(drainTimer);
   }
 
   if (redisClient) {
@@ -232,12 +248,14 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
     scheduleLeaseDurationMs: SCHEDULE_LEASE_DURATION_MS,
     leaseDeferralMarginMs: LEASE_DEFERRAL_MARGIN_MS,
     suspendedTenantRecheckMs: TENANT_SUSPENDED_RECHECK_MS,
+    overlapRecheckMs: SCHEDULE_OVERLAP_RECHECK_MS,
     renewalIntervalMs: RENEWAL_INTERVAL,
     workerMetrics,
     cancelCheckIntervalMs: CANCEL_CHECK_INTERVAL_MS,
     ClaimNotExpiredError,
     DelayedError,
     UnrecoverableError,
+    shutdownSignal: shutdownController.signal,
     execute: (ctx) => runTaskHandler(taskHandlers, ctx, TASK_TIMEOUT_MS),
   });
 

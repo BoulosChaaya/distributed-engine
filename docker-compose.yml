@@ -71,6 +71,10 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     # No container_name: workers must be scalable (docker compose up --scale worker=3).
+    # SIGTERM gives running tasks a 20 s drain, then hands the rest back; the
+    # process exits by 30 s. Compose's default (10 s, then SIGKILL) cut that
+    # short. Matches terminationGracePeriodSeconds in k8s/worker.yaml.
+    stop_grace_period: 40s
     environment:
       NODE_ENV: development
       REDIS_HOST: redis
