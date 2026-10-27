@@ -120,7 +120,7 @@ model, tracing, event storming): [docs/diagrams](docs/diagrams/README.md).
 
 **Fastest path:** `bash scripts/demo-local.sh` starts everything (API, 3 workers, dashboard, Prometheus, Grafana) and checks it; [docs/RUN-LOCALLY.md](docs/RUN-LOCALLY.md) then walks through tasks, tenants, workflows and breaking things on purpose.
 
-Requirements: Node.js 22+, pnpm (via corepack), Docker.
+Requirements: Node.js 22.19+, pnpm (via corepack), Docker.
 
 ```bash
 cp .env.example .env     # set OPERATOR_API_KEY (openssl rand -hex 32) and dashboard login
