@@ -10,6 +10,7 @@ import { WeightedFairScheduler } from '../fairness';
 import { runMigrations } from '../db/migrations';
 import { createLogger } from '../logger/index';
 import { computeBillingPeriodStart } from '../db/tenant-repository';
+import { submitTask } from './helpers/submit-task';
 
 function createCaptureStream(): { stream: Writable; lines: string[] } {
   const lines: string[] = [];
@@ -98,7 +99,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should publish pending outbox events to BullMQ', async () => {
     requireInfra();
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'outbox-test-1',
       priority: 'HIGH',
       payload: { test: true },
@@ -118,7 +119,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should keep task as QUEUED after publish (no status change needed)', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'outbox-status-test',
       priority: 'NORMAL',
       payload: {},
@@ -136,7 +137,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should use task ID as BullMQ job ID for idempotency', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'idempotent-test',
       priority: 'NORMAL',
       payload: {},
@@ -153,7 +154,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should set per-job BullMQ attempts from maxRetries', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'attempts-test',
       priority: 'NORMAL',
       payload: {},
@@ -171,7 +172,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
     requireInfra();
 
     for (let i = 0; i < 5; i++) {
-      await repo.createTaskWithOutbox({
+      await submitTask(repo, {
         name: `batch-test-${i}`,
         priority: 'NORMAL',
         payload: {},
@@ -197,7 +198,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
     const dedupPublisher = new OutboxPublisher(pool, dedupQueue, 60000, 10, 3);
 
     try {
-      const { task } = await repo.createTaskWithOutbox({
+      const { task } = await submitTask(repo, {
         name: 'dedup-test',
         priority: 'NORMAL',
         payload: {},
@@ -228,7 +229,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should mark event as FAILED after max attempts', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'fail-test',
       priority: 'NORMAL',
       payload: {},
@@ -255,7 +256,7 @@ describe('OutboxPublisher (requires PostgreSQL + Redis)', () => {
   it('should handle atomicity: task and outbox event created together', async () => {
     requireInfra();
 
-    const { task, outboxEvent } = await repo.createTaskWithOutbox({
+    const { task, outboxEvent } = await submitTask(repo, {
       name: 'atomic-test',
       priority: 'NORMAL',
       payload: { foo: 'bar' },
@@ -275,7 +276,7 @@ describe('Cancellation vs outbox race (requires PostgreSQL + Redis)', () => {
   it('should not publish a task that was cancelled before outbox processing', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'cancel-before-publish',
       priority: 'NORMAL',
       payload: {},
@@ -294,7 +295,7 @@ describe('Cancellation vs outbox race (requires PostgreSQL + Redis)', () => {
   it('should mark outbox event as DELIVERED when task is cancelled (skip without error)', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'cancel-mark-delivered',
       priority: 'NORMAL',
       payload: {},
@@ -317,7 +318,7 @@ describe('Cancellation vs outbox race (requires PostgreSQL + Redis)', () => {
   it('should honour cancellation that commits after claim but before publish (SELECT FOR UPDATE)', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'race-cancel',
       priority: 'NORMAL',
       payload: {},
@@ -339,7 +340,7 @@ describe('Cancellation vs outbox race (requires PostgreSQL + Redis)', () => {
   it('should publish a task that is still QUEUED', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'not-cancelled',
       priority: 'NORMAL',
       payload: {},
@@ -356,7 +357,7 @@ describe('Cancellation vs outbox race (requires PostgreSQL + Redis)', () => {
   it('should not re-enqueue a task that was cancelled after initial publication', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'cancel-after-pub',
       priority: 'NORMAL',
       payload: {},
@@ -389,7 +390,7 @@ describe('HALF_OPEN circuit breaker bounding (requires PostgreSQL + Redis)', () 
     const halfOpenPublisher = new OutboxPublisher(pool, queue, 60000, 10, 3);
 
     for (let i = 0; i < 3; i++) {
-      await repo.createTaskWithOutbox({
+      await submitTask(repo, {
         name: `halfopen-test-${i}`,
         priority: 'NORMAL',
         payload: {},
@@ -412,7 +413,7 @@ describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL 
   it('should leave a BullMQ job harmless when task is cancelled after publication', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'race-post-publish-cancel',
       priority: 'NORMAL',
       payload: {},
@@ -432,7 +433,7 @@ describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL 
   it('should allow publication even when task is concurrently cancelled (best-effort check)', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'concurrent-cancel-publish',
       priority: 'NORMAL',
       payload: {},
@@ -457,7 +458,7 @@ describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL 
   it('should document that cancellation check is best-effort, not atomic', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'non-atomic-check',
       priority: 'NORMAL',
       payload: {},
@@ -481,7 +482,7 @@ describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL 
   it('should skip cancelled tasks detected by best-effort check before publish', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'skip-cancelled-early',
       priority: 'NORMAL',
       payload: {},
@@ -499,7 +500,7 @@ describe('Cancellation race: BullMQ job for cancelled task (requires PostgreSQL 
   it('should transition outbox event to DELIVERED even when skipping a cancelled task', async () => {
     requireInfra();
 
-    const { task } = await repo.createTaskWithOutbox({
+    const { task } = await submitTask(repo, {
       name: 'delivered-on-skip',
       priority: 'NORMAL',
       payload: {},
@@ -613,7 +614,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
     (cbPublisher as any).circuitState = 'HALF_OPEN';
     (cbPublisher as any).consecutiveSuccesses = 0;
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'cb-success-1',
       priority: 'NORMAL',
       payload: {},
@@ -623,7 +624,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
     await cbPublisher.processOutbox();
     expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'cb-success-2',
       priority: 'NORMAL',
       payload: {},
@@ -666,7 +667,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
     (cbPublisher as any).circuitState = 'OPEN';
     (cbPublisher as any).lastFailureTime = 900;
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'cb-open-skip',
       priority: 'NORMAL',
       payload: {},
@@ -701,7 +702,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
     expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
 
     // Two successes should close it
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'cb-cycle-1',
       priority: 'NORMAL',
       payload: {},
@@ -710,7 +711,7 @@ describe('Circuit breaker full cycle with injectable timing (requires PostgreSQL
     await cbPublisher.processOutbox();
     expect(cbPublisher.getCircuitState()).toBe('HALF_OPEN');
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'cb-cycle-2',
       priority: 'NORMAL',
       payload: {},
@@ -763,7 +764,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
       nowFn: () => Date.now(),
     });
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'partial-fail-cb-test',
       priority: 'NORMAL',
       payload: {},
@@ -833,7 +834,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
       logger: captureLogger,
     });
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'partial-fail-log-test',
       priority: 'NORMAL',
       payload: {},
@@ -907,7 +908,7 @@ describe('Partial-failure semantics (requires PostgreSQL + Redis)', () => {
       logger: captureLogger,
     });
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'bullmq-fail-log-test',
       priority: 'NORMAL',
       payload: {},
@@ -946,7 +947,7 @@ describe('Outbox stop/drain guarantee (requires PostgreSQL + Redis)', () => {
 
     const drainPublisher = new OutboxPublisher(pool, queue, 50, 10, 3);
 
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'drain-test',
       priority: 'NORMAL',
       payload: {},
@@ -988,7 +989,7 @@ describe('Outbox stop/drain guarantee (requires PostgreSQL + Redis)', () => {
     await drainPublisher.stop();
 
     // Create a task after stop — it should not be processed
-    await repo.createTaskWithOutbox({
+    await submitTask(repo, {
       name: 'after-stop-test',
       priority: 'NORMAL',
       payload: {},
@@ -1015,7 +1016,7 @@ describe('Outbox claim concurrency (requires PostgreSQL + Redis)', () => {
     const pub2 = new OutboxPublisher(pool, queue2, 60000, 10, 3);
 
     for (let i = 0; i < 5; i++) {
-      await repo.createTaskWithOutbox({
+      await submitTask(repo, {
         name: `concurrency-test-${i}`,
         priority: 'NORMAL',
         payload: {},
@@ -1220,7 +1221,7 @@ describe('Redis unreachable: publish timeout (requires PostgreSQL)', () => {
   it('turns a hanging queue.add into failures, opens the breaker, and returns promptly', async () => {
     requireInfra();
     for (let i = 0; i < 7; i++) {
-      await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: { i }, maxRetries: 3 });
+      await submitTask(repo, { name: 'echo', priority: 'NORMAL', payload: { i }, maxRetries: 3 });
     }
     const p = new OutboxPublisher(pool, hangingQueue, 60000, 10, 5, { publishTimeoutMs: 100 });
 
@@ -1245,7 +1246,7 @@ describe('Redis unreachable: publish timeout (requires PostgreSQL)', () => {
 
   it('claims nothing while the breaker is open', async () => {
     requireInfra();
-    await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
+    await submitTask(repo, { name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
     const p = new OutboxPublisher(pool, hangingQueue, 60000, 10, 5, { publishTimeoutMs: 50, failureThreshold: 1 });
 
     await p.processOutbox();
@@ -1260,7 +1261,7 @@ describe('Redis unreachable: publish timeout (requires PostgreSQL)', () => {
 describe('Redis connection down: publishing pauses (requires PostgreSQL)', () => {
   it('claims nothing and charges nothing while the queue connection is not ready', async () => {
     requireInfra();
-    await repo.createTaskWithOutbox({ name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
+    await submitTask(repo, { name: 'echo', priority: 'NORMAL', payload: {}, maxRetries: 3 });
     let status = 'reconnecting';
     const added: string[] = [];
     const flakyQueue = {
@@ -1292,7 +1293,7 @@ describe('OutboxPublisher throughput (requires PostgreSQL + Redis)', () => {
   it('keeps polling without the idle interval while batches come back full', async () => {
     requireInfra();
     for (let i = 0; i < 60; i++) {
-      await repo.createTaskWithOutbox({ name: `burst-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
+      await submitTask(repo, { name: `burst-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
     }
     const fast = new OutboxPublisher(pool, queue, 500, 10, 3);
     fast.start();
@@ -1309,7 +1310,7 @@ describe('OutboxPublisher throughput (requires PostgreSQL + Redis)', () => {
   it('waits the poll interval once a batch comes back short', async () => {
     requireInfra();
     for (let i = 0; i < 3; i++) {
-      await repo.createTaskWithOutbox({ name: `trickle-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
+      await submitTask(repo, { name: `trickle-${i}`, priority: 'NORMAL', payload: {}, maxRetries: 0 });
     }
     const p = new OutboxPublisher(pool, queue, 400, 10, 3);
     const polls = jest.spyOn(p, 'processOutbox');

@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { ScheduleRepository, ScheduleStaleVersionError, DuplicateOccurrenceError } from '../db/schedule-repository';
 import { TaskRepository } from '../db/task-repository';
 import { runMigrations } from '../db/migrations';
+import { submitTask } from './helpers/submit-task';
 
 const TEST_PG_URL = process.env.TEST_POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/distributed_engine_test';
 
@@ -947,7 +948,7 @@ describe('Execution lease primitives (requires PostgreSQL)', () => {
   });
 
   it('10. Existing worker/task lease behavior unaffected by schedule lease', async () => {
-    const { task } = await taskRepo.createTaskWithOutbox({
+    const { task } = await submitTask(taskRepo, {
       name: 'immediate-task',
       priority: 'NORMAL',
       payload: { test: true },
@@ -978,7 +979,7 @@ describe('Execution lease primitives (requires PostgreSQL)', () => {
 
 describe('Existing immediate task behavior preserved (requires PostgreSQL)', () => {
   it('should create immediate tasks as QUEUED with outbox', async () => {
-    const { task, outboxEvent } = await taskRepo.createTaskWithOutbox({
+    const { task, outboxEvent } = await submitTask(taskRepo, {
       name: 'immediate',
       priority: 'NORMAL',
       payload: {},
@@ -992,7 +993,7 @@ describe('Existing immediate task behavior preserved (requires PostgreSQL)', () 
   });
 
   it('should still allow all existing task transitions', async () => {
-    const { task } = await taskRepo.createTaskWithOutbox({
+    const { task } = await submitTask(taskRepo, {
       name: 'transitions',
       priority: 'NORMAL',
       payload: {},
@@ -1012,7 +1013,7 @@ describe('Existing immediate task behavior preserved (requires PostgreSQL)', () 
   });
 
   it('should still allow cancellation', async () => {
-    const { task } = await taskRepo.createTaskWithOutbox({
+    const { task } = await submitTask(taskRepo, {
       name: 'cancel-immediate',
       priority: 'NORMAL',
       payload: {},

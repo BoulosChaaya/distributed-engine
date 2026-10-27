@@ -1,5 +1,5 @@
 import { Pool, PoolClient } from 'pg';
-import { Task, TaskStatus, TaskPriority, OutboxEvent } from '../types.js';
+import { Task, TaskStatus, TaskPriority } from '../types.js';
 import { assertValidTransition } from '../state-machine.js';
 import { generateId } from '../utils.js';
 import { injectTraceContext } from '../telemetry/propagation.js';
@@ -45,11 +45,6 @@ export type TransitionExtra = Partial<Pick<Task, 'result' | 'retries' | 'started
   error?: string | null;
 };
 
-export interface TaskWithOutbox {
-  task: Task;
-  outboxEvent: OutboxEvent;
-}
-
 export function rowToTask(row: Record<string, unknown>): Task {
   return {
     id: row.id as string,
@@ -82,63 +77,6 @@ export function rowToTask(row: Record<string, unknown>): Task {
 
 export class TaskRepository {
   constructor(private pool: Pool, private claimTtlMs: number = 30000) {}
-
-  async createTaskWithOutbox(input: CreateTaskInput): Promise<TaskWithOutbox> {
-    const taskId = generateId();
-    const outboxId = generateId();
-    const client = await this.pool.connect();
-
-    try {
-      await client.query('BEGIN');
-
-      const taskResult = await client.query(
-        `INSERT INTO tasks (id, name, status, priority, payload, max_retries, retries, version, created_at, updated_at)
-         VALUES ($1, $2, 'QUEUED', $3, $4, $5, 0, 1, NOW(), NOW())
-         RETURNING *`,
-        [taskId, input.name, input.priority, JSON.stringify(input.payload), input.maxRetries],
-      );
-
-      const outboxPayload = {
-        taskId,
-        taskName: input.name,
-        priority: input.priority,
-        payload: input.payload,
-        maxRetries: input.maxRetries,
-      };
-
-      const traceCtx = injectTraceContext();
-      const hasTraceContext = Object.keys(traceCtx).length > 0;
-
-      const outboxResult = await client.query(
-        `INSERT INTO outbox_events (id, task_id, event_type, payload, status, attempts, created_at, trace_context)
-         VALUES ($1, $2, 'TASK_CREATED', $3, 'PENDING', 0, NOW(), $4)
-         RETURNING *`,
-        [outboxId, taskId, JSON.stringify(outboxPayload), hasTraceContext ? JSON.stringify(traceCtx) : null],
-      );
-
-      await client.query('COMMIT');
-
-      const task = rowToTask(taskResult.rows[0]);
-      const outboxEvent: OutboxEvent = {
-        id: outboxResult.rows[0].id,
-        taskId: outboxResult.rows[0].task_id,
-        eventType: outboxResult.rows[0].event_type,
-        payload: outboxResult.rows[0].payload,
-        status: outboxResult.rows[0].status,
-        attempts: outboxResult.rows[0].attempts,
-        createdAt: new Date(outboxResult.rows[0].created_at),
-        processedAt: outboxResult.rows[0].processed_at ? new Date(outboxResult.rows[0].processed_at) : undefined,
-        traceContext: outboxResult.rows[0].trace_context ?? undefined,
-      };
-
-      return { task, outboxEvent };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
 
   async getTask(taskId: string): Promise<Task | null> {
     const result = await this.pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);

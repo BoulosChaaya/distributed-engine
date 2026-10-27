@@ -7,6 +7,7 @@ import { TenantRepository, computeBillingPeriodStart } from '../db/tenant-reposi
 import { OutboxPublisher } from '../db/outbox-publisher';
 import { WeightedFairScheduler } from '../fairness';
 import { runMigrations } from '../db/migrations';
+import { submitTask } from './helpers/submit-task';
 
 // Publish-time admission: a tenant's tasks reach BullMQ only into free
 // concurrency slots, in priority-then-age order. Real PostgreSQL + Redis.
@@ -132,7 +133,7 @@ describe('publish-time tenant admission (requires PostgreSQL + Redis)', () => {
     const { submit } = await tenantWithLimit(1);
     await submit('t1', 'NORMAL');
     await submit('t2', 'NORMAL');
-    await tasks.createTaskWithOutbox({ name: 'operator', priority: 'NORMAL', payload: {}, maxRetries: 0 });
+    await submitTask(tasks, { name: 'operator', priority: 'NORMAL', payload: {}, maxRetries: 0 });
     expect(await publisher(true).processOutbox()).toBe(2);
     expect((await published()).sort()).toEqual(['operator', 't1']);
   });
