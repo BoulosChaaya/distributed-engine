@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.2 (2026-10-28)
+
+Fixes for the findings the v1.0.1 Engine Atlas left open. Each fix came
+with a test that failed before it; the overlap fix also with a live run.
+
+### Fixed
+- **FORBID_OVERLAP runs occurrences oldest first.** A free lease went to
+  whichever occurrence asked first, and a new one asks the moment it is due,
+  so on a schedule firing faster than its runs finish an older occurrence
+  lost every time (recorded: 55 s, overtaken by three newer runs). The lease
+  now goes to the oldest occurrence still QUEUED. (#89)
+
+### Security
+- **The `http` task checks the address it connects to, not only the host
+  name.** An allow-listed name pointing at a private or metadata address was
+  reachable. Link-local (cloud metadata), unspecified and multicast addresses
+  are now never called; private and loopback addresses only for names also in
+  the new `HTTP_TASK_PRIVATE_HOSTS`. The check runs in the connection's own
+  DNS lookup, so it cannot be rebound. Adds undici 8.12.1; requires
+  Node >= 22.19. (#90)
+
+### Changed
+- **`http` tasks send `Idempotency-Key: <task id>`**, the same on every
+  attempt, so a receiver that honours it can drop a repeat after a worker
+  crash. A key set in the payload is kept. The load test checks that every
+  repeated call carried one unchanged key. (#91)
+- **Tests create tasks through `acceptTask`**, the path the API uses;
+  `createTaskWithOutbox`, called only by tests since 1.0.1, is removed. (#92)
+
+### Upgrade notes
+- Workers that call internal services through `http` tasks (a compose
+  service, a cluster Service) need those hosts in `HTTP_TASK_PRIVATE_HOSTS`
+  as well as `HTTP_TASK_ALLOWED_HOSTS`; otherwise those tasks now fail with
+  "resolves to …, a private address".
+- Node 22.19 or newer.
+
 ## 1.0.1 (2026-10-27)
 
 Bug fixes and security updates found by tracing the system map: every

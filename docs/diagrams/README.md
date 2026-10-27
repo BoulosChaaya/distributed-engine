@@ -15,6 +15,6 @@ Mermaid, so GitHub renders it here and a change to it is reviewed like code.
 The one rule behind all six: **PostgreSQL decides what is true.** Redis, the
 workers and the API can each die; the system re-derives its state from PostgreSQL.
 
-These diagrams describe v1.0.1. Names (tables, statuses, span names, events)
+These diagrams describe v1.0.2. Names (tables, statuses, span names, events)
 are the ones in the code; if a diagram and the code disagree, the code wins
 and the diagram is the bug.

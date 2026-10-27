@@ -1,6 +1,6 @@
 {
   "name": "@distributed-engine/api",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "REST API server for task submission and management",
   "type": "module",
   "main": "./dist/main.js",
