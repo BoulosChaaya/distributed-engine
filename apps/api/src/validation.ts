@@ -6,6 +6,10 @@ export const SubmitTaskSchema = z.object({
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'CRITICAL']).optional().default('NORMAL'),
   maxRetries: z.number().int().min(0).max(10).optional().default(3),
   scheduledFor: z.string().datetime().optional(),
+  // Same key + same body returns the first task (200); same key + another
+  // body is refused (409). Without it, a client that never saw the 201
+  // could only resend and create a second task.
+  idempotencyKey: z.string().min(1).max(255).optional(),
 });
 
 export type SubmitTaskInput = z.infer<typeof SubmitTaskSchema>;
