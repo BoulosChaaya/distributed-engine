@@ -183,7 +183,7 @@ console.log(`   ${a.length} tasks, ${w.length} workflows, ${m.length} idempotenc
 ' "$OUT/console.log" "$OUT"
 sql "CREATE TABLE load_accepted (kind TEXT, tenant TEXT, task_id TEXT, token TEXT);
      CREATE TABLE load_workflows (tenant TEXT, workflow_id TEXT);
-     CREATE TABLE load_sink (token TEXT, hits INT);" >/dev/null
+     CREATE TABLE load_sink (token TEXT, hits INT, keys INT);" >/dev/null
 "${compose[@]}" exec -T postgres psql -U postgres -d distributed_engine -c "\copy load_accepted FROM STDIN" < "$OUT/accepted.tsv" >/dev/null
 "${compose[@]}" exec -T postgres psql -U postgres -d distributed_engine -c "\copy load_workflows FROM STDIN" < "$OUT/workflows.tsv" >/dev/null
 
@@ -219,6 +219,9 @@ wf_bad=$(q "SELECT count(*) FROM load_workflows l LEFT JOIN workflows w ON w.id 
 no_effect=$(q "SELECT count(*) FROM load_accepted a JOIN tasks t ON t.id = a.task_id LEFT JOIN load_sink s ON s.token = a.token
                WHERE a.kind = 'http' AND t.status = 'COMPLETED' AND s.token IS NULL")
 reexec=$(q "SELECT count(*) FROM load_sink WHERE hits > 1")
+# keys = distinct Idempotency-Keys seen for the token (0 if a call had none).
+# A repeat with exactly one key is one an honouring receiver would drop.
+reexec_nokey=$(q "SELECT count(*) FROM load_sink WHERE hits > 1 AND keys <> 1")
 http_done=$(q "SELECT count(*) FROM load_accepted a JOIN tasks t ON t.id = a.task_id WHERE a.kind = 'http' AND t.status = 'COMPLETED'")
 outbox_pending=$(q "SELECT count(*) FROM outbox_events WHERE status = 'PENDING'")
 outbox_failed=$(q "SELECT count(*) FROM outbox_events WHERE status = 'FAILED'")
@@ -264,7 +267,7 @@ for job in engine_api_process_resident_memory_bytes engine_worker_process_reside
 done
 
 node scripts/load-report.mjs "$OUT" \
-  "lost=$lost" "open=$open" "wrong=$wrong" "wf_bad=$wf_bad" "no_effect=$no_effect" "reexec=$reexec" \
+  "lost=$lost" "open=$open" "wrong=$wrong" "wf_bad=$wf_bad" "no_effect=$no_effect" "reexec=$reexec" "reexec_nokey=$reexec_nokey" \
   "http_done=$http_done" "outbox_pending=$outbox_pending" "outbox_failed=$outbox_failed" "mismatch=$mismatch" \
   "peak_conn=$peak_conn" "max_conn=$max_conn" "reclaims=$reclaims" "requeued=$requeued" "k6_status=$k6_status" "start=$START" "end=$END" "drained=$DRAINED" \
   "duration_min=$DURATION_MIN" "workers=$WORKERS" "rates=${RATE_HEAVY}/${RATE_MEDIUM}/${RATE_LIGHT}"

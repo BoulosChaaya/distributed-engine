@@ -143,7 +143,7 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
   });
 
   // Calls an HTTP endpoint on an allow-listed host.
-  handlers.set('http', async ({ payload, signal }) => {
+  handlers.set('http', async ({ taskId, payload, signal }) => {
     if (allowed.length === 0) {
       throw new NonRetryableTaskError('http handler is disabled: set HTTP_TASK_ALLOWED_HOSTS on the worker');
     }
@@ -182,6 +182,13 @@ export function createBuiltinHandlers(options: BuiltinHandlerOptions = {}): Map<
         if (typeof v !== 'string') throw new NonRetryableTaskError('payload.headers must be an object of strings');
         headers[k] = v;
       }
+    }
+    // A task runs at least once: if a worker dies mid-call, another worker
+    // makes the call again. The task id, the same on every attempt, lets a
+    // receiver that honours Idempotency-Key (Stripe-style APIs, the IETF
+    // draft) drop the repeat. A key set in the payload is kept.
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === 'idempotency-key')) {
+      headers['Idempotency-Key'] = taskId;
     }
     let body: string | undefined;
     if (payload.body !== undefined && method !== 'GET' && method !== 'HEAD') {
