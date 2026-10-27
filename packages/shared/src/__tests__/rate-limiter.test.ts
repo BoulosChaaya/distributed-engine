@@ -1,24 +1,13 @@
 import { describe, it, expect, jest } from '@jest/globals';
 import { RedisRateLimiter } from '../rate-limiter';
 
+// Unit tests with a stand-in client. The real behaviour (one atomic script,
+// only allowed requests recorded) is tested against Redis in
+// rate-limiter-redis.test.ts.
 function makeMockRedis(overrides: any = {}): any {
-  const pipeline = {
-    zremrangebyscore: jest.fn().mockReturnThis(),
-    zadd: jest.fn().mockReturnThis(),
-    zcard: jest.fn().mockReturnThis(),
-    pexpire: jest.fn().mockReturnThis(),
-    exec: jest.fn<any>().mockResolvedValue([
-      [null, 0],
-      [null, 1],
-      [null, 1],
-      [null, 1],
-    ]),
-  };
-
   return {
     status: 'ready',
-    pipeline: jest.fn().mockReturnValue(pipeline),
-    _pipeline: pipeline,
+    eval: jest.fn<any>().mockResolvedValue([1, 1]),
     ...overrides,
   };
 }
@@ -34,14 +23,7 @@ describe('RedisRateLimiter', () => {
   });
 
   it('should deny requests over limit', async () => {
-    const redis = makeMockRedis();
-    redis._pipeline.exec.mockResolvedValue([
-      [null, 0],
-      [null, 1],
-      [null, 11],
-      [null, 1],
-    ]);
-
+    const redis = makeMockRedis({ eval: jest.fn<any>().mockResolvedValue([0, 10]) });
     const limiter = new RedisRateLimiter(redis, 60000);
     const result = await limiter.check('tenant:t1', 10);
 
@@ -50,11 +32,7 @@ describe('RedisRateLimiter', () => {
   });
 
   it('should fail-open on Redis error', async () => {
-    const redis = makeMockRedis();
-    redis.pipeline.mockImplementation(() => {
-      throw new Error('Redis unavailable');
-    });
-
+    const redis = makeMockRedis({ eval: jest.fn<any>().mockRejectedValue(new Error('Redis unavailable')) });
     const limiter = new RedisRateLimiter(redis, 60000);
     const result = await limiter.check('tenant:t1', 10);
 
@@ -62,24 +40,18 @@ describe('RedisRateLimiter', () => {
     expect(result.remaining).toBe(10);
   });
 
-  it('should fail-open when pipeline returns null', async () => {
-    const redis = makeMockRedis();
-    redis._pipeline.exec.mockResolvedValue(null);
-
-    const limiter = new RedisRateLimiter(redis, 60000);
-    const result = await limiter.check('tenant:t1', 10);
-
-    expect(result.allowed).toBe(true);
-  });
-
-  it('should use correct sliding window key', async () => {
+  it('passes the key, the window and the limit to one script call', async () => {
     const redis = makeMockRedis();
     const limiter = new RedisRateLimiter(redis, 60000);
 
     await limiter.check('tenant:abc', 5);
 
-    const pipeline = redis._pipeline;
-    expect(pipeline.zremrangebyscore).toHaveBeenCalled();
+    expect(redis.eval).toHaveBeenCalledTimes(1);
+    const args = redis.eval.mock.calls[0];
+    expect(args[1]).toBe(1);
+    expect(args[2]).toBe('ratelimit:tenant:abc');
+    expect(args[5]).toBe(5);
+    expect(args[7]).toBe(60000);
   });
 });
 
@@ -89,8 +61,7 @@ describe('RedisRateLimiter while Redis is unavailable', () => {
   // the call simply waited, and every tenant request with it, for as long as
   // Redis was down.
   it('fails open within the timeout when Redis does not answer', async () => {
-    const redis = makeMockRedis();
-    redis._pipeline.exec.mockReturnValue(new Promise(() => {}));
+    const redis = makeMockRedis({ eval: jest.fn<any>().mockReturnValue(new Promise(() => {})) });
     const limiter = new RedisRateLimiter(redis, 60000, 100);
 
     const started = Date.now();
@@ -107,6 +78,6 @@ describe('RedisRateLimiter while Redis is unavailable', () => {
     const result = await limiter.check('tenant:t1', 10);
     expect(Date.now() - started).toBeLessThan(50);
     expect(result.allowed).toBe(true);
-    expect(redis.pipeline).not.toHaveBeenCalled();
+    expect(redis.eval).not.toHaveBeenCalled();
   });
 });

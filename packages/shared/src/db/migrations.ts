@@ -347,6 +347,17 @@ const MIGRATIONS = [
         EXECUTE FUNCTION notify_outbox_wakeup();
     `,
   },
+  {
+    version: 21,
+    name: 'add_operator_idempotency_index',
+    // idx_tasks_idempotency covers (tenant_id, idempotency_key), but NULLs
+    // are distinct in a unique index, so two operator tasks (tenant_id NULL)
+    // with the same key never collide there. This index is the operator's.
+    sql: `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_operator_idempotency
+        ON tasks(idempotency_key) WHERE tenant_id IS NULL AND idempotency_key IS NOT NULL;
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<void> {

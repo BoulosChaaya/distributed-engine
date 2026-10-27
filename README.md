@@ -175,7 +175,7 @@ They answer 503 if no key is configured.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /tasks | Create a task (`scheduledFor` makes it one-time scheduled) |
+| POST | /tasks | Create a task (supports `idempotencyKey`: 201 new, 200 same task again, 409 same key with another body; a future `scheduledFor` waits as SCHEDULED) |
 | GET | /tasks, /tasks/:id | List (paginated) / get |
 | PUT | /tasks/:id/cancel | Cancel |
 | POST | /tasks/:id/retry | Send a FAILED task back to the queue with a fresh retry budget (not workflow steps) |
@@ -286,6 +286,7 @@ claim token, so a worker that lost its lease can never record an outcome.
 | TASK_TIMEOUT_MS | 300000 | Per-task execution limit |
 | HTTP_TASK_ALLOWED_HOSTS | — | Comma-separated hosts for `http` tasks (`*.example.com` allowed); empty = disabled |
 | SCHEDULE_LEASE_DURATION_MS | 300000 | FORBID_OVERLAP execution lease |
+| SCHEDULE_OVERLAP_RECHECK_MS | 5000 | How often a blocked FORBID_OVERLAP occurrence asks for the lease again |
 
 **Dashboard:** `ENGINE_API_URL`, `OPERATOR_API_KEY`, `DASHBOARD_USER`,
 `DASHBOARD_PASSWORD`. Missing login → 503.

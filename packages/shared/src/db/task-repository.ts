@@ -13,18 +13,23 @@ export interface CreateTaskInput {
   maxRetries: number;
 }
 
-export interface AcceptTaskInput {
-  tenantId: string;
+/**
+ * A submission through the tenant API, or (tenantId null) through the
+ * operator API. Both take the same path: one transaction for the idempotency
+ * check, the quota charge (tenants only), the task and its outbox event.
+ */
+export type AcceptTaskInput = {
   name: string;
   priority: TaskPriority;
   payload: Record<string, unknown>;
   maxRetries: number;
   idempotencyKey?: string;
-  billingPeriodStart: Date;
-  maxJobsPerPeriod: number;
   scheduledFor?: string;
   scheduleId?: string;
-}
+} & (
+  | { tenantId: string; billingPeriodStart: Date; maxJobsPerPeriod: number }
+  | { tenantId: null; billingPeriodStart?: undefined; maxJobsPerPeriod?: undefined }
+);
 
 export interface AcceptTaskResult {
   task: Task;
@@ -548,21 +553,23 @@ export class TaskRepository {
 
       if (input.idempotencyKey) {
         const existing = await client.query(
-          `SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2`,
+          `SELECT * FROM tasks WHERE tenant_id IS NOT DISTINCT FROM $1 AND idempotency_key = $2`,
           [input.tenantId, input.idempotencyKey],
         );
         if (existing.rows.length > 0) {
           const hash = computeIdempotencyHash(input.name, input.priority, input.maxRetries, input.payload, input.scheduledFor, input.scheduleId);
           if (existing.rows[0].idempotency_hash !== hash) {
             await client.query('ROLLBACK');
-            throw new IdempotencyConflictError(input.tenantId, input.idempotencyKey);
+            throw new IdempotencyConflictError(input.tenantId ?? 'operator', input.idempotencyKey);
           }
           await client.query('COMMIT');
           return { task: rowToTask(existing.rows[0]), idempotent: true };
         }
       }
 
-      await chargeTenantJob(client, input.tenantId, input.billingPeriodStart, input.maxJobsPerPeriod);
+      if (input.tenantId !== null) {
+        await chargeTenantJob(client, input.tenantId, input.billingPeriodStart, input.maxJobsPerPeriod);
+      }
 
       const taskId = generateId();
       const outboxId = generateId();
@@ -615,7 +622,7 @@ export class TaskRepository {
       const pgError = error as { code?: string };
       if (pgError.code === '23505' && input.idempotencyKey) {
         const winner = await client.query(
-          'SELECT * FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2',
+          'SELECT * FROM tasks WHERE tenant_id IS NOT DISTINCT FROM $1 AND idempotency_key = $2',
           [input.tenantId, input.idempotencyKey],
         );
         if (winner.rows.length > 0) {
@@ -623,7 +630,7 @@ export class TaskRepository {
           if (winner.rows[0].idempotency_hash === hash) {
             return { task: rowToTask(winner.rows[0]), idempotent: true };
           }
-          throw new IdempotencyConflictError(input.tenantId, input.idempotencyKey);
+          throw new IdempotencyConflictError(input.tenantId ?? 'operator', input.idempotencyKey);
         }
       }
 
