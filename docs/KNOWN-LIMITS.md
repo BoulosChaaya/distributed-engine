@@ -10,9 +10,11 @@ come from the load test ([load-test.md](load-test.md)).
   died runs again on another worker. PostgreSQL records exactly one terminal
   state per task (version column plus claim token), but a side effect the
   handler performed before the crash (an HTTP call, an email) can happen
-  twice. Handlers with external effects must be idempotent; the `http` task
-  type is not made idempotent by the engine. The load test counts these
-  re-executions instead of failing on them.
+  twice. Handlers with external effects must be idempotent. The `http` task
+  type sends `Idempotency-Key: <task id>`, the same on every attempt, so a
+  receiver that honours the header drops the repeat; a receiver that ignores
+  it still sees the call twice. The load test counts these re-executions
+  instead of failing on them.
 - **A resend is safe only with an idempotency key.** Both submit routes
   (`POST /tasks` and `POST /tenant/tasks`) and both workflow routes accept
   `idempotencyKey`: the same key and body return the first task (200), the

@@ -28,7 +28,7 @@ beforeAll(async () => {
     req.on('end', () => {
       if (req.url === '/ok') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ got: body ? JSON.parse(body) : null, auth: req.headers['x-token'] ?? null }));
+        res.end(JSON.stringify({ got: body ? JSON.parse(body) : null, auth: req.headers['x-token'] ?? null, key: req.headers['idempotency-key'] ?? null }));
       } else if (req.url === '/missing') {
         res.writeHead(404);
         res.end('nope');
@@ -115,7 +115,21 @@ describe('http handler', () => {
       url: `${base}/ok`, method: 'post', headers: { 'x-token': 'abc' }, body: { n: 1 },
     }), 5000);
     expect(out.status).toBe(200);
-    expect(JSON.parse(out.body)).toEqual({ got: { n: 1 }, auth: 'abc' });
+    expect(JSON.parse(out.body)).toMatchObject({ got: { n: 1 }, auth: 'abc' });
+  });
+
+  it('sends Idempotency-Key = task id, the same on every attempt, so the receiver can drop a re-run', async () => {
+    // A task runs at least once: after a worker dies mid-call, the call is
+    // made again by another worker. The key lets the receiver tell.
+    const first: any = await runTaskHandler(handlers, { ...ctx('http', { url: `${base}/ok`, method: 'POST', body: {} }), taskId: 'task-42', attempt: 1 }, 5000);
+    const again: any = await runTaskHandler(handlers, { ...ctx('http', { url: `${base}/ok`, method: 'POST', body: {} }), taskId: 'task-42', attempt: 2 }, 5000);
+    expect(JSON.parse(first.body).key).toBe('task-42');
+    expect(JSON.parse(again.body).key).toBe('task-42');
+  });
+
+  it('keeps an Idempotency-Key the payload sets itself', async () => {
+    const out: any = await runTaskHandler(handlers, ctx('http', { url: `${base}/ok`, headers: { 'idempotency-key': 'order-7' } }), 5000);
+    expect(JSON.parse(out.body).key).toBe('order-7');
   });
 
   it('refuses hosts outside the allow-list without making a request', async () => {

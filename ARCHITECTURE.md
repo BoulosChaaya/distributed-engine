@@ -427,7 +427,7 @@ The system guarantees at-least-once delivery, not exactly-once. Duplicate proces
 - Worker completes work but crashes before writing COMPLETED to PG
 - BullMQ retries a job that was already processed
 
-Task handlers should be idempotent to handle these cases safely. What *is* exactly-once is the recorded outcome: COMPLETED is terminal in the state machine, and every transition out of PROCESSING needs the current claim token. A duplicate execution can never record a second result.
+Task handlers should be idempotent to handle these cases safely. The built-in `http` handler helps the other side do that: every call carries `Idempotency-Key: <task id>`, identical on every attempt and after a reclaim, unless the payload sets its own. What *is* exactly-once is the recorded outcome: COMPLETED is terminal in the state machine, and every transition out of PROCESSING needs the current claim token. A duplicate execution can never record a second result.
 
 ## Multi-Tenancy
 

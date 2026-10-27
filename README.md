@@ -162,7 +162,7 @@ cannot make code appear.
 | `echo` | anything | Returns the payload as the result |
 | `sleep` | `{ "ms": 1000 }` (max 300000) | Waits; stands in for slow I/O |
 | `flaky` | `{ "failTimes": 1 }` | Fails the first N attempts, then succeeds |
-| `http` | `{ "url", "method", "headers", "body", "timeoutMs" }` | Calls an allow-listed host; disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set |
+| `http` | `{ "url", "method", "headers", "body", "timeoutMs" }` | Calls an allow-listed host with `Idempotency-Key: <task id>`; disabled unless `HTTP_TASK_ALLOWED_HOSTS` is set |
 
 - **Permanent errors** (unknown type, bad payload, HTTP 4xx): FAILED on that
   attempt.
@@ -258,7 +258,9 @@ claim token, so a worker that lost its lease can never record an outcome.
 
 - A task whose worker dies mid-run executes again on another worker.
 - PostgreSQL records exactly one result per task.
-- Handlers that call external systems should be idempotent.
+- Handlers that call external systems should be idempotent. The `http`
+  task sends `Idempotency-Key: <task id>` on every attempt so the receiver
+  can drop a repeat.
 
 ## Configuration
 
