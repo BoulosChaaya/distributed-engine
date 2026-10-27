@@ -5,3 +5,5 @@ packages:
 # Remove once express itself requires body-parser >= 2.4.0.
 overrides:
   body-parser: '>=2.4.0 <3'
+  # GHSA-6pq8-jhm2-2vcw (moderate). express parses with qs; remove once express requires >= 6.16.1.
+  qs: '>=6.16.1 <7'
