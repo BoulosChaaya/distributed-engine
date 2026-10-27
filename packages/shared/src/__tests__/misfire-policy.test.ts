@@ -26,7 +26,14 @@ beforeEach(async () => {
   await pool.query('TRUNCATE outbox_events, tasks, recurring_schedules CASCADE');
 });
 
-async function scheduleDue(policy: MisfirePolicy, nextRunAt: Date, cron = '0 * * * *') {
+// Hourly at a minute half an hour away from now. With '0 * * * *' a run in the
+// first minute of an hour saw the latest occurrence as on time (less than the
+// 60 s misfire threshold), so SKIP_MISSED correctly ran it and the test
+// failed: it failed in CI on a dependency PR that ran at 13:00.
+const minute = (new Date().getUTCMinutes() + 30) % 60;
+const HOURLY = `${minute} * * * *`;
+
+async function scheduleDue(policy: MisfirePolicy, nextRunAt: Date, cron = HOURLY) {
   return repo.createSchedule({
     name: `misfire-${policy}`, taskName: 'echo', taskPriority: 'NORMAL', taskPayload: {}, taskMaxRetries: 3,
     cronExpression: cron, timezone: 'UTC', nextRunAt, misfirePolicy: policy, overlapPolicy: 'ALLOW_OVERLAP',
@@ -36,7 +43,7 @@ const occurrences = async (id: string) =>
   (await pool.query('SELECT scheduled_for FROM tasks WHERE schedule_id = $1 ORDER BY scheduled_for', [id])).rows;
 
 describe('Misfire policies after 3 hours of downtime (requires PostgreSQL)', () => {
-  const threeHoursAgo = () => { const d = new Date(Date.now() - 3 * 3600e3); d.setUTCMinutes(0, 0, 0); return d; };
+  const threeHoursAgo = () => { const d = new Date(Date.now() - 3 * 3600e3); d.setUTCMinutes(minute, 0, 0); return d; };
 
   it('SKIP_MISSED runs nothing and moves to the next future hour', async () => {
     const s = await scheduleDue('SKIP_MISSED', threeHoursAgo());
