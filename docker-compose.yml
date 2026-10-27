@@ -93,6 +93,8 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       # Hosts the `http` task type may call (comma-separated). Empty disables it.
       HTTP_TASK_ALLOWED_HOSTS: ${HTTP_TASK_ALLOWED_HOSTS:-}
+      # Of those, the ones that may resolve to a private address (internal services).
+      HTTP_TASK_PRIVATE_HOSTS: ${HTTP_TASK_PRIVATE_HOSTS:-}
     depends_on:
       redis:
         condition: service_healthy

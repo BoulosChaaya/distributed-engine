@@ -81,9 +81,9 @@ model, tracing, event storming): [docs/diagrams](docs/diagrams/README.md).
   - a failed step cancels only its downstream; independent branches finish
   - cancel a whole workflow; idempotency keys; tenants charged one job per step
 - **Task handlers:**
-  - `echo`, `sleep`, `flaky` (fails on purpose), and `http` (SSRF-safe
-    allow-list; a redirect fails the task permanently instead of
-    counting as success)
+  - `echo`, `sleep`, `flaky` (fails on purpose), and `http` (SSRF-safe:
+    an allow-list of hosts plus a check of the address actually connected
+    to; a redirect fails the task permanently instead of counting as success)
   - permanent vs transient errors
   - retry budget owned by PostgreSQL
   - per-task timeout
@@ -120,7 +120,7 @@ model, tracing, event storming): [docs/diagrams](docs/diagrams/README.md).
 
 **Fastest path:** `bash scripts/demo-local.sh` starts everything (API, 3 workers, dashboard, Prometheus, Grafana) and checks it; [docs/RUN-LOCALLY.md](docs/RUN-LOCALLY.md) then walks through tasks, tenants, workflows and breaking things on purpose.
 
-Requirements: Node.js 22+, pnpm (via corepack), Docker.
+Requirements: Node.js 22.19+, pnpm (via corepack), Docker.
 
 ```bash
 cp .env.example .env     # set OPERATOR_API_KEY (openssl rand -hex 32) and dashboard login
@@ -286,6 +286,7 @@ claim token, so a worker that lost its lease can never record an outcome.
 | QUEUE_CONCURRENCY | 5 | Jobs in parallel per worker |
 | TASK_TIMEOUT_MS | 300000 | Per-task execution limit |
 | HTTP_TASK_ALLOWED_HOSTS | — | Comma-separated hosts for `http` tasks (`*.example.com` allowed); empty = disabled |
+| HTTP_TASK_PRIVATE_HOSTS | — | Allow-listed hosts that may resolve to private or loopback addresses (internal services); link-local is always refused |
 | SCHEDULE_LEASE_DURATION_MS | 300000 | FORBID_OVERLAP execution lease |
 | SCHEDULE_OVERLAP_RECHECK_MS | 5000 | How often a blocked FORBID_OVERLAP occurrence asks for the lease again |
 

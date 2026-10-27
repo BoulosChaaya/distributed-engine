@@ -266,6 +266,7 @@ Loki/Grafana setup.
 | Tasks sit in QUEUED | Workers running? Redis reachable? | If Redis lost jobs, the reconciler requeues them after the grace period ([docs/redis-loss-recovery.md](docs/redis-loss-recovery.md)) |
 | Task FAILED at once with "No handler registered" | Task `name` | Use a registered type (`echo`, `sleep`, `flaky`, `http`) |
 | `http` task FAILED "not in HTTP_TASK_ALLOWED_HOSTS" | Worker env | Add the host to `HTTP_TASK_ALLOWED_HOSTS` |
+| `http` task FAILED "resolves to …, a private address" | Worker env, DNS | If it is an internal service you mean to call, add the host to `HTTP_TASK_PRIVATE_HOSTS` too |
 | StaleVersion / ClaimTokenMismatch in logs | — | Expected under contention or after a lease loss; only one writer wins |
 
 ## Backup
