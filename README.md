@@ -175,7 +175,7 @@ They answer 503 if no key is configured.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /tasks | Create a task (`scheduledFor` makes it one-time scheduled) |
+| POST | /tasks | Create a task (supports `idempotencyKey`: 201 new, 200 same task again, 409 same key with another body; a future `scheduledFor` waits as SCHEDULED) |
 | GET | /tasks, /tasks/:id | List (paginated) / get |
 | PUT | /tasks/:id/cancel | Cancel |
 | POST | /tasks/:id/retry | Send a FAILED task back to the queue with a fresh retry budget (not workflow steps) |
