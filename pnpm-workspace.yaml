@@ -1,3 +1,7 @@
 packages:
   - 'apps/*'
   - 'packages/*'
+# Security floor for a transitive dependency of express (GHSA-27r3-jxmh-p828).
+# Remove once express itself requires body-parser >= 2.4.0.
+overrides:
+  body-parser: '>=2.4.0 <3'
