@@ -282,7 +282,8 @@ describe('Worker orchestration', () => {
   });
 
   it('4. FORBID_OVERLAP contention defers through moveToDelayed + DelayedError', async () => {
-    const leaseExpiresAt = new Date(Date.now() + 60000);
+    // A lease that ends before the next recheck: wake right after it ends.
+    const leaseExpiresAt = new Date(Date.now() + 1000);
     const taskRepo = makeMockTaskRepo({
       getTask: jest.fn<any>().mockResolvedValue(makeTask({ scheduleId: 'sched-1' })),
     });
@@ -321,6 +322,42 @@ describe('Worker orchestration', () => {
       leaseExpiresAt.getTime() + 2000,
       job.token,
     );
+  });
+
+  it('4b. a blocked occurrence rechecks soon, not when a renewed 5-minute lease would expire', async () => {
+    // The holder renews its lease to now + SCHEDULE_LEASE_DURATION_MS (300 s)
+    // every 10 s, so expiresAt says nothing about when the holder finishes.
+    // Waiting for it delays the next occurrence by up to 5 minutes after the
+    // holder is done (ARCHITECTURE.md promises it "re-activates after the
+    // lease holder finishes").
+    const now = Date.now();
+    const taskRepo = makeMockTaskRepo({
+      getTask: jest.fn<any>().mockResolvedValue(makeTask({ scheduleId: 'sched-1' })),
+    });
+    const scheduleRepo = makeMockScheduleRepo({
+      getSchedule: jest.fn<any>().mockResolvedValue({ id: 'sched-1', overlapPolicy: 'FORBID_OVERLAP' }),
+      acquireExecutionLease: jest.fn<any>().mockResolvedValue({ acquired: false, expiresAt: new Date(now + 300000) }),
+    });
+    const processTask = createProcessTask({
+      taskRepo,
+      scheduleRepo,
+      tracing: makeMockTracing(),
+      logger: makeMockLogger(),
+      workerId: 'w-1',
+      scheduleLeaseDurationMs: 300000,
+      leaseDeferralMarginMs: 2000,
+      renewalIntervalMs: 10000,
+      workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
+      ClaimNotExpiredError: MockClaimNotExpiredError,
+      DelayedError: MockDelayedError,
+      execute: sleepExecute,
+    });
+    const job = makeMockJob();
+
+    await expect(processTask(job, 'task-1', makeMockSpan())).rejects.toThrow('DelayedError');
+
+    const [wakeAt] = job.moveToDelayed.mock.calls[0] as [number, string];
+    expect(wakeAt - now).toBeLessThanOrEqual(10000);
   });
 
   it('5. overlap deferral occurs before QUEUED to PROCESSING transition', async () => {

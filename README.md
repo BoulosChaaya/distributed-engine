@@ -286,6 +286,7 @@ claim token, so a worker that lost its lease can never record an outcome.
 | TASK_TIMEOUT_MS | 300000 | Per-task execution limit |
 | HTTP_TASK_ALLOWED_HOSTS | — | Comma-separated hosts for `http` tasks (`*.example.com` allowed); empty = disabled |
 | SCHEDULE_LEASE_DURATION_MS | 300000 | FORBID_OVERLAP execution lease |
+| SCHEDULE_OVERLAP_RECHECK_MS | 5000 | How often a blocked FORBID_OVERLAP occurrence asks for the lease again |
 
 **Dashboard:** `ENGINE_API_URL`, `OPERATOR_API_KEY`, `DASHBOARD_USER`,
 `DASHBOARD_PASSWORD`. Missing login → 503.
