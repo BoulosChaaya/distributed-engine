@@ -9,7 +9,7 @@ const port = Number(process.env.TEST_REDIS_PORT || 6379);
 let redis: IORedis;
 
 beforeAll(async () => {
-  redis = new IORedis({ host, port, password: process.env.TEST_REDIS_PASSWORD, maxRetriesPerRequest: null });
+  redis = new IORedis({ host, port, password: process.env.REDIS_PASSWORD, maxRetriesPerRequest: null });
   await redis.ping();
 });
 afterAll(async () => { await redis.quit(); });
