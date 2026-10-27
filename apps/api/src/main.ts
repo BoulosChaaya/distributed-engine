@@ -268,52 +268,33 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = SubmitTaskSchema.parse(req.body);
 
-    if (validatedData.scheduledFor) {
-      const scheduledFor = new Date(validatedData.scheduledFor);
-      logger.info('Scheduled task creation requested', {
-        taskName: validatedData.name,
-        priority: validatedData.priority,
-        scheduledFor: scheduledFor.toISOString(),
-      });
-
-      const { task } = await scheduleRepo.createScheduledTask({
-        name: validatedData.name,
-        priority: validatedData.priority,
-        payload: validatedData.payload,
-        maxRetries: validatedData.maxRetries,
-        scheduledFor,
-      });
-
-      logger.info('Scheduled task created', {
-        taskId: task.id,
-        taskName: task.name,
-        scheduledFor: scheduledFor.toISOString(),
-      });
-
-      res.status(201).json({
-        success: true,
-        data: task,
-        timestamp: new Date(),
-      } as ApiResponse<Task>);
-      return;
-    }
-
-    logger.info('Task creation requested', { taskName: validatedData.name, priority: validatedData.priority });
+    logger.info('Task creation requested', {
+      taskName: validatedData.name,
+      priority: validatedData.priority,
+      scheduledFor: validatedData.scheduledFor,
+      idempotencyKey: validatedData.idempotencyKey !== undefined,
+    });
 
     const span = tracing.startTaskCreation('pending', validatedData.name, validatedData.priority);
 
-    let task: Task;
+    // The tenant route's path, without a tenant and so without quota: one
+    // transaction for the idempotency check, the task and its outbox event.
+    // A future scheduledFor (by the database clock) is stored SCHEDULED with
+    // no outbox event; the scheduler releases it when it is due.
+    let result: { task: Task; idempotent: boolean };
     try {
-      const result = await tracing.withActiveSpan(span, () =>
-        taskRepo.createTaskWithOutbox({
+      result = await tracing.withActiveSpan(span, () =>
+        taskRepo.acceptTask({
+          tenantId: null,
           name: validatedData.name,
           priority: validatedData.priority,
           payload: validatedData.payload,
           maxRetries: validatedData.maxRetries,
+          idempotencyKey: validatedData.idempotencyKey,
+          scheduledFor: validatedData.scheduledFor,
         }),
       );
-      task = result.task;
-      span.setAttribute('task.id', task.id);
+      span.setAttribute('task.id', result.task.id);
       tracing.setSpanOk(span);
     } catch (error) {
       tracing.recordError(span, error);
@@ -322,17 +303,23 @@ app.post('/tasks', async (req: Request, res: Response, next: NextFunction) => {
       tracing.endSpan(span);
     }
 
-    logger.info('Task created', { taskId: task.id, taskName: task.name, priority: task.priority });
+    const { task, idempotent } = result;
+    logger.info(idempotent ? 'Idempotent task returned' : 'Task created', {
+      taskId: task.id, taskName: task.name, priority: task.priority, status: task.status,
+    });
 
-    res.status(201).json({
+    res.status(idempotent ? 200 : 201).json({
       success: true,
       data: task,
+      idempotent,
       timestamp: new Date(),
-    } as ApiResponse<Task>);
+    });
   } catch (error) {
     if (isZodError(error)) {
       logger.warn('Task creation rejected: validation error', { errorType: 'ValidationError' });
       next(new ValidationError(error));
+    } else if (error instanceof IdempotencyConflictError) {
+      next(new AppError(409, error.message));
     } else {
       logger.error('Task creation failed', {
         errorType: error instanceof Error ? error.name : 'UnknownError',

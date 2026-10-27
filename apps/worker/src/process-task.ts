@@ -63,6 +63,13 @@ export interface ProcessTaskDeps {
    * reconciler leaves it alone. Default 60 s.
    */
   suspendedTenantRecheckMs?: number;
+  /**
+   * How long a FORBID_OVERLAP occurrence waits before asking for the
+   * schedule's execution lease again. Not the lease's expiry: the holder
+   * renews it to now + scheduleLeaseDurationMs every renewal, so expiry
+   * says nothing about when the holder will finish.
+   */
+  overlapRecheckMs?: number;
   renewalIntervalMs: number;
   /**
    * How often a running task checks whether it was cancelled (a primary-key
@@ -82,6 +89,15 @@ export interface ProcessTaskDeps {
    * retrying a task the database already marked FAILED.
    */
   UnrecoverableError?: new (message: string) => Error;
+  /**
+   * Fires when this worker is shutting down and its drain window is over.
+   * A task still running then is stopped and handed back as QUEUED without
+   * charging a retry: a deploy is not the task's fault. Without it, a task
+   * that outlived the shutdown guard was killed with the process, its lease
+   * expired, and the reclaim charged a retry; a task with maxRetries 0
+   * ended FAILED just because the worker was redeployed.
+   */
+  shutdownSignal?: AbortSignal;
   /**
    * Runs the task's handler. The signal fires when this worker loses its
    * lease, so the handler can stop work another worker may now own.
@@ -131,12 +147,14 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     scheduleLeaseDurationMs,
     leaseDeferralMarginMs,
     suspendedTenantRecheckMs = 60_000,
+    overlapRecheckMs = 5_000,
     renewalIntervalMs,
     cancelCheckIntervalMs = 0,
     workerMetrics,
     ClaimNotExpiredError,
     DelayedError,
     UnrecoverableError,
+    shutdownSignal,
     execute,
   } = deps;
 
@@ -212,6 +230,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
     let renewalTimer: ReturnType<typeof setInterval> | undefined;
     let ownershipLost = false;
     let cancelled = false;
+    let released = false;
     let cancelTimer: ReturnType<typeof setInterval> | undefined;
     const abort = new AbortController();
     let scheduleLeaseToken: string | undefined;
@@ -225,7 +244,14 @@ export function createProcessTask(deps: ProcessTaskDeps) {
           scheduleLeaseDurationMs,
         );
         if (!leaseResult.acquired) {
-          const deferUntil = (leaseResult.expiresAt?.getTime() ?? Date.now()) + leaseDeferralMarginMs;
+          // Ask again soon rather than at the lease's expiry. The holder
+          // releases the lease the moment it finishes, but nothing wakes a
+          // delayed job, and its expiry is renewed to ~5 minutes ahead every
+          // 10 s. Waiting for expiry ran the next occurrence up to 5 minutes
+          // after the previous one had finished. A crashed holder is still
+          // covered: its lease expires and the next recheck after that wins.
+          const leaseEnd = (leaseResult.expiresAt?.getTime() ?? Date.now()) + leaseDeferralMarginMs;
+          const deferUntil = Math.min(leaseEnd, Date.now() + overlapRecheckMs);
           logger.info('Schedule execution lease held, deferring', {
             taskId,
             scheduleId: schedule.id,
@@ -346,6 +372,13 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         tracing.endSpan(reclaimSpan);
       }
     }
+
+    const onShutdown = () => {
+      released = true;
+      abort.abort(new Error('worker shutting down'));
+    };
+    if (shutdownSignal?.aborted) onShutdown();
+    else shutdownSignal?.addEventListener('abort', onShutdown, { once: true });
 
     try {
       renewalTimer = setInterval(async () => {
@@ -474,6 +507,24 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         parentSpan.setAttribute('task.ownership_lost', true);
         return { status: 'SKIPPED', taskId, reason: 'ownership_lost' };
       }
+      if (released) {
+        // Stopped because this worker is shutting down. Hand the task back
+        // as QUEUED with its retry count unchanged, and put the job back for
+        // another worker now. If PostgreSQL can't take the write, the lease
+        // runs out and the task is reclaimed (charged), as before.
+        try {
+          await taskRepo.transitionStatus(taskId, taskVersion, 'QUEUED', {
+            claimToken,
+            error: 'Released by a worker shutting down; not charged as a retry',
+          });
+          logger.info('Task released on shutdown', { taskId });
+        } catch (releaseError) {
+          logger.warn('Could not release task on shutdown; its lease will expire', { taskId, reason: String(releaseError) });
+        }
+        parentSpan.setAttribute('task.released_on_shutdown', true);
+        await job.moveToDelayed(Date.now(), job.token);
+        throw new DelayedError();
+      }
 
       workerMetrics.jobsFailed++;
 
@@ -528,6 +579,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
       }
       throw error;
     } finally {
+      shutdownSignal?.removeEventListener('abort', onShutdown);
       if (renewalTimer) {
         clearInterval(renewalTimer);
         renewalTimer = undefined;

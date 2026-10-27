@@ -282,7 +282,8 @@ describe('Worker orchestration', () => {
   });
 
   it('4. FORBID_OVERLAP contention defers through moveToDelayed + DelayedError', async () => {
-    const leaseExpiresAt = new Date(Date.now() + 60000);
+    // A lease that ends before the next recheck: wake right after it ends.
+    const leaseExpiresAt = new Date(Date.now() + 1000);
     const taskRepo = makeMockTaskRepo({
       getTask: jest.fn<any>().mockResolvedValue(makeTask({ scheduleId: 'sched-1' })),
     });
@@ -321,6 +322,42 @@ describe('Worker orchestration', () => {
       leaseExpiresAt.getTime() + 2000,
       job.token,
     );
+  });
+
+  it('4b. a blocked occurrence rechecks soon, not when a renewed 5-minute lease would expire', async () => {
+    // The holder renews its lease to now + SCHEDULE_LEASE_DURATION_MS (300 s)
+    // every 10 s, so expiresAt says nothing about when the holder finishes.
+    // Waiting for it delays the next occurrence by up to 5 minutes after the
+    // holder is done (ARCHITECTURE.md promises it "re-activates after the
+    // lease holder finishes").
+    const now = Date.now();
+    const taskRepo = makeMockTaskRepo({
+      getTask: jest.fn<any>().mockResolvedValue(makeTask({ scheduleId: 'sched-1' })),
+    });
+    const scheduleRepo = makeMockScheduleRepo({
+      getSchedule: jest.fn<any>().mockResolvedValue({ id: 'sched-1', overlapPolicy: 'FORBID_OVERLAP' }),
+      acquireExecutionLease: jest.fn<any>().mockResolvedValue({ acquired: false, expiresAt: new Date(now + 300000) }),
+    });
+    const processTask = createProcessTask({
+      taskRepo,
+      scheduleRepo,
+      tracing: makeMockTracing(),
+      logger: makeMockLogger(),
+      workerId: 'w-1',
+      scheduleLeaseDurationMs: 300000,
+      leaseDeferralMarginMs: 2000,
+      renewalIntervalMs: 10000,
+      workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
+      ClaimNotExpiredError: MockClaimNotExpiredError,
+      DelayedError: MockDelayedError,
+      execute: sleepExecute,
+    });
+    const job = makeMockJob();
+
+    await expect(processTask(job, 'task-1', makeMockSpan())).rejects.toThrow('DelayedError');
+
+    const [wakeAt] = job.moveToDelayed.mock.calls[0] as [number, string];
+    expect(wakeAt - now).toBeLessThanOrEqual(10000);
   });
 
   it('5. overlap deferral occurs before QUEUED to PROCESSING transition', async () => {
@@ -707,5 +744,81 @@ describe('Worker orchestration', () => {
       expect(result).toMatchObject({ status: 'SKIPPED', reason: 'ownership_lost' });
       expect(transitions.map((t) => t.status)).toEqual(['PROCESSING']);
     });
+  });
+});
+
+describe('Worker shutdown (found by tracing: a deploy charged a retry)', () => {
+  const waitForAbort = ({ signal }: { signal: AbortSignal }) =>
+    new Promise<unknown>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+
+  function setup(execute: ProcessTaskDeps['execute']) {
+    const shutdown = new AbortController();
+    const transitionStatus = jest.fn<any>()
+      .mockResolvedValueOnce({ version: 2, claimToken: 'ct-1', retries: 0 })
+      .mockResolvedValue({ version: 3, claimToken: undefined, retries: 0 });
+    const taskRepo = makeMockTaskRepo({
+      getTask: jest.fn<any>().mockResolvedValue(makeTask({ maxRetries: 0 })),
+      transitionStatus,
+    });
+    const workerMetrics = { jobsCompleted: 0, jobsFailed: 0 };
+    const processTask = createProcessTask({
+      taskRepo,
+      scheduleRepo: makeMockScheduleRepo(),
+      tracing: makeMockTracing(),
+      logger: makeMockLogger(),
+      workerId: 'w-1',
+      scheduleLeaseDurationMs: 300000,
+      leaseDeferralMarginMs: 2000,
+      renewalIntervalMs: 10000,
+      workerMetrics,
+      ClaimNotExpiredError: MockClaimNotExpiredError,
+      DelayedError: MockDelayedError,
+      shutdownSignal: shutdown.signal,
+      execute,
+    });
+    return { shutdown, transitionStatus, workerMetrics, processTask };
+  }
+
+  it('hands a still-running task back as QUEUED without charging a retry', async () => {
+    const { shutdown, transitionStatus, workerMetrics, processTask } = setup(waitForAbort);
+    const job = makeMockJob();
+
+    const run = processTask(job, 'task-1', makeMockSpan());
+    await flushMicrotasks();
+    shutdown.abort();
+
+    await expect(run).rejects.toThrow('DelayedError');
+    const release = transitionStatus.mock.calls[1] as [string, number, string, Record<string, unknown>];
+    expect(release[2]).toBe('QUEUED');
+    expect(release[3].claimToken).toBe('ct-1');
+    expect(release[3]).not.toHaveProperty('retries');
+    expect(job.moveToDelayed).toHaveBeenCalledTimes(1);
+    expect(workerMetrics.jobsFailed).toBe(0);
+  });
+
+  it('a task that finishes despite the shutdown is still recorded COMPLETED', async () => {
+    const { shutdown, transitionStatus, processTask } = setup(async () => ({ done: true }));
+    shutdown.abort();
+
+    const result = await processTask(makeMockJob(), 'task-1', makeMockSpan());
+
+    expect(result.status).toBe('COMPLETED');
+    expect((transitionStatus.mock.calls[1] as unknown[])[2]).toBe('COMPLETED');
+  });
+
+  it('if the release write fails, the job is still put back (the lease covers the task)', async () => {
+    const { shutdown, transitionStatus, processTask } = setup(waitForAbort);
+    transitionStatus.mockReset();
+    transitionStatus
+      .mockResolvedValueOnce({ version: 2, claimToken: 'ct-1', retries: 0 })
+      .mockRejectedValue(new Error('PostgreSQL down'));
+    const job = makeMockJob();
+
+    const run = processTask(job, 'task-1', makeMockSpan());
+    await flushMicrotasks();
+    shutdown.abort();
+
+    await expect(run).rejects.toThrow('DelayedError');
+    expect(job.moveToDelayed).toHaveBeenCalledTimes(1);
   });
 });
