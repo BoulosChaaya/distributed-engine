@@ -60,7 +60,8 @@ operator dashboard shows and controls the system.
    the orphan from PostgreSQL and requeues it through the outbox.
 
 Full design: [ARCHITECTURE.md](ARCHITECTURE.md). Operations:
-[DEPLOYMENT.md](DEPLOYMENT.md).
+[DEPLOYMENT.md](DEPLOYMENT.md). Diagrams (C4, sequences, state machines, data
+model, tracing, event storming): [docs/diagrams](docs/diagrams/README.md).
 
 ## Features
 

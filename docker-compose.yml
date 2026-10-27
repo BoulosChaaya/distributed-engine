@@ -48,6 +48,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       LOG_LEVEL: info
+      # Traces: empty sends none. With the tracing profile, set it to
+      # http://otel-collector:4318 (see docs/diagrams/05-tracing.md).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       QUEUE_CONCURRENCY: 5
       # Required for /tasks, /schedules, /workers, /metrics. Set it in .env (see .env.example).
       OPERATOR_API_KEY: ${OPERATOR_API_KEY:?Set OPERATOR_API_KEY in .env - see .env.example}
@@ -85,6 +88,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       LOG_LEVEL: info
+      # Traces: empty sends none. With the tracing profile, set it to
+      # http://otel-collector:4318 (see docs/diagrams/05-tracing.md).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       # Hosts the `http` task type may call (comma-separated). Empty disables it.
       HTTP_TASK_ALLOWED_HOSTS: ${HTTP_TASK_ALLOWED_HOSTS:-}
     depends_on:
