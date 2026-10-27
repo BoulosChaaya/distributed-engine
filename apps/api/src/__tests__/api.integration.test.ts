@@ -39,6 +39,11 @@ describe('API Validation', () => {
       expect(() => SubmitTaskSchema.parse({ name: 'test', maxRetries: 11 })).toThrow();
     });
 
+    it('accepts an optional idempotency key and refuses an empty one', () => {
+      expect(SubmitTaskSchema.parse({ name: 'echo', idempotencyKey: 'order-42' }).idempotencyKey).toBe('order-42');
+      expect(() => SubmitTaskSchema.parse({ name: 'echo', idempotencyKey: '' })).toThrow();
+    });
+
     it('should accept all valid priorities', () => {
       for (const priority of ['LOW', 'NORMAL', 'HIGH', 'CRITICAL']) {
         const result = SubmitTaskSchema.parse({ name: 'test', priority });

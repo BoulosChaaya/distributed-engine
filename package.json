@@ -1,6 +1,6 @@
 {
   "name": "distributed-engine",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Distributed task execution engine with API, workers, and dashboard",
   "private": true,
   "type": "module",
