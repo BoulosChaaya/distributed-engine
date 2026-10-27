@@ -14,7 +14,7 @@ export interface TaskRepoLike {
 
 export interface ScheduleRepoLike {
   getSchedule(scheduleId: string): Promise<RecurringSchedule | null>;
-  acquireExecutionLease(scheduleId: string, durationMs: number): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date }>;
+  acquireExecutionLease(scheduleId: string, durationMs: number, forTaskId?: string): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date; olderWaiting?: boolean }>;
   renewExecutionLease(scheduleId: string, leaseToken: string, durationMs: number): Promise<void>;
   releaseExecutionLease(scheduleId: string, leaseToken: string): Promise<void>;
 }
@@ -242,6 +242,7 @@ export function createProcessTask(deps: ProcessTaskDeps) {
         const leaseResult = await scheduleRepo.acquireExecutionLease(
           schedule.id,
           scheduleLeaseDurationMs,
+          taskId,
         );
         if (!leaseResult.acquired) {
           // Ask again soon rather than at the lease's expiry. The holder
@@ -250,9 +251,13 @@ export function createProcessTask(deps: ProcessTaskDeps) {
           // 10 s. Waiting for expiry ran the next occurrence up to 5 minutes
           // after the previous one had finished. A crashed holder is still
           // covered: its lease expires and the next recheck after that wins.
-          const leaseEnd = (leaseResult.expiresAt?.getTime() ?? Date.now()) + leaseDeferralMarginMs;
+          // An older occurrence still waiting goes first (oldest-first
+          // lease); this one asks again after the same recheck interval.
+          const leaseEnd = leaseResult.expiresAt
+            ? leaseResult.expiresAt.getTime() + leaseDeferralMarginMs
+            : Number.POSITIVE_INFINITY;
           const deferUntil = Math.min(leaseEnd, Date.now() + overlapRecheckMs);
-          logger.info('Schedule execution lease held, deferring', {
+          logger.info(leaseResult.olderWaiting ? 'Older occurrence waiting, deferring' : 'Schedule execution lease held, deferring', {
             taskId,
             scheduleId: schedule.id,
             deferUntil: new Date(deferUntil).toISOString(),

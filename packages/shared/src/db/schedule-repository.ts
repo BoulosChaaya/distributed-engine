@@ -510,10 +510,20 @@ export class ScheduleRepository {
     }
   }
 
+  /**
+   * FORBID_OVERLAP: one run of a schedule at a time, oldest occurrence first.
+   *
+   * Given the asking task (forTaskId), a free lease goes only to the oldest
+   * occurrence still QUEUED. Without that, whoever asked first after a release
+   * won, and a new occurrence asks the moment it is due: on a schedule firing
+   * faster than its runs finish, an older occurrence lost every time (recorded:
+   * 55 s and three newer runs). A refused caller defers and asks again.
+   */
   async acquireExecutionLease(
     scheduleId: string,
     leaseDurationMs: number = 300000,
-  ): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date }> {
+    forTaskId?: string,
+  ): Promise<{ acquired: boolean; leaseToken?: string; expiresAt?: Date; olderWaiting?: boolean }> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -536,6 +546,22 @@ export class ScheduleRepository {
       ) {
         await client.query('ROLLBACK');
         return { acquired: false, expiresAt: schedule.executionLeaseExpiresAt };
+      }
+
+      if (forTaskId) {
+        // The schedule row is locked FOR UPDATE above, so two askers cannot
+        // both pass this check.
+        const older = await client.query(
+          `SELECT 1 FROM tasks o, tasks me
+           WHERE me.id = $2 AND o.schedule_id = $1 AND o.status = 'QUEUED' AND o.id <> me.id
+             AND (o.scheduled_for, o.id) < (me.scheduled_for, me.id)
+           LIMIT 1`,
+          [scheduleId, forTaskId],
+        );
+        if (older.rows.length > 0) {
+          await client.query('ROLLBACK');
+          return { acquired: false, olderWaiting: true };
+        }
       }
 
       const leaseToken = generateId();

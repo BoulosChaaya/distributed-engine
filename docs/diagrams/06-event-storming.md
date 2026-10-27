@@ -84,7 +84,7 @@ flowchart LR
   clock([Clock]):::actor --> due[Schedule due]:::evt
   due --> polmis[/"Misfire policy:<br/>skip, run once, or catch up"/]:::pol
   polmis --> occ[Occurrence created]:::evt
-  occ --> polover[/"FORBID_OVERLAP:<br/>one run at a time, recheck every 5 s"/]:::pol
+  occ --> polover[/"FORBID_OVERLAP:<br/>one run at a time, oldest first,<br/>recheck every 5 s"/]:::pol
 
   clock --> scan[Reconciler cycle]:::evt
   scan --> polorph[/"Whenever a task has no job in Redis<br/>and nothing pending: re-emit it"/]:::pol

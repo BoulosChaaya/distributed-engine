@@ -360,6 +360,44 @@ describe('Worker orchestration', () => {
     expect(wakeAt - now).toBeLessThanOrEqual(10000);
   });
 
+  it('4c. an occurrence with an older one still waiting defers, and asks with its own task id', async () => {
+    const now = Date.now();
+    const transitionStatus = jest.fn<any>();
+    const taskRepo = makeMockTaskRepo({
+      getTask: jest.fn<any>().mockResolvedValue(makeTask({ scheduleId: 'sched-1' })),
+      transitionStatus,
+    });
+    const acquireExecutionLease = jest.fn<any>().mockResolvedValue({ acquired: false, olderWaiting: true });
+    const scheduleRepo = makeMockScheduleRepo({
+      getSchedule: jest.fn<any>().mockResolvedValue({ id: 'sched-1', overlapPolicy: 'FORBID_OVERLAP' }),
+      acquireExecutionLease,
+    });
+    const processTask = createProcessTask({
+      taskRepo,
+      scheduleRepo,
+      tracing: makeMockTracing(),
+      logger: makeMockLogger(),
+      workerId: 'w-1',
+      scheduleLeaseDurationMs: 300000,
+      leaseDeferralMarginMs: 2000,
+      overlapRecheckMs: 5000,
+      renewalIntervalMs: 10000,
+      workerMetrics: { jobsCompleted: 0, jobsFailed: 0 },
+      ClaimNotExpiredError: MockClaimNotExpiredError,
+      DelayedError: MockDelayedError,
+      execute: sleepExecute,
+    });
+    const job = makeMockJob();
+
+    await expect(processTask(job, 'task-1', makeMockSpan())).rejects.toThrow('DelayedError');
+
+    expect(acquireExecutionLease).toHaveBeenCalledWith('sched-1', 300000, 'task-1');
+    const [wakeAt] = job.moveToDelayed.mock.calls[0] as [number, string];
+    expect(wakeAt - now).toBeGreaterThanOrEqual(4900);
+    expect(wakeAt - now).toBeLessThanOrEqual(6000);
+    expect(transitionStatus).not.toHaveBeenCalled();
+  });
+
   it('5. overlap deferral occurs before QUEUED to PROCESSING transition', async () => {
     const transitionStatus = jest.fn<any>();
     const taskRepo = makeMockTaskRepo({
