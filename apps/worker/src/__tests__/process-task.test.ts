@@ -746,3 +746,79 @@ describe('Worker orchestration', () => {
     });
   });
 });
+
+describe('Worker shutdown (found by tracing: a deploy charged a retry)', () => {
+  const waitForAbort = ({ signal }: { signal: AbortSignal }) =>
+    new Promise<unknown>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+
+  function setup(execute: ProcessTaskDeps['execute']) {
+    const shutdown = new AbortController();
+    const transitionStatus = jest.fn<any>()
+      .mockResolvedValueOnce({ version: 2, claimToken: 'ct-1', retries: 0 })
+      .mockResolvedValue({ version: 3, claimToken: undefined, retries: 0 });
+    const taskRepo = makeMockTaskRepo({
+      getTask: jest.fn<any>().mockResolvedValue(makeTask({ maxRetries: 0 })),
+      transitionStatus,
+    });
+    const workerMetrics = { jobsCompleted: 0, jobsFailed: 0 };
+    const processTask = createProcessTask({
+      taskRepo,
+      scheduleRepo: makeMockScheduleRepo(),
+      tracing: makeMockTracing(),
+      logger: makeMockLogger(),
+      workerId: 'w-1',
+      scheduleLeaseDurationMs: 300000,
+      leaseDeferralMarginMs: 2000,
+      renewalIntervalMs: 10000,
+      workerMetrics,
+      ClaimNotExpiredError: MockClaimNotExpiredError,
+      DelayedError: MockDelayedError,
+      shutdownSignal: shutdown.signal,
+      execute,
+    });
+    return { shutdown, transitionStatus, workerMetrics, processTask };
+  }
+
+  it('hands a still-running task back as QUEUED without charging a retry', async () => {
+    const { shutdown, transitionStatus, workerMetrics, processTask } = setup(waitForAbort);
+    const job = makeMockJob();
+
+    const run = processTask(job, 'task-1', makeMockSpan());
+    await flushMicrotasks();
+    shutdown.abort();
+
+    await expect(run).rejects.toThrow('DelayedError');
+    const release = transitionStatus.mock.calls[1] as [string, number, string, Record<string, unknown>];
+    expect(release[2]).toBe('QUEUED');
+    expect(release[3].claimToken).toBe('ct-1');
+    expect(release[3]).not.toHaveProperty('retries');
+    expect(job.moveToDelayed).toHaveBeenCalledTimes(1);
+    expect(workerMetrics.jobsFailed).toBe(0);
+  });
+
+  it('a task that finishes despite the shutdown is still recorded COMPLETED', async () => {
+    const { shutdown, transitionStatus, processTask } = setup(async () => ({ done: true }));
+    shutdown.abort();
+
+    const result = await processTask(makeMockJob(), 'task-1', makeMockSpan());
+
+    expect(result.status).toBe('COMPLETED');
+    expect((transitionStatus.mock.calls[1] as unknown[])[2]).toBe('COMPLETED');
+  });
+
+  it('if the release write fails, the job is still put back (the lease covers the task)', async () => {
+    const { shutdown, transitionStatus, processTask } = setup(waitForAbort);
+    transitionStatus.mockReset();
+    transitionStatus
+      .mockResolvedValueOnce({ version: 2, claimToken: 'ct-1', retries: 0 })
+      .mockRejectedValue(new Error('PostgreSQL down'));
+    const job = makeMockJob();
+
+    const run = processTask(job, 'task-1', makeMockSpan());
+    await flushMicrotasks();
+    shutdown.abort();
+
+    await expect(run).rejects.toThrow('DelayedError');
+    expect(job.moveToDelayed).toHaveBeenCalledTimes(1);
+  });
+});

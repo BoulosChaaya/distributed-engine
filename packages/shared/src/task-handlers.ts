@@ -15,7 +15,9 @@
  *
  * Every handler receives an AbortSignal. It fires when the worker loses its
  * lease (another worker may already own the task), when the task exceeds its
- * timeout, or on shutdown. Handlers must stop promptly when it fires.
+ * timeout, or when the worker is shutting down and its drain window is over
+ * (the task is then handed back without charging a retry). Handlers must stop
+ * promptly when it fires.
  */
 
 export class NonRetryableTaskError extends Error {
