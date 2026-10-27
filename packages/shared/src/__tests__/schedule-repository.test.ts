@@ -617,6 +617,32 @@ describe('Execution overlap policy (requires PostgreSQL)', () => {
     expect(lease2.leaseToken).not.toBe(lease1.leaseToken);
   });
 
+  it('gives a free lease to the oldest waiting occurrence, not the first to ask', async () => {
+    // Recorded on v1.0.1: with runs longer than the interval, a new occurrence
+    // asked at the same moment as an older one's recheck and won, three times
+    // in a row; the older one waited 55 s.
+    const schedule = await scheduleRepo.createSchedule({
+      name: 'fifo', taskName: 'task', taskPriority: 'NORMAL', taskPayload: {}, taskMaxRetries: 3,
+      cronExpression: '*/10 * * * * *', timezone: 'UTC', nextRunAt: new Date(),
+      misfirePolicy: 'SKIP_MISSED', overlapPolicy: 'FORBID_OVERLAP',
+    });
+    const older = await scheduleRepo.generateOccurrence(schedule.id, new Date('2025-01-01T00:00:10Z'), new Date('2025-01-01T00:00:20Z'));
+    const newer = await scheduleRepo.generateOccurrence(schedule.id, new Date('2025-01-01T00:00:20Z'), new Date('2025-01-01T00:00:30Z'));
+
+    const byNewer = await scheduleRepo.acquireExecutionLease(schedule.id, 60000, newer.task.id);
+    expect(byNewer.acquired).toBe(false);
+    expect(byNewer.olderWaiting).toBe(true);
+
+    const byOlder = await scheduleRepo.acquireExecutionLease(schedule.id, 60000, older.task.id);
+    expect(byOlder.acquired).toBe(true);
+    await scheduleRepo.releaseExecutionLease(schedule.id, byOlder.leaseToken!);
+
+    // Once the older one has run, the newer one is next.
+    await pool.query(`UPDATE tasks SET status = 'COMPLETED', version = version + 1 WHERE id = $1`, [older.task.id]);
+    const byNewerAgain = await scheduleRepo.acquireExecutionLease(schedule.id, 60000, newer.task.id);
+    expect(byNewerAgain.acquired).toBe(true);
+  });
+
   it('should reject lease release with wrong token', async () => {
     const schedule = await scheduleRepo.createSchedule({
       name: 'wrong-release',

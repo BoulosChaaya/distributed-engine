@@ -167,5 +167,6 @@ sequenceDiagram
   S->>P: next minute → occurrence 2
   W2->>P: lease held → delay 5 s, ask again
   W1->>P: COMPLETED · release lease
-  W2->>P: within 5 s: lease free → take it → run
+  W2->>P: within 5 s: lease free, no older occurrence QUEUED → take it → run
+  Note over W2,P: a free lease goes to the oldest QUEUED occurrence · a newer one that asks first waits
 ```

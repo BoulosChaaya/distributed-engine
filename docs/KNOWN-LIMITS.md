@@ -79,8 +79,8 @@ come from the load test ([load-test.md](load-test.md)).
 ## Features not built
 
 - Cron schedules start single tasks, not workflows.
-- `FORBID_OVERLAP` runs every occurrence, one at a time; none is dropped. A
-  blocked occurrence asks for the schedule's lease every 5 s
+- `FORBID_OVERLAP` runs every occurrence, one at a time and oldest first;
+  none is dropped. A blocked occurrence asks for the schedule's lease every 5 s
   (`SCHEDULE_OVERLAP_RECHECK_MS`). A schedule whose runs take longer than its
   interval therefore builds a backlog that drains at the speed of the runs.
 - No dead-letter queue beyond the FAILED state (and operator or tenant
