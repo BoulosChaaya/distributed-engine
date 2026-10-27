@@ -19,6 +19,30 @@ export interface RateLimitResult {
  * task needs only PostgreSQL. So: not connected -> allow at once, without
  * queueing a command; connected but slow -> allow after timeoutMs.
  */
+/**
+ * One atomic step per request: drop entries older than the window, count the
+ * rest, and record this request only if it is allowed. Returns
+ * [allowed (1/0), requests counted in the window after this one].
+ *
+ * Recording only allowed requests is the point. The earlier version added
+ * every request to the window before counting, rejected ones included, so a
+ * client that kept retrying while over its limit kept its own window full
+ * and got nothing through, instead of its limit. Being one script also
+ * removes the read-then-write race between API replicas.
+ */
+const SLIDING_WINDOW_SCRIPT = `
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+local count = redis.call('ZCARD', KEYS[1])
+local allowed = 0
+if count < tonumber(ARGV[3]) then
+  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+  count = count + 1
+  allowed = 1
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[5])
+return {allowed, count}
+`;
+
 export class RedisRateLimiter {
   constructor(
     private redis: IORedis,
@@ -36,23 +60,14 @@ export class RedisRateLimiter {
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const pipeline = this.redis.pipeline();
-      pipeline.zremrangebyscore(redisKey, '-inf', windowStart);
-      pipeline.zadd(redisKey, now, `${now}:${Math.random().toString(36).slice(2, 8)}`);
-      pipeline.zcard(redisKey);
-      pipeline.pexpire(redisKey, this.windowMs);
-
+      const member = `${now}:${Math.random().toString(36).slice(2, 10)}`;
+      const call = this.redis.eval(SLIDING_WINDOW_SCRIPT, 1, redisKey, now, windowStart, limit, member, this.windowMs) as Promise<[number, number]>;
       const timedOut = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), this.timeoutMs); });
-      const results = await Promise.race([pipeline.exec(), timedOut]);
-      if (!results) {
-        return { allowed: true, remaining: limit, resetAtMs: now + this.windowMs };
-      }
+      const result = await Promise.race([call, timedOut]);
+      if (!result) return allowAll;
 
-      const count = (results[2]?.[1] as number) ?? 0;
-      const allowed = count <= limit;
-      const remaining = Math.max(0, limit - count);
-
-      return { allowed, remaining, resetAtMs: now + this.windowMs };
+      const [allowedFlag, count] = result;
+      return { allowed: allowedFlag === 1, remaining: Math.max(0, limit - Number(count)), resetAtMs: now + this.windowMs };
     } catch {
       return allowAll;
     } finally {

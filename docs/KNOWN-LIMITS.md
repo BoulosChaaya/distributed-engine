@@ -13,6 +13,11 @@ come from the load test ([load-test.md](load-test.md)).
   twice. Handlers with external effects must be idempotent; the `http` task
   type is not made idempotent by the engine. The load test counts these
   re-executions instead of failing on them.
+- **A resend is safe only with an idempotency key.** Both submit routes
+  (`POST /tasks` and `POST /tenant/tasks`) and both workflow routes accept
+  `idempotencyKey`: the same key and body return the first task (200), the
+  same key with another body is refused (409). Without a key, a client that
+  never saw its 201 and sends again creates a second task.
 - **No global ordering.** Within one tenant, tasks are published by priority
   then age, and admission keeps that order under the tenant's concurrency
   limit. Across tenants, weighted fair publishing interleaves them. With
@@ -47,6 +52,13 @@ come from the load test ([load-test.md](load-test.md)).
   for the 30 s stale-claim timeout; jobs lost from Redis are re-published
   after the reconciler's grace period (60 s). The load test shows these as
   the longest waits ([load-test.md](load-test.md)).
+- **Deploys hand work back, they don't drop it.** On SIGTERM a worker gives
+  running tasks 20 s (`WORKER_SHUTDOWN_DRAIN_MS`) to finish, then stops the
+  rest and hands them back as QUEUED without charging a retry; another
+  worker starts them at once, from the beginning. A handler that ignores its
+  abort signal keeps running until the 30 s shutdown guard, is killed, and
+  is recovered by its lease (charged). The built-in handlers all stop on the
+  signal. Orchestrators must allow at least 30 s (k8s and compose use 40 s).
 - **One region.** No multi-region deployment, no cross-region failover.
 
 ## Capacity
@@ -67,6 +79,10 @@ come from the load test ([load-test.md](load-test.md)).
 ## Features not built
 
 - Cron schedules start single tasks, not workflows.
+- `FORBID_OVERLAP` runs every occurrence, one at a time; none is dropped. A
+  blocked occurrence asks for the schedule's lease every 5 s
+  (`SCHEDULE_OVERLAP_RECHECK_MS`). A schedule whose runs take longer than its
+  interval therefore builds a backlog that drains at the speed of the runs.
 - No dead-letter queue beyond the FAILED state (and operator or tenant
   retry); no saga or compensation steps in workflows.
 - The `http` task type allow-lists host names only; it does not resolve
