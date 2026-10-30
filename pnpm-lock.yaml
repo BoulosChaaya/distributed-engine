@@ -68,8 +68,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared
       bullmq:
-        specifier: ^6.3.14
-        version: 6.3.15(ioredis@6.0.0)(pg@8.23.1)
+        specifier: ^6.5.0
+        version: 6.5.0(ioredis@6.0.0)(pg@8.23.1)
       express:
         specifier: ^5.3.0
         version: 5.3.0
@@ -136,8 +136,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared
       bullmq:
-        specifier: ^6.3.14
-        version: 6.3.15(ioredis@6.0.0)(pg@8.23.1)
+        specifier: ^6.5.0
+        version: 6.5.0(ioredis@6.0.0)(pg@8.23.1)
       ioredis:
         specifier: ^6.0.0
         version: 6.0.0
@@ -197,8 +197,8 @@ importers:
         specifier: 1.43.0
         version: 1.43.0
       bullmq:
-        specifier: ^6.3.14
-        version: 6.3.15(ioredis@6.0.0)(pg@8.23.1)
+        specifier: ^6.5.0
+        version: 6.5.0(ioredis@6.0.0)(pg@8.23.1)
       cron-parser:
         specifier: ^5.10.2
         version: 5.10.2
@@ -1652,9 +1652,9 @@ packages:
   bser@2.1.1:
     resolution: {integrity: sha512-gQxTNE/GAfIIrmHLUE3oJyp5FO6HRBfhjnw4/wMmA63ZGDJnWBmgY/lyQBpnDUkGmAhbSe39tx2d/iTOAfglwQ==}
 
-  bullmq@6.3.15:
-    resolution: {integrity: sha512-J6EZH/DhfGnsIafSK2FfNJ6XtSAQnD4YM1vts5+jT4usLYkxV2uU72oKNpmyxUQl9U4sFEvK5MO5SJ+dGlwOLQ==}
-    engines: {node: '>=14.17.0'}
+  bullmq@6.5.0:
+    resolution: {integrity: sha512-GDaUfEig2lWHS52aOI0h8f/W0m+5PPmHOJSahAKRMfi82BdL/2EqCuiDmJcNiwgpaZ0KHz7NxC8eNMI3bh8NQg==}
+    engines: {node: '>=14.18.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
       ioredis: '>=5.0.0'
@@ -2464,8 +2464,8 @@ packages:
     resolution: {integrity: sha512-4kmO/MdyUIkLIvTPr8VHLil4AtoKIoniWPIEk5+CDy0xnWC84azhSFmuJ7PxZdsYtiP5kEeQsORAVIeMgxT+Hw==}
     hasBin: true
 
-  msgpackr@2.1.0:
-    resolution: {integrity: sha512-p/pBCVO63CsvvpkomUnNNag6+n38rULuDA6HHe70o2gtC8ODI52foF/4ko2qQcp6OiErJXTmrZeXmsGGHsIQNQ==}
+  msgpackr@2.1.2:
+    resolution: {integrity: sha512-JHAdwubWNEadHQsFAib6uXOzKFxY8QOWHu9LCCksOINMC+TjgaKS2Tdrw7dW5SY0LLz8YK2/YqLSi2vigQt05w==}
 
   nanoid@3.3.20:
     resolution: {integrity: sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==}
@@ -4690,10 +4690,10 @@ snapshots:
     dependencies:
       node-int64: 0.4.0
 
-  bullmq@6.3.15(ioredis@6.0.0)(pg@8.23.1):
+  bullmq@6.5.0(ioredis@6.0.0)(pg@8.23.1):
     dependencies:
       cron-parser: 5.10.2
-      msgpackr: 2.1.0
+      msgpackr: 2.1.2
       node-abort-controller: 3.1.1
       semver: 7.8.5
       tslib: 2.8.1
@@ -5657,7 +5657,7 @@ snapshots:
       '@msgpackr-extract/msgpackr-extract-win32-x64': 3.0.4
     optional: true
 
-  msgpackr@2.1.0:
+  msgpackr@2.1.2:
     optionalDependencies:
       msgpackr-extract: 3.0.4
 
