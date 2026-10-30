@@ -13,7 +13,7 @@
   "dependencies": {
     "@opentelemetry/api": "1.9.1",
     "@repo/shared": "workspace:*",
-    "bullmq": "^6.3.14",
+    "bullmq": "^6.5.0",
     "ioredis": "^6.0.0",
     "pg": "^8.23.1",
     "prom-client": "15.1.3"

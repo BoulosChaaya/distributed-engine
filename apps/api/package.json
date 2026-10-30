@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@repo/shared": "workspace:*",
-    "bullmq": "^6.3.14",
+    "bullmq": "^6.5.0",
     "express": "^5.3.0",
     "ioredis": "^6.0.0",
     "pg": "^8.23.1",
